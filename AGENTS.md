@@ -33,6 +33,24 @@ prompts/server-agent.md
 prompts/request-client-agent.md
 ```
 
+## Recommended Installed Skills
+
+The following Matt Pocock skills are useful for this project and may be invoked when they fit the task:
+
+- `grill-me`: stress-test an unclear plan before implementation.
+- `grilling`: ask one focused design question at a time until requirements are sharp.
+- `grill-with-docs`: refine a plan while also updating durable domain docs and ADRs.
+- `setup-matt-pocock-skills`: configure this repo for Matt Pocock's engineering-skill conventions when issue tracking and domain docs are ready.
+- `domain-modeling`: define ASR gateway terms, lifecycle states, adapter concepts, and ADRs.
+- `codebase-design`: design deep modules and clean adapter/lifecycle seams.
+- `diagnosing-bugs`: debug failing tests, lifecycle races, networking failures, and performance regressions.
+- `tdd`: build API and lifecycle behavior test-first through public interfaces.
+- `implement`: implement a PRD or issue with tests and a final review pass.
+- `to-prd`: turn a resolved discussion into a PRD.
+- `to-issues`: split a PRD into independently implementable vertical slices.
+- `prototype`: create throwaway experiments for lifecycle state machines or adapter behavior.
+- `handoff`: summarize a session for another agent without duplicating existing docs.
+
 ## Development Principles
 
 - Keep the public API aligned with `docs/asr-server-prd.md`.

@@ -33,24 +33,6 @@ prompts/server-agent.md
 prompts/request-client-agent.md
 ```
 
-## 推荐技能
-
-下面这些 Matt Pocock 技能适合本项目，可按任务需要调用：
-
-- `grill-me`：实现前压力测试不清晰的方案。
-- `grilling`：一次只问一个关键设计问题，直到需求足够清楚。
-- `grill-with-docs`：边澄清方案，边更新长期设计文档和 ADR。
-- `setup-matt-pocock-skills`：当 issue 跟踪和领域文档准备好后，配置工程技能约定。
-- `domain-modeling`：定义 ASR 网关术语、生命周期状态、适配器概念和 ADR。
-- `codebase-design`：设计深模块，保持适配器和生命周期边界清晰。
-- `diagnosing-bugs`：诊断失败测试、生命周期竞态、网络问题和性能回退。
-- `tdd`：通过公共接口测试优先实现 API 和生命周期行为。
-- `implement`：根据 PRD 或 issue 实现功能，并完成测试和最终审查。
-- `to-prd`：把已经达成共识的讨论整理成 PRD。
-- `to-issues`：把 PRD 拆成可独立完成的纵向切片。
-- `prototype`：为生命周期状态机或适配器行为创建一次性实验。
-- `handoff`：在不重复已有文档的前提下，为下一个代理总结交接信息。
-
 ## 开发原则
 
 - 公共 API 必须和 `docs/asr-server-prd.md` 保持一致。

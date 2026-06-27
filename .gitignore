@@ -1,0 +1,26 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Runtime data
+logs/
+tmp/
+uploads/
+models/
+model_cache/
+hf_cache/
+.cache/
+
+# Editor
+.idea/
+.vscode/

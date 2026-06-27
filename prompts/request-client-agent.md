@@ -1,6 +1,6 @@
 # 请求端 Agent 提示词
 
-你是 Mac mini 本地项目的开发 agent。你的任务是把项目接入一台局域网内的 WSL ASR 服务器。
+你是 Mac mini 本地项目的开发代理。你的任务是把项目接入一台局域网内的 WSL ASR 服务器。
 
 ASR 服务地址：
 
@@ -13,7 +13,7 @@ http://192.168.31.137:18080
 - Mac 上可能存在 `http_proxy`、`https_proxy`、`all_proxy` 指向 `127.0.0.1:7897`。
 - 请求局域网 ASR 服务时必须绕过代理。
 - 命令行测试使用 `curl --noproxy '*'`。
-- 代码里设置 `NO_PROXY=192.168.31.137,localhost,127.0.0.1` 或使用等价的 per-request no-proxy 配置。
+- 代码里设置 `NO_PROXY=192.168.31.137,localhost,127.0.0.1`，或使用等价的单请求绕过代理配置。
 
 请完成以下任务：
 

@@ -1,82 +1,82 @@
-# Agent Development Guide
+# 代理开发指南
 
-## Project Context
+## 项目背景
 
-This repository defines and will host a local-network ASR gateway for Mac mini clients calling a GPU-backed service running inside Windows WSL Arch Linux.
+这个仓库用于实现一个局域网 ASR 网关：Mac mini 客户端通过 HTTP 调用运行在 Windows WSL Arch Linux 内的 GPU ASR 服务。
 
-Primary deployment target:
+主要部署目录：
 
 ```text
 /home/fragt/services/asr-server
 ```
 
-Public LAN endpoint:
+局域网公开入口：
 
 ```text
 http://192.168.31.137:18080
 ```
 
-The Mac mini is only a lightweight development and client-validation machine. GPU inference, CUDA validation, model package installation, and long-running service deployment must happen inside WSL Arch Linux on the Windows PC.
+Mac mini 只作为轻量开发机和客户端验收机。真实 GPU 推理、CUDA 验证、模型包安装、长期后台服务部署，都必须在 Windows PC 的 WSL Arch Linux 内完成。
 
-## Required Reading
+## 必读文档
 
-Before implementing service behavior, read:
+实现服务行为前，必须先读：
 
 ```text
 docs/asr-server-prd.md
 ```
 
-Use these prompts when handing work to focused agents:
+把任务交给专门代理时，使用这些提示词：
 
 ```text
 prompts/server-agent.md
 prompts/request-client-agent.md
 ```
 
-## Recommended Installed Skills
+## 推荐技能
 
-The following Matt Pocock skills are useful for this project and may be invoked when they fit the task:
+下面这些 Matt Pocock 技能适合本项目，可按任务需要调用：
 
-- `grill-me`: stress-test an unclear plan before implementation.
-- `grilling`: ask one focused design question at a time until requirements are sharp.
-- `grill-with-docs`: refine a plan while also updating durable domain docs and ADRs.
-- `setup-matt-pocock-skills`: configure this repo for Matt Pocock's engineering-skill conventions when issue tracking and domain docs are ready.
-- `domain-modeling`: define ASR gateway terms, lifecycle states, adapter concepts, and ADRs.
-- `codebase-design`: design deep modules and clean adapter/lifecycle seams.
-- `diagnosing-bugs`: debug failing tests, lifecycle races, networking failures, and performance regressions.
-- `tdd`: build API and lifecycle behavior test-first through public interfaces.
-- `implement`: implement a PRD or issue with tests and a final review pass.
-- `to-prd`: turn a resolved discussion into a PRD.
-- `to-issues`: split a PRD into independently implementable vertical slices.
-- `prototype`: create throwaway experiments for lifecycle state machines or adapter behavior.
-- `handoff`: summarize a session for another agent without duplicating existing docs.
+- `grill-me`：实现前压力测试不清晰的方案。
+- `grilling`：一次只问一个关键设计问题，直到需求足够清楚。
+- `grill-with-docs`：边澄清方案，边更新长期设计文档和 ADR。
+- `setup-matt-pocock-skills`：当 issue 跟踪和领域文档准备好后，配置工程技能约定。
+- `domain-modeling`：定义 ASR 网关术语、生命周期状态、适配器概念和 ADR。
+- `codebase-design`：设计深模块，保持适配器和生命周期边界清晰。
+- `diagnosing-bugs`：诊断失败测试、生命周期竞态、网络问题和性能回退。
+- `tdd`：通过公共接口测试优先实现 API 和生命周期行为。
+- `implement`：根据 PRD 或 issue 实现功能，并完成测试和最终审查。
+- `to-prd`：把已经达成共识的讨论整理成 PRD。
+- `to-issues`：把 PRD 拆成可独立完成的纵向切片。
+- `prototype`：为生命周期状态机或适配器行为创建一次性实验。
+- `handoff`：在不重复已有文档的前提下，为下一个代理总结交接信息。
 
-## Development Principles
+## 开发原则
 
-- Keep the public API aligned with `docs/asr-server-prd.md`.
-- Use Python 3.12, uv, FastAPI, and Uvicorn for the service implementation.
-- Keep the service entrypoint listening on `0.0.0.0:18080`.
-- Do not use `/mnt/c` as the WSL project location; deploy under `/home/fragt/services/asr-server`.
-- Do not expose worker ports `8001` or `8002` to the LAN unless the PRD is explicitly changed.
-- Do not reuse historical test port `8765` for implementation, deployment, firewall, or startup configuration.
-- Do not add Web UI work before the API, lifecycle manager, tests, and first transcription path are working.
+- 公共 API 必须和 `docs/asr-server-prd.md` 保持一致。
+- 使用 Python 3.12、uv、FastAPI 和 Uvicorn 实现服务。
+- 服务入口监听 `0.0.0.0:18080`。
+- WSL 项目位置不要放在 `/mnt/c`；正式部署目录是 `/home/fragt/services/asr-server`。
+- 除非 PRD 明确变更，不要把 worker 端口 `8001` 暴露到局域网。
+- 不要把历史测试端口 `8765` 写入实现、部署、防火墙或启动配置。
+- API、生命周期管理、测试和第一条转录路径完成前，不要做 Web UI。
 
-## Cross-Platform Rules
+## 跨平台边界
 
-- macOS development may create project skeletons, schemas, tests, mock adapters, and documentation.
-- macOS development must not require CUDA, NVIDIA drivers, model downloads, or large local model caches.
-- WSL Arch Linux development is responsible for CUDA checks, `nvidia-smi`, disk-space checks, real Qwen/MiMo dependencies, and model inference validation.
-- Keep heavy model dependencies lazy-loaded inside adapters so basic imports and tests can run without a GPU.
-- Keep path handling POSIX-compatible and avoid hardcoded macOS-only paths in service code.
+- macOS 侧可以创建项目骨架、schema、测试、mock 适配器、客户端验证脚本和文档。
+- macOS 侧不得要求 CUDA、NVIDIA 驱动、模型下载或大型本地模型缓存。
+- WSL Arch Linux 侧负责 CUDA 检查、`nvidia-smi`、磁盘空间检查、真实 Qwen 依赖安装和模型推理验证。
+- 大模型依赖必须在适配器内懒加载，保证基础 import 和测试在无 GPU 环境也能运行。
+- 路径处理保持 POSIX 兼容，不要在服务代码里硬编码 macOS 专用路径。
 
-## API And Lifecycle Rules
+## API 与生命周期规则
 
-- Model capability discovery must come from `GET /v1/models`; clients should not hardcode capabilities.
-- Model states must use the PRD enum: `unloaded`, `loading`, `loaded`, `unloading_scheduled`, `unloading`, `error`.
-- Every model must maintain active request counting and a lifecycle lock.
-- If unload is requested while active requests exist, set `unloading_scheduled`, reject new same-model requests with `409 model_unloading_scheduled`, and unload only after active requests finish.
-- Do not force-unload a model while inference is active.
-- Return errors using the PRD error envelope:
+- 模型能力发现必须来自 `GET /v1/models`；客户端不要硬编码模型能力。
+- 模型状态必须使用 PRD 枚举：`unloaded`、`loading`、`loaded`、`unloading_scheduled`、`unloading`、`error`。
+- 每个模型必须维护活跃请求计数和生命周期锁。
+- 如果卸载请求到来时仍有活跃请求，设置 `unloading_scheduled`，新的同模型请求返回 `409 model_unloading_scheduled`，等活跃请求完成后再卸载。
+- 推理仍在执行时，不要强制卸载模型。
+- 错误必须使用 PRD 错误信封：
 
 ```json
 {
@@ -88,32 +88,33 @@ The following Matt Pocock skills are useful for this project and may be invoked 
 }
 ```
 
-## Networking And Security
+## 网络与安全
 
-- The only LAN-facing API port is `18080`.
-- Mac clients must bypass local proxies for `192.168.31.137`, for example with `curl --noproxy '*'`.
-- Support optional bearer-token authentication, but do not require public-network assumptions.
-- Do not add public tunneling, port mapping, or internet exposure.
-- Uploaded audio should be stored in temporary locations and cleaned after inference.
-- Logs must not save full audio contents by default.
+- 唯一面向局域网的 API 端口是 `18080`。
+- Mac 客户端请求 `192.168.31.137` 时必须绕过本机代理，例如使用 `curl --noproxy '*'`。
+- 支持可选 Bearer Token 鉴权，但不要假设服务会暴露到公网。
+- 不要添加公网隧道、端口映射或互联网暴露。
+- 上传音频应写入临时位置，并在推理结束后清理。
+- 日志默认不要保存完整音频内容。
 
-## Testing Expectations
+## 测试要求
 
-At minimum, cover:
+至少覆盖：
 
-- Health check.
-- Model list and model status.
-- Model load and unload behavior.
-- Unload waiting for active requests.
-- Rejection of new requests during `unloading_scheduled`.
-- Transcription parameter validation.
-- Unsupported capability errors, including MiMo forced alignment.
+- 健康检查。
+- 模型列表和单模型状态。
+- 模型加载和卸载行为。
+- 卸载等待活跃请求完成。
+- `unloading_scheduled` 状态下拒绝新请求。
+- 转录接口参数校验。
+- 未声明能力的错误处理，例如 timestamps、forced alignment 或 streaming 返回 `capability_not_supported`。
+- Qwen 两个尺寸和 `/v1/models` 中声明的所有后端的转录路径。
 
-Use mock adapters first so lifecycle and API behavior can be tested before real model integration.
+先用 mock 适配器覆盖生命周期和 API 行为，再在 WSL Arch Linux 内接入真实 Qwen 模型。
 
-## Git Hygiene
+## Git 规范
 
-- Keep generated caches, virtual environments, model caches, uploads, and local runtime data out of Git.
-- Keep documentation and prompts in stable paths so agent handoffs remain valid.
-- Make focused commits with clear messages.
-- Do not commit machine-specific secrets, tokens, downloaded models, or audio samples containing private content.
+- 生成缓存、虚拟环境、模型缓存、上传文件和本地运行数据不要进 Git。
+- 文档和提示词保持在稳定路径，方便代理交接。
+- 提交要聚焦，提交信息要清楚。
+- 不要提交机器专用 secret、token、下载模型或包含隐私内容的音频样本。

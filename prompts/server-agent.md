@@ -30,11 +30,12 @@ docs/asr-server-prd.md
 - 第一版优先做稳定的离线转写，不要一开始就实现 Web UI。
 - 模型包很重，安装前先检查磁盘空间、CUDA、`nvidia-smi`。
 
-首批模型：
+初版模型只包含：
 
 - `qwen3-asr-1.7b`
 - `qwen3-asr-0.6b`
-- `mimo-v2.5-asr`
+
+MiMo-V2.5-ASR 不进入初版交付范围；不要把 MiMo 写进 `/v1/models`，也不要把 MiMo 转写作为初版验收项。
 
 必须实现的 API：
 
@@ -46,8 +47,9 @@ POST /v1/models/{model_id}/load
 DELETE /v1/models/{model_id}
 DELETE /v1/models
 POST /v1/audio/transcriptions
-POST /v1/audio/alignments
 ```
+
+`POST /v1/audio/alignments`、WebSocket 流式转写、时间戳等高级能力只在真实实现并验收后再打开 capabilities；未打开时返回 `capability_not_supported` 或不暴露入口。
 
 模型状态枚举：
 
@@ -85,7 +87,6 @@ asr_server/
     __init__.py
     base.py
     qwen.py
-    mimo.py
 tests/
   test_health.py
   test_models.py
@@ -97,15 +98,14 @@ README.md
 
 开发顺序：
 
-1. 创建 FastAPI 项目骨架和 `/health`。
-2. 实现模型注册表和 `/v1/models`。
-3. 实现模型生命周期状态机，并写测试覆盖并发卸载语义。
-4. 先用 mock adapter 打通 `POST /v1/audio/transcriptions`。
-5. 接入 Qwen3-ASR adapter。
-6. 接入 MiMo-V2.5-ASR adapter。
-7. 补充 `/v1/audio/alignments`，如果模型不支持则返回 `capability_not_supported`。
-8. 增加 systemd user service 或 Windows 启动任务，让服务可后台常驻。
-9. 从 Mac mini 验收局域网调用。
+1. 阅读现有 Mac 侧实现和测试，保留 API 合约、错误 envelope、生命周期语义。
+2. 在 WSL Arch Linux 的 `/home/fragt/services/asr-server` 部署项目，不要放在 `/mnt/c`。
+3. 检查磁盘空间、CUDA、`nvidia-smi`、Python 3.12、uv。
+4. 接入 Qwen3-ASR adapter，真实跑通 `qwen3-asr-0.6b` 与 `qwen3-asr-1.7b`。
+5. 对 `/v1/models` 中声明的每个 backend 都做端到端转写验收；若某个 backend 不能跑通，不要声明它。
+6. 保持 mock adapter 测试可在无 GPU 环境通过。
+7. 增加 systemd user service 或 Windows 启动任务，让服务可后台常驻。
+8. 从 Mac mini 验收局域网调用。
 
 测试命令：
 
@@ -128,12 +128,12 @@ curl --noproxy '*' -v http://192.168.31.137:18080/v1/models
 - 可运行的 FastAPI ASR 服务。
 - README 中写明启动、停止、开机自启、Mac 调用方式。
 - 测试覆盖健康检查、模型列表、加载、卸载、卸载等待当前请求完成、转写接口参数校验。
-- 给出一次真实音频的 Qwen 转写验收结果。
-- 给出一次真实音频的 MiMo 转写验收结果，或明确说明 MiMo 未能部署的具体阻塞点。
+- 给出 `qwen3-asr-0.6b` 在所有声明后端上的真实音频转写验收结果。
+- 给出 `qwen3-asr-1.7b` 在所有声明后端上的真实音频转写验收结果。
 
 不要做：
 
 - 不要开放公网。
 - 不要默认经过代理访问局域网 IP。
 - 不要在活跃请求还没结束时强行卸载模型。
-- 不要把 Qwen 和 MiMo 的差异暴露给请求端，必须由统一 API 屏蔽。
+- 不要在 `/v1/models` 中声明未真实跑通的模型、后端或高级能力。

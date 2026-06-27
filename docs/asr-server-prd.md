@@ -1,15 +1,16 @@
 # WSL ASR Server PRD
 
-更新时间：2026-06-26
+更新时间：2026-06-27
 
 ## 1. 背景
 
 当前 Windows 主机已通过 WSL2 Arch Linux 暴露局域网服务，Mac mini 已验证可以访问 WSL mirrored networking 下的局域网服务。目标是在 WSL 内常驻一个 ASR 服务，让 Mac mini 上的本地项目可以通过 HTTP API 调用 Windows/WSL 内的 GPU 模型完成音频转录。
 
-首批支持模型：
+初版支持模型只包含 Qwen3-ASR 两个尺寸：
 
 - QwenLM/Qwen3-ASR：https://github.com/QwenLM/Qwen3-ASR
-- XiaomiMiMo/MiMo-V2.5-ASR：https://github.com/XiaomiMiMo/MiMo-V2.5-ASR
+
+MiMo-V2.5-ASR 不进入初版交付范围，保留为后续扩展候选。
 
 硬件前提：
 
@@ -20,7 +21,7 @@
 
 ## 2. 目标
 
-构建一个常驻 WSL 后台的统一 ASR 网关，屏蔽 Qwen3-ASR 与 MiMo-V2.5-ASR 的模型差异，对 Mac mini 提供稳定、可探测、可管理、可扩展的 API。
+构建一个常驻 WSL 后台的统一 ASR 网关，让 Mac mini 可以通过稳定、可探测、可管理的 API 调用 WSL Arch Linux 上的 Qwen3-ASR GPU 转录能力。
 
 必须支持：
 
@@ -30,8 +31,9 @@
 - 请求卸载指定模型或全部模型。
 - 卸载模型时保证当前正在执行的请求完成后再卸载，并拒绝新的同模型请求。
 - 上传音频并获取转写结果。
-- 对 Qwen3-ASR 暴露时间戳、强制对齐、流式转写等可选能力。
-- 对 MiMo-V2.5-ASR 暴露语言提示、离线高质量转写能力。
+- 跑通 `qwen3-asr-0.6b` 和 `qwen3-asr-1.7b` 的端到端转录流程。
+- 对每个 Qwen3-ASR 模型跑通所有在 `/v1/models` 中声明支持的推理后端；初版声明支持 `transformers` 与 `vllm` 时，两者都必须能完成转录。
+- `/v1/models` 只声明已经实现并通过验收的能力；时间戳、强制对齐、流式转写等高级能力不作为初版发布验收前提。
 
 暂不做：
 
@@ -40,6 +42,7 @@
 - 分布式多机调度。
 - Web 管理后台。
 - Windows Docker 部署。
+- MiMo-V2.5-ASR 适配器与验收。
 
 ## 3. 用户与场景
 
@@ -48,7 +51,7 @@
 典型场景：
 
 1. Mac 项目启动时调用 `GET /v1/models`，发现服务端可用模型与能力。
-2. Mac 项目上传音频到 `POST /v1/audio/transcriptions`，指定 `model=qwen3-asr-1.7b` 或 `model=mimo-v2.5-asr`。
+2. Mac 项目上传音频到 `POST /v1/audio/transcriptions`，指定 `model=qwen3-asr-1.7b` 或 `model=qwen3-asr-0.6b`。
 3. 长音频或批处理时，Mac 项目创建异步任务，再轮询任务状态。
 4. 长时间不用某个模型时，Mac 项目或运维脚本调用卸载接口释放显存。
 5. 如果服务端正在处理请求，卸载动作进入排队状态，当前请求结束后再释放模型。
@@ -63,32 +66,27 @@ flowchart LR
   Gateway --> Registry["Model Registry"]
   Gateway --> Manager["Model Lifecycle Manager"]
   Gateway --> Qwen["Qwen3-ASR Adapter"]
-  Gateway --> MiMo["MiMo-V2.5-ASR Adapter"]
   Qwen --> GPU["NVIDIA GPU in WSL"]
-  MiMo --> GPU
 ```
 
 建议进程：
 
 - `asr-gateway`：对 Mac 暴露 HTTP API，监听 `0.0.0.0:18080`。
 - `qwen-adapter`：可先内嵌在 gateway 进程内，后续如需 vLLM serving 再拆成独立 worker。
-- `mimo-adapter`：可先内嵌在 gateway 进程内。
 
 端口规划：
 
 - `18080`：唯一对 Mac mini 暴露的正式 ASR API 入口。服务进程运行在 WSL Arch Linux 内，监听 `0.0.0.0:18080`；Windows 侧只需要为这个端口添加专用网络入站防火墙规则。
 - `8001`：可选的 WSL 内部 Qwen3-ASR worker 端口。只有当后续把 Qwen 适配器拆成独立 worker 进程时才使用；默认第一版不需要开放。若启用，必须只绑定 WSL 内部 loopback 或 Unix socket，不为 Windows 防火墙添加入站规则，不对 Mac mini 暴露。
-- `8002`：可选的 WSL 内部 MiMo-V2.5-ASR worker 端口。只有当后续把 MiMo 适配器拆成独立 worker 进程时才使用；默认第一版不需要开放。若启用，必须只绑定 WSL 内部 loopback 或 Unix socket，不为 Windows 防火墙添加入站规则，不对 Mac mini 暴露。
 
 历史测试端口 `8765` 不属于正式设计，不应写入部署、启动、自启或防火墙配置。正式验收只使用 `18080`。
 
 ## 5. 模型能力矩阵
 
-| 模型 | 模型 ID | 首选用途 | 支持能力 | 限制 |
+| 模型 | 模型 ID | 首选用途 | 初版验收能力 | 限制 |
 | --- | --- | --- | --- | --- |
-| Qwen3-ASR 0.6B | `qwen3-asr-0.6b` | 轻量转写、较低显存占用 | 离线转写、语言提示、时间戳、强制对齐、可接 vLLM | 质量和复杂音频能力弱于 1.7B |
-| Qwen3-ASR 1.7B | `qwen3-asr-1.7b` | 默认主力模型 | 离线转写、流式转写、语言提示、长音频、歌声/BGM、时间戳、强制对齐、vLLM serving | 流式与部分高级能力依赖 Qwen 官方后端支持 |
-| MiMo-V2.5-ASR | `mimo-v2.5-asr` | 中文/英文、方言、噪声、多说话人、歌声、知识密集音频 | 离线转写、语言提示、自动语言、原生标点 | 不作为第一版流式模型；如无官方时间戳接口，统一返回无时间戳 |
+| Qwen3-ASR 0.6B | `qwen3-asr-0.6b` | 轻量转写、较低显存占用 | 离线转写、语言提示、`transformers` 后端转写、`vllm` 后端转写 | 质量和复杂音频能力弱于 1.7B；高级能力后续按实测结果逐项打开 |
+| Qwen3-ASR 1.7B | `qwen3-asr-1.7b` | 默认主力模型 | 离线转写、语言提示、`transformers` 后端转写、`vllm` 后端转写 | 流式、时间戳、强制对齐等高级能力不阻塞初版发布 |
 
 ## 6. API 设计
 
@@ -127,17 +125,17 @@ flowchart LR
       "default": true,
       "capabilities": {
         "transcription": true,
-        "streaming": true,
-        "timestamps": ["word", "char"],
-        "forced_alignment": true,
+        "streaming": false,
+        "timestamps": [],
+        "forced_alignment": false,
         "languages": ["auto", "zh", "en", "yue", "ar", "de", "fr", "es", "pt", "id", "it", "ko", "ru", "th", "vi", "ja", "tr", "hi", "ms", "nl", "sv", "da", "fi", "pl", "cs", "fil", "fa", "el", "hu", "mk", "ro"],
         "chinese_dialects": ["Anhui", "Dongbei", "Fujian", "Gansu", "Guizhou", "Hebei", "Henan", "Hubei", "Hunan", "Jiangxi", "Ningxia", "Shandong", "Shaanxi", "Shanxi", "Sichuan", "Tianjin", "Yunnan", "Zhejiang", "Cantonese-Hong-Kong-accent", "Cantonese-Guangdong-accent", "Wu", "Minnan"],
         "backends": ["transformers", "vllm"]
       }
     },
     {
-      "id": "mimo-v2.5-asr",
-      "provider": "XiaomiMiMo",
+      "id": "qwen3-asr-0.6b",
+      "provider": "QwenLM",
       "status": "unloaded",
       "default": false,
       "capabilities": {
@@ -145,8 +143,9 @@ flowchart LR
         "streaming": false,
         "timestamps": [],
         "forced_alignment": false,
-        "languages": ["auto", "zh", "en"],
-        "backends": ["transformers"]
+        "languages": ["auto", "zh", "en", "yue", "ar", "de", "fr", "es", "pt", "id", "it", "ko", "ru", "th", "vi", "ja", "tr", "hi", "ms", "nl", "sv", "da", "fi", "pl", "cs", "fil", "fa", "el", "hu", "mk", "ro"],
+        "chinese_dialects": ["Anhui", "Dongbei", "Fujian", "Gansu", "Guizhou", "Hebei", "Henan", "Hubei", "Hunan", "Jiangxi", "Ningxia", "Shandong", "Shaanxi", "Shanxi", "Sichuan", "Tianjin", "Yunnan", "Zhejiang", "Cantonese-Hong-Kong-accent", "Cantonese-Guangdong-accent", "Wu", "Minnan"],
+        "backends": ["transformers", "vllm"]
       }
     }
   ]
@@ -264,7 +263,7 @@ flowchart LR
       "active_requests": 1
     },
     {
-      "id": "mimo-v2.5-asr",
+      "id": "qwen3-asr-0.6b",
       "status": "unloaded",
       "active_requests": 0
     }
@@ -299,13 +298,7 @@ Content-Type: `multipart/form-data`
   "language": "zh",
   "text": "这是转写结果。",
   "duration": 12.35,
-  "timestamps": [
-    {
-      "start": 0.0,
-      "end": 1.24,
-      "text": "这是"
-    }
-  ],
+  "timestamps": [],
   "segments": [],
   "usage": {
     "audio_seconds": 12.35
@@ -318,7 +311,7 @@ Content-Type: `multipart/form-data`
 
 `POST /v1/audio/alignments`
 
-首版仅 Qwen3-ASR 支持。
+预留接口，后续仅 Qwen3-ASR 模型支持。只有当对应模型和后端已通过能力验收时，`forced_alignment` 才能在 `/v1/models` 中标记为 `true`。
 
 Content-Type: `multipart/form-data`
 
@@ -348,13 +341,13 @@ Content-Type: `multipart/form-data`
 }
 ```
 
-如果请求 MiMo：
+如果请求不支持强制对齐的模型或后端：
 
 ```json
 {
   "error": {
     "code": "capability_not_supported",
-    "message": "mimo-v2.5-asr does not support forced alignment in this server"
+    "message": "requested model/backend does not support forced alignment in this server"
   }
 }
 ```
@@ -377,11 +370,11 @@ Content-Type: `multipart/form-data`
 
 Qwen3-ASR 官方支持流式推理，但当前边界需要在 API 中明确：
 
-- 仅 Qwen3-ASR 支持流式转写，MiMo-V2.5-ASR 第一版不支持。
 - Qwen3-ASR streaming 当前依赖 vLLM backend；transformers backend 不作为流式实现路径。
 - 流式请求不支持 batch inference。
 - 流式请求不返回 timestamps；需要 timestamps 时应使用非流式转写或强制对齐接口。
 - 流式转写面向“实时输入”，例如麦克风、通话、边录边转；不替代长音频文件上传后的服务端切分。
+- 如果流式转写未在初版实现或未通过验收，`/v1/models` 中对应模型的 `streaming` 必须为 `false`。
 
 建议流式 API：
 
@@ -444,7 +437,6 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 | --- | --- | --- | --- | --- |
 | `qwen3-asr-1.7b` | 180 秒 | 300 秒 | 2 秒 | Qwen3-ASR 官方说明支持 long audio；为了稳定延迟和显存，默认仍按 3 分钟软切分。请求时间戳或强制对齐时，单段不得超过 300 秒。 |
 | `qwen3-asr-0.6b` | 180 秒 | 300 秒 | 2 秒 | 与 1.7B 保持一致；后续可根据吞吐测试放宽。 |
-| `mimo-v2.5-asr` | 60 秒 | 120 秒 | 2 秒 | MiMo 官方模型卡未给出明确长音频窗口；首版采用更保守窗口，优先保证质量和显存稳定。 |
 
 同步与异步阈值：
 
@@ -534,7 +526,7 @@ uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
 Windows 防火墙：
 
 - 需要允许专用网络入站 TCP `18080`。
-- 不需要为 `8001`、`8002` 添加 Windows 防火墙入站规则；它们只是未来可选的 WSL 内部 worker 通信端口。
+- 不需要为 `8001` 添加 Windows 防火墙入站规则；它只是未来可选的 WSL 内部 Qwen worker 通信端口。
 - 不需要保留或开放 `8765`；它只是此前连通性测试端口。
 - Mac 请求局域网服务时需要绕过本机代理，例如 `curl --noproxy '*' http://192.168.31.137:18080/health`。
 
@@ -583,12 +575,17 @@ limits:
 连通性：
 
 - Mac mini 执行 `curl --noproxy '*' http://192.168.31.137:18080/health` 返回 `status=ok`。
-- Mac mini 执行 `curl --noproxy '*' http://192.168.31.137:18080/v1/models` 能看到 Qwen 与 MiMo 模型。
+- Mac mini 执行 `curl --noproxy '*' http://192.168.31.137:18080/v1/models` 能看到 `qwen3-asr-0.6b` 与 `qwen3-asr-1.7b`。
+- `/v1/models` 不展示未进入初版交付范围的 MiMo 模型，也不声明未验收通过的高级能力。
 
 转写：
 
-- 上传一段 10 秒中文音频，Qwen3-ASR 返回非空 `text`。
-- 上传一段 10 秒中文音频，MiMo-V2.5-ASR 返回非空 `text`。
+- Mac mini 通过局域网向 `POST /v1/audio/transcriptions` 上传一段 10 秒中文音频，`qwen3-asr-0.6b` + `transformers` 返回非空 `text`。
+- Mac mini 通过局域网向 `POST /v1/audio/transcriptions` 上传一段 10 秒中文音频，`qwen3-asr-0.6b` + `vllm` 返回非空 `text`。
+- Mac mini 通过局域网向 `POST /v1/audio/transcriptions` 上传一段 10 秒中文音频，`qwen3-asr-1.7b` + `transformers` 返回非空 `text`。
+- Mac mini 通过局域网向 `POST /v1/audio/transcriptions` 上传一段 10 秒中文音频，`qwen3-asr-1.7b` + `vllm` 返回非空 `text`。
+- 默认模型 `qwen3-asr-1.7b` 在不显式传 `backend` 时可以用 `backend=auto` 完成转录。
+- 前端 Mac 客户端只依赖 `GET /v1/models` 的模型与后端发现结果，不硬编码服务端未声明的能力。
 
 模型管理：
 
@@ -599,8 +596,8 @@ limits:
 
 能力探测：
 
-- 请求 MiMo 强制对齐返回 `capability_not_supported`。
-- 请求 Qwen 时间戳在可用后端下返回 `timestamps`。
+- 请求未声明的高级能力，例如 timestamps、forced alignment 或 streaming，返回 `capability_not_supported`，或在能力未声明时由客户端避免发起该请求。
+- 任意出现在 `/v1/models` capabilities 中的能力都必须有对应的 Mac 到 WSL 端到端验收记录。
 
 ## 12. 后续路线
 
@@ -608,21 +605,23 @@ limits:
 
 - FastAPI 网关。
 - 模型注册表。
-- Qwen 与 MiMo 适配器最小可用转写。
+- Qwen3-ASR 0.6B 与 1.7B 适配器最小可用转写。
+- Qwen3-ASR 两个尺寸在所有声明支持的推理后端上完成端到端转录验收。
 - 模型加载/卸载状态机。
 - Mac 局域网访问验收。
 
 优先级 P1：
 
 - 异步任务。
-- Qwen 强制对齐。
 - 上传文件大小、时长、格式限制。
 - systemd user service 或 Windows 开机启动。
+- Qwen 时间戳与强制对齐能力，按后端实测结果逐项声明。
 
 优先级 P2：
 
-- Qwen vLLM worker。
+- Qwen vLLM 独立 worker。
 - WebSocket 流式转写。
+- MiMo-V2.5-ASR 适配器调研与转写验收。
 - 简单 Web 管理页。
 - 多模型队列与优先级。
 

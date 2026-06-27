@@ -10,6 +10,7 @@ This repository contains the planning documents and agent prompts for a local-ne
 - `asr_server/`: FastAPI app, model registry, lifecycle manager, and mock ASR adapter.
 - `tests/`: API and lifecycle behavior tests that run without CUDA.
 - `scripts/asr_client.py`: Mac-side validation client that bypasses local proxy settings.
+- `test-fixtures/audio/`: user-provided audio samples for WSL-side ASR self-tests.
 
 ## Deployment Target
 

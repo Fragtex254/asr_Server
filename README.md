@@ -6,6 +6,7 @@
 
 - `docs/asr-server-prd.md`：产品需求和 API 合约。
 - `prompts/server-agent.md`：给 WSL Arch Linux 服务端开发代理的实现提示词。
+- `prompts/wsl-project-brief.md`：给 WSL 侧代理开工前阅读的项目总览提示词。
 - `prompts/request-client-agent.md`：给 Mac 侧客户端项目的接入提示词。
 - `asr_server/`：FastAPI 应用、模型注册表、生命周期管理器和 mock ASR 适配器。
 - `tests/`：不依赖 CUDA 的 API 和生命周期行为测试。

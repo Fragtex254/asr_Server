@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from time import perf_counter
 
-from asr_server.adapters.base import AsrAdapter, TranscriptionResult
+from asr_server.adapters.base import AsrAdapter, TranscriptionResult, TranscriptionTimings
 from asr_server.errors import AsrError
 from asr_server.registry import Backend, ModelDefinition, ModelStatus
 
@@ -153,6 +154,27 @@ class ModelLifecycleManager:
         language: str,
         timestamps: str,
     ) -> tuple[str, TranscriptionResult]:
+        resolved_backend, results, timings = await self.transcribe_chunks(
+            [audio],
+            model_id=model_id,
+            backend=backend,
+            language=language,
+            timestamps=timestamps,
+        )
+        return resolved_backend, replace(results[0], timings=timings)
+
+    async def transcribe_chunks(
+        self,
+        audio_chunks: list[bytes],
+        *,
+        model_id: str | None,
+        backend: Backend,
+        language: str,
+        timestamps: str,
+    ) -> tuple[str, list[TranscriptionResult], TranscriptionTimings]:
+        if not audio_chunks:
+            raise AsrError(400, "bad_request", "audio request did not contain any chunks")
+        request_started = perf_counter()
         selected_model_id = model_id or self.default_model_id
         runtime = self.runtime_for(selected_model_id)
         if timestamps != "none" and not runtime.definition.capabilities.timestamps:
@@ -162,21 +184,38 @@ class ModelLifecycleManager:
                 f"{selected_model_id} does not support timestamps in this server",
                 {"timestamps": timestamps},
             )
-        resolved_backend = await self._begin_request(runtime, backend=backend)
+        resolved_backend, load_ms = await self._begin_request(runtime, backend=backend)
         try:
-            result = await runtime.adapter.transcribe(
-                audio,
-                model_id=selected_model_id,
-                backend=resolved_backend,
-                language=language,
-            )
+            results = []
+            for audio in audio_chunks:
+                chunk_started = perf_counter()
+                result = await runtime.adapter.transcribe(
+                    audio,
+                    model_id=selected_model_id,
+                    backend=resolved_backend,
+                    language=language,
+                )
+                if result.timings.total_ms == 0:
+                    result = replace(
+                        result,
+                        timings=replace(result.timings, total_ms=(perf_counter() - chunk_started) * 1000),
+                    )
+                results.append(result)
             runtime.last_used_at = utc_now_iso()
-            return resolved_backend, result
+            timings = TranscriptionTimings(
+                total_ms=(perf_counter() - request_started) * 1000,
+                load_ms=load_ms,
+                decode_ms=sum(result.timings.decode_ms for result in results),
+                inference_ms=sum(result.timings.inference_ms for result in results),
+                postprocess_ms=sum(result.timings.postprocess_ms for result in results),
+            )
+            return resolved_backend, results, timings
         finally:
             await self._finish_request(runtime)
 
-    async def _begin_request(self, runtime: ModelRuntime, *, backend: Backend) -> str:
+    async def _begin_request(self, runtime: ModelRuntime, *, backend: Backend) -> tuple[str, float]:
         resolved_backend = self.resolve_backend(runtime, backend)
+        load_ms = 0.0
         async with runtime.lock:
             if runtime.status == "unloading_scheduled" or runtime.rejecting_new_requests:
                 raise AsrError(
@@ -194,13 +233,15 @@ class ModelLifecycleManager:
                 )
             if runtime.status in ("unloaded", "error") or runtime.backend != resolved_backend:
                 runtime.status = "loading"
+                load_started = perf_counter()
                 await runtime.adapter.load(resolved_backend, "cuda", "auto")
+                load_ms = (perf_counter() - load_started) * 1000
                 runtime.status = "loaded"
                 runtime.backend = resolved_backend
                 runtime.loaded_at = utc_now_iso()
                 runtime.rejecting_new_requests = False
             runtime.active_requests += 1
-            return resolved_backend
+            return resolved_backend, load_ms
 
     async def _finish_request(self, runtime: ModelRuntime) -> None:
         async with runtime.lock:
@@ -217,4 +258,3 @@ class ModelLifecycleManager:
         runtime.backend = None
         runtime.loaded_at = None
         runtime.vram_allocated_mb = None
-

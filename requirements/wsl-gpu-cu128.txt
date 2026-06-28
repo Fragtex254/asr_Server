@@ -1,0 +1,8 @@
+# WSL GPU runtime pins. Install with:
+# uv pip install --torch-backend cu128 -r requirements/wsl-gpu-cu128.txt
+torch==2.11.0
+torchvision==0.26.0
+torchaudio==2.11.0
+numba==0.65.1
+llvmlite==0.47.0
+qwen-asr==0.0.6

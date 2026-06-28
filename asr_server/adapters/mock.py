@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from time import perf_counter
 
-from asr_server.adapters.base import TranscriptionResult
+from asr_server.adapters.base import TranscriptionResult, TranscriptionTimings
 
 
 class MockAsrAdapter:
@@ -26,8 +27,10 @@ class MockAsrAdapter:
         backend: str,
         language: str,
     ) -> TranscriptionResult:
+        inference_started = perf_counter()
         if self.delay_seconds > 0:
             await asyncio.sleep(self.delay_seconds)
+        inference_ms = (perf_counter() - inference_started) * 1000
         text = f"mock transcription for {model_id} using {backend}"
         if audio:
             text += f" ({len(audio)} bytes)"
@@ -36,5 +39,5 @@ class MockAsrAdapter:
             duration=max(len(audio) / 16_000, 0.01),
             language="zh" if language == "auto" else language,
             warnings=["mock_adapter"],
+            timings=TranscriptionTimings(inference_ms=inference_ms),
         )
-

@@ -31,6 +31,48 @@ uv run pytest -q
 uv run mypy asr_server tests scripts
 ```
 
+## GPU 运行时依赖
+
+WSL 侧真实 Qwen3-ASR 运行时统一使用这组 PyTorch CUDA 版本：
+
+```text
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+torchaudio==2.11.0+cu128
+qwen-asr==0.0.6
+numba==0.65.1
+llvmlite==0.47.0
+```
+
+安装命令：
+
+```bash
+uv pip install --torch-backend cu128 -r requirements/wsl-gpu-cu128.txt
+```
+
+不要裸跑 `pip install torch`，也不要让 `qwen-asr` 安装过程把 torch 升级到另一组 CUDA wheel。安装后必须验收：
+
+```bash
+uv run python - <<'PY'
+import torch
+import torchvision
+import torchaudio
+import qwen_asr
+
+print("torch:", torch.__version__)
+print("torch cuda:", torch.version.cuda)
+print("cuda available:", torch.cuda.is_available())
+assert torch.__version__ == "2.11.0+cu128"
+assert torch.version.cuda == "12.8"
+assert torch.cuda.is_available()
+print("device:", torch.cuda.get_device_name(0))
+print("capability:", torch.cuda.get_device_capability(0))
+print("torchvision:", torchvision.__version__)
+print("torchaudio:", torchaudio.__version__)
+print("qwen_asr import ok:", qwen_asr.Qwen3ASRModel)
+PY
+```
+
 真实 Qwen adapter 启动时使用：
 
 ```bash

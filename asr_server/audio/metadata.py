@@ -1,0 +1,47 @@
+from __future__ import annotations
+
+import io
+import wave
+from dataclasses import dataclass
+
+
+RAW_FALLBACK_BYTES_PER_SECOND = 16_000
+
+
+@dataclass(frozen=True)
+class AudioMetadata:
+    duration_seconds: float
+    format: str
+    byte_length: int
+    sample_rate: int | None = None
+    channels: int | None = None
+
+
+def inspect_audio(audio: bytes) -> AudioMetadata:
+    wav_metadata = _inspect_wav(audio)
+    if wav_metadata is not None:
+        return wav_metadata
+    return AudioMetadata(
+        duration_seconds=max(len(audio) / RAW_FALLBACK_BYTES_PER_SECOND, 0.01),
+        format="raw",
+        byte_length=len(audio),
+    )
+
+
+def _inspect_wav(audio: bytes) -> AudioMetadata | None:
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as wav_file:
+            frame_rate = wav_file.getframerate()
+            frame_count = wav_file.getnframes()
+            channels = wav_file.getnchannels()
+    except (EOFError, wave.Error):
+        return None
+    if frame_rate <= 0:
+        return None
+    return AudioMetadata(
+        duration_seconds=frame_count / frame_rate,
+        format="wav",
+        byte_length=len(audio),
+        sample_rate=frame_rate,
+        channels=channels,
+    )

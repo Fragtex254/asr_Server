@@ -20,6 +20,7 @@ models/
 model_cache/
 hf_cache/
 .cache/
+transcripts/
 
 # Editor
 .idea/

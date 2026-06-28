@@ -4,9 +4,10 @@ import importlib
 import os
 import tempfile
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
-from asr_server.adapters.base import TranscriptionResult
+from asr_server.adapters.base import TranscriptionResult, TranscriptionTimings
 from asr_server.errors import AsrError
 
 
@@ -75,15 +76,23 @@ class QwenAsrAdapter:
             audio_path = Path(audio_file.name)
         try:
             qwen_language = None if language == "auto" else language
+            inference_started = perf_counter()
             results = self._model.transcribe(audio=str(audio_path), language=qwen_language)
+            inference_ms = (perf_counter() - inference_started) * 1000
+            postprocess_started = perf_counter()
             first = results[0]
             text = self._result_text(first)
             detected_language = self._result_language(first) or ("zh" if language == "auto" else language)
+            postprocess_ms = (perf_counter() - postprocess_started) * 1000
             return TranscriptionResult(
                 text=text,
                 duration=max(len(audio) / 16_000, 0.01),
                 language=detected_language,
                 warnings=[],
+                timings=TranscriptionTimings(
+                    inference_ms=inference_ms,
+                    postprocess_ms=postprocess_ms,
+                ),
             )
         finally:
             audio_path.unlink(missing_ok=True)

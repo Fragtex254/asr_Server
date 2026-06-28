@@ -11,6 +11,8 @@ from pydantic import BaseModel
 from asr_server import __version__
 from asr_server.adapters.base import AsrAdapter
 from asr_server.adapters.mock import MockAsrAdapter
+from asr_server.adapters.qwen import QwenAsrAdapter
+from asr_server.config import Settings, load_settings
 from asr_server.errors import AsrError, asr_error_handler, validation_error_handler
 from asr_server.lifecycle import ModelLifecycleManager
 from asr_server.registry import Backend, default_models
@@ -28,14 +30,19 @@ class UnloadRequest(BaseModel):
     cuda_empty_cache: bool = True
 
 
-def create_app(adapter_delay_seconds: float = 0.0) -> FastAPI:
-    def adapter_factory(_model_id: str) -> AsrAdapter:
+def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 0.0) -> FastAPI:
+    app_settings = settings or load_settings()
+
+    def adapter_factory(model_id: str) -> AsrAdapter:
+        if app_settings.adapter == "qwen":
+            return QwenAsrAdapter(model_id)
         return MockAsrAdapter(delay_seconds=adapter_delay_seconds)
 
     app = FastAPI(title="WSL ASR Server", version=__version__)
     app.add_exception_handler(AsrError, cast(Any, asr_error_handler))
     app.add_exception_handler(RequestValidationError, cast(Any, validation_error_handler))
-    app.state.manager = ModelLifecycleManager(default_models(), adapter_factory)
+    app.state.manager = ModelLifecycleManager(default_models(app_settings.default_model), adapter_factory)
+    app.state.settings = app_settings
 
     @app.get("/health")
     async def health() -> dict[str, object]:

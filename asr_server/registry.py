@@ -97,7 +97,9 @@ class ModelDefinition:
     capabilities: ModelCapabilities
 
 
-def default_models() -> dict[str, ModelDefinition]:
+def default_models(default_model_id: str = "qwen3-asr-1.7b") -> dict[str, ModelDefinition]:
+    if default_model_id not in {"qwen3-asr-1.7b", "qwen3-asr-0.6b"}:
+        raise ValueError("ASR_DEFAULT_MODEL must be qwen3-asr-1.7b or qwen3-asr-0.6b")
     qwen_capabilities = ModelCapabilities(
         transcription=True,
         streaming=False,
@@ -111,14 +113,13 @@ def default_models() -> dict[str, ModelDefinition]:
         "qwen3-asr-1.7b": ModelDefinition(
             id="qwen3-asr-1.7b",
             provider="QwenLM",
-            default=True,
+            default=default_model_id == "qwen3-asr-1.7b",
             capabilities=qwen_capabilities,
         ),
         "qwen3-asr-0.6b": ModelDefinition(
             id="qwen3-asr-0.6b",
             provider="QwenLM",
-            default=False,
+            default=default_model_id == "qwen3-asr-0.6b",
             capabilities=qwen_capabilities,
         ),
     }
-

@@ -1,0 +1,18 @@
+[Unit]
+Description=WSL ASR Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/fragt/services/asr-server
+Environment=ASR_HOST=0.0.0.0
+Environment=ASR_PORT=18080
+Environment=ASR_ADAPTER=qwen
+ExecStart=/home/fragt/.local/bin/uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+

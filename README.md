@@ -11,6 +11,8 @@
 - `tests/`：不依赖 CUDA 的 API 和生命周期行为测试。
 - `scripts/asr_client.py`：Mac 侧验证客户端，会绕过本机代理设置。
 - `scripts/qwen_asr_backend_smoke.py`：WSL 侧真实 Qwen3-ASR 后端最小验收脚本。
+- `scripts/wsl_smoke.sh`：WSL 侧启动服务并运行 HTTP smoke test 的脚本。
+- `deploy/`：systemd user service 和 Windows 启动脚本模板。
 - `test-fixtures/audio/`：给 WSL 侧 ASR 自测使用的音频样本。
 
 ## 部署目标

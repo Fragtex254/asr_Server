@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 import importlib
+from dataclasses import replace
 from typing import Annotated, Any, cast
 
 from fastapi import Body, FastAPI, File, Form, UploadFile
@@ -13,6 +14,9 @@ from asr_server import __version__
 from asr_server.adapters.base import AsrAdapter
 from asr_server.adapters.mock import MockAsrAdapter
 from asr_server.adapters.qwen import QwenAsrAdapter
+from asr_server.audio.merger import merge_transcription_results
+from asr_server.audio.preprocess import normalize_audio_to_wav
+from asr_server.audio.splitter import split_audio
 from asr_server.config import Settings, load_settings
 from asr_server.errors import AsrError, asr_error_handler, validation_error_handler
 from asr_server.lifecycle import ModelLifecycleManager
@@ -117,6 +121,10 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         backend: Annotated[Backend, Form()] = "auto",
         temperature: Annotated[float | None, Form()] = None,
         max_new_tokens: Annotated[int | None, Form(ge=1)] = None,
+        split_strategy: Annotated[str, Form()] = "auto",
+        max_chunk_seconds: Annotated[float | None, Form()] = None,
+        overlap_seconds: Annotated[float | None, Form()] = None,
+        preserve_segments: Annotated[bool, Form()] = False,
     ) -> dict[str, object] | PlainTextResponse:
         del temperature, max_new_tokens
         if response_format not in {"json", "text", "verbose_json"}:
@@ -125,12 +133,31 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             raise AsrError(400, "bad_request", f"unsupported timestamps value: {timestamps}")
         manager: ModelLifecycleManager = app.state.manager
         audio = await file.read()
-        resolved_backend, result = await manager.transcribe(
-            audio,
+        normalized = normalize_audio_to_wav(audio)
+        split = split_audio(
+            normalized.audio,
+            split_strategy=split_strategy,
+            max_chunk_seconds=max_chunk_seconds,
+            overlap_seconds=overlap_seconds,
+        )
+        resolved_backend, chunk_results, timings = await manager.transcribe_chunks(
+            [chunk.audio for chunk in split.chunks],
             model_id=model,
             backend=backend,
             language=language,
             timestamps=timestamps,
+        )
+        timings = replace(
+            timings,
+            total_ms=timings.total_ms + normalized.decode_ms,
+            decode_ms=timings.decode_ms + normalized.decode_ms,
+        )
+        result = merge_transcription_results(
+            split.chunks,
+            chunk_results,
+            source_duration=split.metadata.duration_seconds,
+            preserve_segments=preserve_segments,
+            timings=timings,
         )
         if response_format == "text":
             return PlainTextResponse(result.text)
@@ -144,7 +171,10 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             "duration": result.duration,
             "timestamps": [],
             "segments": [],
+            "split": split.summary(),
+            "chunks": result.chunks,
             "usage": {"audio_seconds": result.duration},
+            "timings": result.timings.to_api(),
             "warnings": result.warnings,
         }
 

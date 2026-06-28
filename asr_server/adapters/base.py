@@ -1,7 +1,25 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
+
+
+@dataclass(frozen=True)
+class TranscriptionTimings:
+    total_ms: float = 0.0
+    load_ms: float = 0.0
+    decode_ms: float = 0.0
+    inference_ms: float = 0.0
+    postprocess_ms: float = 0.0
+
+    def to_api(self) -> dict[str, float]:
+        return {
+            "total_ms": self.total_ms,
+            "load_ms": self.load_ms,
+            "decode_ms": self.decode_ms,
+            "inference_ms": self.inference_ms,
+            "postprocess_ms": self.postprocess_ms,
+        }
 
 
 @dataclass(frozen=True)
@@ -10,6 +28,7 @@ class TranscriptionResult:
     duration: float
     language: str
     warnings: list[str]
+    timings: TranscriptionTimings = field(default_factory=TranscriptionTimings)
 
 
 class AsrAdapter(Protocol):
@@ -28,4 +47,3 @@ class AsrAdapter(Protocol):
         language: str,
     ) -> TranscriptionResult:
         ...
-

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -37,11 +38,15 @@ class QwenAsrAdapter:
                 max_inference_batch_size=1,
             )
         elif backend == "vllm":
-            self._model = qwen_asr.Qwen3ASRModel.LLM(
-                model=repo_id,
-                gpu_memory_utilization=0.7,
-                max_inference_batch_size=1,
-            )
+            self._configure_vllm_environment()
+            llm_kwargs: dict[str, Any] = {
+                "model": repo_id,
+                "gpu_memory_utilization": float(os.getenv("ASR_QWEN_VLLM_GPU_MEMORY_UTILIZATION", "0.9")),
+                "max_inference_batch_size": 1,
+            }
+            max_model_len = os.getenv("ASR_QWEN_VLLM_MAX_MODEL_LEN", "32768")
+            llm_kwargs["max_model_len"] = int(max_model_len)
+            self._model = qwen_asr.Qwen3ASRModel.LLM(**llm_kwargs)
         else:
             raise AsrError(422, "capability_not_supported", f"unsupported Qwen backend: {backend}")
         self.loaded_backend = backend
@@ -102,6 +107,11 @@ class QwenAsrAdapter:
             raise AsrError(503, "gpu_unavailable", "installed torch is CPU-only")
         if not torch.cuda.is_available():
             raise AsrError(503, "gpu_unavailable", "torch cannot access CUDA")
+
+    def _configure_vllm_environment(self) -> None:
+        os.environ.setdefault("VLLM_HOST_IP", "127.0.0.1")
+        os.environ.setdefault("NCCL_SOCKET_IFNAME", "lo")
+        os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
 
     def _result_text(self, result: Any) -> str:
         text = getattr(result, "text", "")

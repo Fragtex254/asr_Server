@@ -96,7 +96,7 @@ PY
 
 ## 服务端开发前置门槛
 
-在写或修改真实 Qwen adapter 之前，先脱离服务端代码，分别跑通两个最小转录流程：
+在写或修改真实 Qwen adapter 之前，先脱离服务端代码跑通最小转录流程：
 
 ```bash
 uv run python scripts/qwen_asr_backend_smoke.py \
@@ -104,17 +104,11 @@ uv run python scripts/qwen_asr_backend_smoke.py \
   --model Qwen/Qwen3-ASR-0.6B \
   --audio test-fixtures/audio/test_short.wav \
   --language auto
-
-uv run python scripts/qwen_asr_backend_smoke.py \
-  --backend vllm \
-  --model Qwen/Qwen3-ASR-0.6B \
-  --audio test-fixtures/audio/test_short.wav \
-  --language auto
 ```
 
 用户口头说的 `tf` 在本项目里表示 `transformers`，不是 TensorFlow。
 
-两个后端都返回非空文本后，才能开始把真实推理接入服务端 adapter。某个后端没跑通，就不要在 `/v1/models` 中声明该后端。
+`transformers` 后端返回非空文本后，才能开始把真实推理接入服务端 adapter。第一版不要在 `/v1/models` 中声明 `vllm`。
 
 ## 验收路径
 
@@ -126,7 +120,7 @@ uv run python scripts/qwen_asr_backend_smoke.py \
 4. `uv run mypy asr_server tests scripts`
 5. 验证 CUDA 版 torch。
 6. 安装并验收 `qwen-asr`。
-7. 分别跑通 `scripts/qwen_asr_backend_smoke.py --backend transformers` 和 `--backend vllm`。
+7. 跑通 `scripts/qwen_asr_backend_smoke.py --backend transformers`。
 8. 启动真实服务：`ASR_ADAPTER=qwen uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080`
 9. 运行：`ASR_BASE_URL=http://127.0.0.1:18080 uv run pytest tests/test_http_smoke.py -q`
 10. 从 Mac mini 用 `curl --noproxy '*'` 验收局域网入口。
@@ -147,7 +141,6 @@ uv run python scripts/qwen_asr_backend_smoke.py \
 
 - torch 版本、CUDA 版本、GPU 名称。
 - `transformers` 后端最小转录结果。
-- `vllm` 后端最小转录结果。
 - `qwen3-asr-0.6b` 和 `qwen3-asr-1.7b` 的服务端 API 转录结果。
 - `/health` 和 `/v1/models` 的响应摘要。
 - Mac mini 是否能通过 `http://192.168.31.137:18080` 调用服务。

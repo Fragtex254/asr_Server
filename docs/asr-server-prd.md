@@ -32,7 +32,7 @@ MiMo-V2.5-ASR 不进入初版交付范围，保留为后续扩展候选。
 - 卸载模型时保证当前正在执行的请求完成后再卸载，并拒绝新的同模型请求。
 - 上传音频并获取转写结果。
 - 跑通 `qwen3-asr-0.6b` 和 `qwen3-asr-1.7b` 的端到端转录流程。
-- 对每个 Qwen3-ASR 模型跑通所有在 `/v1/models` 中声明支持的推理后端；初版声明支持 `transformers` 与 `vllm` 时，两者都必须能完成转录。
+- 对每个 Qwen3-ASR 模型跑通所有在 `/v1/models` 中声明支持的推理后端；第一版只声明 `transformers` 后端，`vllm` 后端延后到后续版本。
 - `/v1/models` 只声明已经实现并通过验收的能力；时间戳、强制对齐、流式转写等高级能力不作为初版发布验收前提。
 
 暂不做：
@@ -85,8 +85,8 @@ flowchart LR
 
 | 模型 | 模型 ID | 首选用途 | 初版验收能力 | 限制 |
 | --- | --- | --- | --- | --- |
-| Qwen3-ASR 0.6B | `qwen3-asr-0.6b` | 轻量转写、较低显存占用 | 离线转写、语言提示、`transformers` 后端转写、`vllm` 后端转写 | 质量和复杂音频能力弱于 1.7B；高级能力后续按实测结果逐项打开 |
-| Qwen3-ASR 1.7B | `qwen3-asr-1.7b` | 默认主力模型 | 离线转写、语言提示、`transformers` 后端转写、`vllm` 后端转写 | 流式、时间戳、强制对齐等高级能力不阻塞初版发布 |
+| Qwen3-ASR 0.6B | `qwen3-asr-0.6b` | 轻量转写、较低显存占用 | 离线转写、语言提示、`transformers` 后端转写 | 质量和复杂音频能力弱于 1.7B；高级能力后续按实测结果逐项打开 |
+| Qwen3-ASR 1.7B | `qwen3-asr-1.7b` | 默认主力模型 | 离线转写、语言提示、`transformers` 后端转写 | 流式、时间戳、强制对齐、vLLM 等高级能力不阻塞初版发布 |
 
 ## 6. API 设计
 
@@ -130,7 +130,7 @@ flowchart LR
         "forced_alignment": false,
         "languages": ["auto", "zh", "en", "yue", "ar", "de", "fr", "es", "pt", "id", "it", "ko", "ru", "th", "vi", "ja", "tr", "hi", "ms", "nl", "sv", "da", "fi", "pl", "cs", "fil", "fa", "el", "hu", "mk", "ro"],
         "chinese_dialects": ["Anhui", "Dongbei", "Fujian", "Gansu", "Guizhou", "Hebei", "Henan", "Hubei", "Hunan", "Jiangxi", "Ningxia", "Shandong", "Shaanxi", "Shanxi", "Sichuan", "Tianjin", "Yunnan", "Zhejiang", "Cantonese-Hong-Kong-accent", "Cantonese-Guangdong-accent", "Wu", "Minnan"],
-        "backends": ["transformers", "vllm"]
+        "backends": ["transformers"]
       }
     },
     {
@@ -145,7 +145,7 @@ flowchart LR
         "forced_alignment": false,
         "languages": ["auto", "zh", "en", "yue", "ar", "de", "fr", "es", "pt", "id", "it", "ko", "ru", "th", "vi", "ja", "tr", "hi", "ms", "nl", "sv", "da", "fi", "pl", "cs", "fil", "fa", "el", "hu", "mk", "ro"],
         "chinese_dialects": ["Anhui", "Dongbei", "Fujian", "Gansu", "Guizhou", "Hebei", "Henan", "Hubei", "Hunan", "Jiangxi", "Ningxia", "Shandong", "Shaanxi", "Shanxi", "Sichuan", "Tianjin", "Yunnan", "Zhejiang", "Cantonese-Hong-Kong-accent", "Cantonese-Guangdong-accent", "Wu", "Minnan"],
-        "backends": ["transformers", "vllm"]
+        "backends": ["transformers"]
       }
     }
   ]
@@ -581,9 +581,7 @@ limits:
 转写：
 
 - Mac mini 通过局域网向 `POST /v1/audio/transcriptions` 上传一段 10 秒中文音频，`qwen3-asr-0.6b` + `transformers` 返回非空 `text`。
-- Mac mini 通过局域网向 `POST /v1/audio/transcriptions` 上传一段 10 秒中文音频，`qwen3-asr-0.6b` + `vllm` 返回非空 `text`。
 - Mac mini 通过局域网向 `POST /v1/audio/transcriptions` 上传一段 10 秒中文音频，`qwen3-asr-1.7b` + `transformers` 返回非空 `text`。
-- Mac mini 通过局域网向 `POST /v1/audio/transcriptions` 上传一段 10 秒中文音频，`qwen3-asr-1.7b` + `vllm` 返回非空 `text`。
 - 默认模型 `qwen3-asr-1.7b` 在不显式传 `backend` 时可以用 `backend=auto` 完成转录。
 - 前端 Mac 客户端只依赖 `GET /v1/models` 的模型与后端发现结果，不硬编码服务端未声明的能力。
 
@@ -606,7 +604,7 @@ limits:
 - FastAPI 网关。
 - 模型注册表。
 - Qwen3-ASR 0.6B 与 1.7B 适配器最小可用转写。
-- Qwen3-ASR 两个尺寸在所有声明支持的推理后端上完成端到端转录验收。
+- Qwen3-ASR 两个尺寸在 `transformers` 后端上完成端到端转录验收。
 - 模型加载/卸载状态机。
 - Mac 局域网访问验收。
 

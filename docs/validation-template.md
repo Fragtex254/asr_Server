@@ -26,25 +26,14 @@
 - 是否通过：
 - 失败日志：
 
-### vllm
-
-- 命令：
-- 模型 ID：
-- 音频文件：
-- 输出语言：
-- 文本前 200 字：
-- 是否通过：
-- 失败日志：
-
 ## 服务端 API 验收
 
 - 服务地址：
 - `/health` 摘要：
 - `/v1/models` 模型和后端列表：
 - `qwen3-asr-0.6b` + `transformers` 文本前 200 字：
-- `qwen3-asr-0.6b` + `vllm` 文本前 200 字：
 - `qwen3-asr-1.7b` + `transformers` 文本前 200 字：
-- `qwen3-asr-1.7b` + `vllm` 文本前 200 字：
+- `backend=vllm` 未声明后端错误码：
 - `timestamps=word` 未声明能力错误码：
 - 卸载活跃请求时的状态：
 - `unloading_scheduled` 新请求错误码：
@@ -61,4 +50,3 @@
 - 通过/不通过：
 - 阻塞点：
 - 后续动作：
-

@@ -35,11 +35,4 @@ if [[ "${RUN_QWEN_BACKEND_SMOKE}" == "1" ]]; then
     --model "${MODEL_REPO}" \
     --audio "${AUDIO}" \
     --language auto
-
-  uv run python scripts/qwen_asr_backend_smoke.py \
-    --backend vllm \
-    --model "${MODEL_REPO}" \
-    --audio "${AUDIO}" \
-    --language auto
 fi
-

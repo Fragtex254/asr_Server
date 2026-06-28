@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import os
 from pathlib import Path
 from typing import Any
 
@@ -64,14 +65,20 @@ def run_transformers(args: argparse.Namespace) -> None:
 
 def run_vllm(args: argparse.Namespace) -> None:
     require_cuda_torch()
+    os.environ.setdefault("VLLM_HOST_IP", "127.0.0.1")
+    os.environ.setdefault("NCCL_SOCKET_IFNAME", "lo")
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
     qwen_asr = importlib.import_module("qwen_asr")
     model_cls = qwen_asr.Qwen3ASRModel
-    model = model_cls.LLM(
-        model=args.model,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_inference_batch_size=1,
-        max_new_tokens=args.max_new_tokens,
-    )
+    llm_kwargs: dict[str, Any] = {
+        "model": args.model,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "max_inference_batch_size": 1,
+        "max_new_tokens": args.max_new_tokens,
+    }
+    if args.max_model_len is not None:
+        llm_kwargs["max_model_len"] = args.max_model_len
+    model = model_cls.LLM(**llm_kwargs)
     results = model.transcribe(audio=str(args.audio), language=normalize_language(args.language))
     first = results[0]
     print("backend: vllm")
@@ -90,7 +97,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio", type=Path, default=Path(DEFAULT_AUDIO))
     parser.add_argument("--language", default="auto")
     parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--max-model-len", type=int, default=None)
     return parser.parse_args()
 
 
@@ -106,4 +114,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

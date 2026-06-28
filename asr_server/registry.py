@@ -107,7 +107,7 @@ def default_models(default_model_id: str = "qwen3-asr-1.7b") -> dict[str, ModelD
         forced_alignment=False,
         languages=QWEN_LANGUAGES,
         chinese_dialects=QWEN_CHINESE_DIALECTS,
-        backends=["transformers", "vllm"],
+        backends=["transformers"],
     )
     return {
         "qwen3-asr-1.7b": ModelDefinition(

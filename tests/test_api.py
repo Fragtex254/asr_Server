@@ -31,7 +31,7 @@ async def test_models_lists_only_qwen_models(client: AsyncClient) -> None:
     model_ids = {model["id"] for model in models}
     assert model_ids == {"qwen3-asr-1.7b", "qwen3-asr-0.6b"}
     for model in models:
-        assert model["capabilities"]["backends"] == ["transformers", "vllm"]
+        assert model["capabilities"]["backends"] == ["transformers"]
         assert model["capabilities"]["streaming"] is False
         assert model["capabilities"]["timestamps"] == []
         assert model["capabilities"]["forced_alignment"] is False
@@ -47,14 +47,14 @@ async def test_unknown_model_uses_error_envelope(client: AsyncClient) -> None:
 async def test_load_and_unload_model(client: AsyncClient) -> None:
     load_response = await client.post(
         "/v1/models/qwen3-asr-1.7b/load",
-        json={"backend": "vllm", "device": "cuda", "dtype": "auto"},
+        json={"backend": "transformers", "device": "cuda", "dtype": "auto"},
     )
     assert load_response.status_code == 200
     assert load_response.json()["status"] == "loaded"
 
     status_response = await client.get("/v1/models/qwen3-asr-1.7b/status")
     assert status_response.json()["status"] == "loaded"
-    assert status_response.json()["backend"] == "vllm"
+    assert status_response.json()["backend"] == "transformers"
 
     unload_response = await client.request(
         "DELETE",
@@ -63,6 +63,16 @@ async def test_load_and_unload_model(client: AsyncClient) -> None:
     )
     assert unload_response.status_code == 200
     assert unload_response.json()["status"] == "unloaded"
+
+
+async def test_loading_vllm_backend_is_not_supported(client: AsyncClient) -> None:
+    response = await client.post(
+        "/v1/models/qwen3-asr-1.7b/load",
+        json={"backend": "vllm", "device": "cuda", "dtype": "auto"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "capability_not_supported"
 
 
 async def test_transcription_auto_loads_default_model(client: AsyncClient) -> None:
@@ -81,17 +91,27 @@ async def test_transcription_auto_loads_default_model(client: AsyncClient) -> No
 
 async def test_transcription_supports_each_declared_backend(client: AsyncClient) -> None:
     for model in ("qwen3-asr-0.6b", "qwen3-asr-1.7b"):
-        for backend in ("transformers", "vllm"):
-            response = await client.post(
-                "/v1/audio/transcriptions",
-                files={"file": ("sample.wav", b"fake audio", "audio/wav")},
-                data={"model": model, "backend": backend},
-            )
+        response = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", b"fake audio", "audio/wav")},
+            data={"model": model, "backend": "transformers"},
+        )
 
-            assert response.status_code == 200
-            assert response.json()["model"] == model
-            assert response.json()["backend"] == backend
-            assert response.json()["text"]
+        assert response.status_code == 200
+        assert response.json()["model"] == model
+        assert response.json()["backend"] == "transformers"
+        assert response.json()["text"]
+
+
+async def test_vllm_backend_is_not_declared_for_first_release(client: AsyncClient) -> None:
+    response = await client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("sample.wav", b"fake audio", "audio/wav")},
+        data={"model": "qwen3-asr-1.7b", "backend": "vllm"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "capability_not_supported"
 
 
 async def test_unsupported_capability_returns_422(client: AsyncClient) -> None:
@@ -140,4 +160,3 @@ async def test_unload_waits_for_active_request_and_rejects_new_requests() -> Non
         status_response = await client.get("/v1/models/qwen3-asr-1.7b/status")
         assert status_response.json()["status"] == "unloaded"
         assert status_response.json()["active_requests"] == 0
-

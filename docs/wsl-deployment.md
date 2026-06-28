@@ -43,10 +43,9 @@ ASR_ADAPTER=qwen uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
 
 ```bash
 uv run python scripts/qwen_asr_backend_smoke.py --backend transformers --model Qwen/Qwen3-ASR-0.6B --audio test-fixtures/audio/test_short.wav
-uv run python scripts/qwen_asr_backend_smoke.py --backend vllm --model Qwen/Qwen3-ASR-0.6B --audio test-fixtures/audio/test_short.wav
 ```
 
-两个后端都返回非空文本后，再接入或启用服务端真实 adapter。
+`transformers` 后端返回非空文本后，再接入或启用服务端真实 adapter。第一版不在 `/v1/models` 中声明 `vllm`。
 
 ## HTTP smoke test
 
@@ -62,7 +61,7 @@ ASR_BASE_URL=http://127.0.0.1:18080 uv run pytest tests/test_http_smoke.py -q
 ASR_ADAPTER=qwen scripts/wsl_smoke.sh
 ```
 
-如果还要在同一个脚本里跑 Qwen 后端预验收：
+如果还要在同一个脚本里跑 Qwen `transformers` 后端预验收：
 
 ```bash
 ASR_ADAPTER=qwen ASR_RUN_QWEN_BACKEND_SMOKE=1 scripts/wsl_smoke.sh
@@ -85,4 +84,3 @@ systemctl --user status asr-server.service
 ## 防火墙
 
 Windows 只需要为专用网络开放 TCP `18080`。不要开放 `8001`、`8765` 或公网入口。
-

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import importlib
 from typing import Annotated, Any, cast
 
 from fastapi import Body, FastAPI, File, Form, UploadFile
@@ -30,6 +31,21 @@ class UnloadRequest(BaseModel):
     cuda_empty_cache: bool = True
 
 
+def gpu_health() -> dict[str, object]:
+    try:
+        torch = importlib.import_module("torch")
+    except ModuleNotFoundError:
+        return {"available": False, "name": None, "vram_total_mb": None}
+    if getattr(torch.version, "cuda", None) is None or not torch.cuda.is_available():
+        return {"available": False, "name": None, "vram_total_mb": None}
+    properties = torch.cuda.get_device_properties(0)
+    return {
+        "available": True,
+        "name": torch.cuda.get_device_name(0),
+        "vram_total_mb": int(properties.total_memory / 1024 / 1024),
+    }
+
+
 def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 0.0) -> FastAPI:
     app_settings = settings or load_settings()
 
@@ -50,11 +66,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             "status": "ok",
             "version": __version__,
             "host": socket.gethostname(),
-            "gpu": {
-                "available": False,
-                "name": None,
-                "vram_total_mb": None,
-            },
+            "gpu": gpu_health(),
         }
 
     @app.get("/v1/models")

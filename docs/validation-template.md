@@ -38,6 +38,25 @@
 - 卸载活跃请求时的状态：
 - `unloading_scheduled` 新请求错误码：
 
+## 转录耗时记录
+
+- 是否返回 `timings.total_ms`：
+- 是否返回 `timings.load_ms`：
+- 是否返回 `timings.inference_ms`：
+- 短音频总耗时：
+- 长音频总耗时：
+- 是否避免记录完整音频内容：
+
+## 长音频切分与合并
+
+- 使用音频文件：`test-fixtures/audio/test_long.mp3`
+- 切分策略：
+- chunk 数量：
+- overlap 秒数：
+- 是否返回 chunk 元数据：
+- 合并文本前 200 字：
+- 是否通过：
+
 ## Mac 局域网验收
 
 - Mac 请求是否绕过代理：

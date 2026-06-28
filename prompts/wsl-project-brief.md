@@ -50,6 +50,7 @@ ASR_ADAPTER=qwen uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
 AGENTS.md
 docs/asr-server-prd.md
 docs/wsl-deployment.md
+docs/wsl-next-plan.md
 prompts/server-agent.md
 docs/validation-template.md
 ```
@@ -125,6 +126,17 @@ uv run python scripts/qwen_asr_backend_smoke.py \
 9. 运行：`ASR_BASE_URL=http://127.0.0.1:18080 uv run pytest tests/test_http_smoke.py -q`
 10. 从 Mac mini 用 `curl --noproxy '*'` 验收局域网入口。
 11. 把结果填写到 `docs/validation-template.md` 对应格式里。
+
+## 下一阶段开发顺序
+
+完成 Qwen `transformers` 最小链路后，按 `docs/wsl-next-plan.md` 推进：
+
+1. 转录耗时记录。
+2. 长音频切分与合并。
+3. Qwen `transformers` 能力补全。
+4. MiMo `transformers` 调研。
+
+不要先做 MiMo，也不要回到 vLLM。
 
 ## 你不要做什么
 

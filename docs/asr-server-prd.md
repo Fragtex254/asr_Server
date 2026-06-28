@@ -599,6 +599,8 @@ limits:
 
 ## 12. 后续路线
 
+当前 WSL 服务端下一阶段按 `docs/wsl-next-plan.md` 执行：先做转录耗时记录，再做长音频切分与合并，再补 Qwen `transformers` 能力，最后再评估 MiMo。
+
 优先级 P0：
 
 - FastAPI 网关。
@@ -610,6 +612,8 @@ limits:
 
 优先级 P1：
 
+- 转录耗时记录，包括总耗时、加载耗时、推理耗时和后处理耗时。
+- 长音频切分与合并，先支持固定切分和 chunk 元数据。
 - 异步任务。
 - 上传文件大小、时长、格式限制。
 - systemd user service 或 Windows 开机启动。

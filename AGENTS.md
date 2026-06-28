@@ -51,6 +51,93 @@ prompts/request-client-agent.md
 - 大模型依赖必须在适配器内懒加载，保证基础 import 和测试在无 GPU 环境也能运行。
 - 路径处理保持 POSIX 兼容，不要在服务代码里硬编码 macOS 专用路径。
 
+## RTX 5070 Ti 与 Qwen3-ASR 环境规则
+
+WSL 侧安装真实 Qwen3-ASR 前，必须先把 RTX 5070 Ti 的 PyTorch CUDA 环境验收通过。这个显卡较新，最常见错误是 agent 直接执行普通 `pip install torch` 或被依赖解析成 CPU 版 torch。
+
+硬性规则：
+
+- 只在 WSL Arch Linux 内安装真实推理依赖；Mac mini 不安装 CUDA、torch GPU 包、Qwen 模型包或模型缓存。
+- 使用 Python 3.12 和 uv。不要混用多个 Python、conda 环境和系统 pip。
+- 安装 torch 时必须使用 PyTorch 官方 CUDA wheel 源，例如 CUDA 12.8 对应的 `cu128` 源；不要使用没有 CUDA wheel 源的裸 `pip install torch`。
+- `nvidia-smi` 只能证明 WSL 能看到驱动和显卡，不能证明 Python 环境里的 torch 是 CUDA 版；必须运行下面的 Python 验收脚本。
+- 如果新显卡报 `no kernel image is available`、架构不支持或 CUDA capability 不匹配，不要退回 CPU 版 torch；应改用支持 RTX 5070 Ti 的更新官方 CUDA wheel 或 PyTorch nightly，并重新验收。
+- Qwen3-ASR 的 `qwen-asr` 或 `qwen-asr[vllm]` 必须在 CUDA 版 torch 验收通过后再安装。
+- 安装 `qwen-asr[vllm]` 后必须再次验收 torch；如果 vLLM 或其他依赖把 torch 替换成 CPU 版，必须停止并修复，不得继续接入模型。
+- `/v1/models` 中只能声明真实跑通过的后端。`transformers` 或 `vllm` 任一后端没跑通，就不要声明该后端。
+
+推荐 WSL 安装顺序：
+
+```bash
+cd /home/fragt/services/asr-server
+
+uv python install 3.12
+uv sync
+
+sudo pacman -Syu --needed ffmpeg libsndfile
+
+nvidia-smi
+uv pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
+uv run python - <<'PY'
+import torch
+
+print("torch:", torch.__version__)
+print("torch cuda:", torch.version.cuda)
+print("cuda available:", torch.cuda.is_available())
+assert torch.version.cuda is not None, "装到 CPU 版 torch 了"
+assert torch.cuda.is_available(), "torch 看不到 CUDA"
+print("device:", torch.cuda.get_device_name(0))
+print("capability:", torch.cuda.get_device_capability(0))
+PY
+
+uv pip install -U qwen-asr
+# 只有需要 vLLM 后端时才安装：
+uv pip install -U 'qwen-asr[vllm]'
+
+uv run python - <<'PY'
+import torch
+
+assert torch.version.cuda is not None, "qwen/vllm 安装后 torch 变成 CPU 版"
+assert torch.cuda.is_available(), "qwen/vllm 安装后 CUDA 不可用"
+print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))
+PY
+```
+
+如果已经误装 CPU 版 torch，优先删除 `.venv` 后按上述顺序重建环境；不要在错误环境上继续叠装：
+
+```bash
+rm -rf .venv
+uv sync
+uv pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
+```
+
+## Qwen3-ASR 后端预验收门槛
+
+开发 WSL 服务端真实 adapter 前，必须先脱离本项目服务代码，分别跑通一次最小 Qwen3-ASR 转录流程：
+
+- `transformers` 后端，用户口头说的 `tf` 在本项目里统一理解为 `transformers`，不是 TensorFlow。
+- `vllm` 后端。
+
+推荐先用 `Qwen/Qwen3-ASR-0.6B` 和 `test-fixtures/audio/test_short.wav` 验收，降低首次下载和显存压力。两个后端都返回非空文本后，才能开始把它们接入 `asr_server` adapter。任一后端失败时，不要在 `/v1/models` 中声明该后端。
+
+验收命令：
+
+```bash
+uv run python scripts/qwen_asr_backend_smoke.py \
+  --backend transformers \
+  --model Qwen/Qwen3-ASR-0.6B \
+  --audio test-fixtures/audio/test_short.wav \
+  --language auto
+
+uv run python scripts/qwen_asr_backend_smoke.py \
+  --backend vllm \
+  --model Qwen/Qwen3-ASR-0.6B \
+  --audio test-fixtures/audio/test_short.wav \
+  --language auto
+```
+
+验收记录至少写下：模型 ID、后端、音频文件、torch 版本、CUDA 版本、GPU 名称、输出语言和文本前 200 字。
+
 ## API 与生命周期规则
 
 - 模型能力发现必须来自 `GET /v1/models`；客户端不要硬编码模型能力。

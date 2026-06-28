@@ -29,6 +29,7 @@ docs/asr-server-prd.md
 - 不要把项目放在 `/mnt/c` 下，放在 WSL 原生文件系统 `/home/fragt/services/asr-server`。
 - 第一版优先做稳定的离线转写，不要一开始就实现 Web UI。
 - 模型包很重，安装前先检查磁盘空间、CUDA、`nvidia-smi`。
+- RTX 5070 Ti 较新，必须显式安装并验证 CUDA 版 torch，防止误装 CPU 版 torch。
 
 初版模型只包含：
 
@@ -36,6 +37,83 @@ docs/asr-server-prd.md
 - `qwen3-asr-0.6b`
 
 MiMo-V2.5-ASR 不进入初版交付范围；不要把 MiMo 写进 `/v1/models`，也不要把 MiMo 转写作为初版验收项。
+
+## RTX 5070 Ti / Qwen3-ASR 安装要求
+
+真实推理依赖只能在 WSL Arch Linux 内安装。Mac mini 只做客户端验证，不安装 CUDA、torch GPU 包、Qwen 模型包或模型缓存。
+
+先验收 torch CUDA，再安装 Qwen3-ASR。`nvidia-smi` 只能证明 WSL 能看到驱动和显卡，不能证明 Python 环境里的 torch 是 CUDA 版。不要直接裸跑 `pip install torch`，必须使用 PyTorch 官方 CUDA wheel 源，例如 CUDA 12.8 的 `cu128`：
+
+```bash
+cd /home/fragt/services/asr-server
+
+uv python install 3.12
+uv sync
+
+sudo pacman -Syu --needed ffmpeg libsndfile
+
+nvidia-smi
+uv pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
+uv run python - <<'PY'
+import torch
+
+print("torch:", torch.__version__)
+print("torch cuda:", torch.version.cuda)
+print("cuda available:", torch.cuda.is_available())
+assert torch.version.cuda is not None, "装到 CPU 版 torch 了"
+assert torch.cuda.is_available(), "torch 看不到 CUDA"
+print("device:", torch.cuda.get_device_name(0))
+print("capability:", torch.cuda.get_device_capability(0))
+PY
+```
+
+只有上面的 CUDA 验收通过后，才能安装 Qwen3-ASR：
+
+```bash
+uv pip install -U qwen-asr
+
+# 只有需要验收 vLLM 后端时才安装：
+uv pip install -U 'qwen-asr[vllm]'
+
+uv run python - <<'PY'
+import torch
+
+assert torch.version.cuda is not None, "qwen/vllm 安装后 torch 变成 CPU 版"
+assert torch.cuda.is_available(), "qwen/vllm 安装后 CUDA 不可用"
+print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))
+PY
+```
+
+如果已经误装 CPU 版 torch，删除 `.venv` 后按上述顺序重建。不要在错误环境上继续叠装。
+
+如果 RTX 5070 Ti 报 `no kernel image is available`、架构不支持或 CUDA capability 不匹配，不要退回 CPU 版 torch；应改用支持该显卡的更新官方 CUDA wheel 或 PyTorch nightly，并重新跑 CUDA 验收脚本。
+
+`/v1/models` 中只能声明真实跑通过的后端。`transformers` 或 `vllm` 任一后端没跑通，就不要声明该后端。
+
+## 服务端开发前的后端预验收
+
+开始开发真实 Qwen adapter 前，必须先脱离服务端代码，分别跑通一次最小 Qwen3-ASR 转录流程：
+
+- `transformers` 后端。用户口头说的 `tf` 在本项目里统一理解为 `transformers`，不是 TensorFlow。
+- `vllm` 后端。
+
+优先使用 0.6B 和短音频样本降低首次验收成本：
+
+```bash
+uv run python scripts/qwen_asr_backend_smoke.py \
+  --backend transformers \
+  --model Qwen/Qwen3-ASR-0.6B \
+  --audio test-fixtures/audio/test_short.wav \
+  --language auto
+
+uv run python scripts/qwen_asr_backend_smoke.py \
+  --backend vllm \
+  --model Qwen/Qwen3-ASR-0.6B \
+  --audio test-fixtures/audio/test_short.wav \
+  --language auto
+```
+
+两个命令都必须返回非空文本。某个后端失败时，先修该后端的最小脚本，不要直接写服务端 adapter，也不要在 `/v1/models` 中声明该后端。
 
 必须实现的 API：
 
@@ -101,11 +179,12 @@ README.md
 1. 阅读现有 Mac 侧实现和测试，保留 API 合约、错误信封、生命周期语义。
 2. 在 WSL Arch Linux 的 `/home/fragt/services/asr-server` 部署项目，不要放在 `/mnt/c`。
 3. 检查磁盘空间、CUDA、`nvidia-smi`、Python 3.12、uv。
-4. 接入 Qwen3-ASR 适配器，真实跑通 `qwen3-asr-0.6b` 与 `qwen3-asr-1.7b`。
-5. 对 `/v1/models` 中声明的每个后端都做端到端转写验收；若某个后端不能跑通，不要声明它。
-6. 保持 mock 适配器测试可在无 GPU 环境通过。
-7. 增加 systemd user service 或 Windows 启动任务，让服务可后台常驻。
-8. 从 Mac mini 验收局域网调用。
+4. 先用 `scripts/qwen_asr_backend_smoke.py` 分别跑通 `transformers` 和 `vllm` 最小转录流程。
+5. 接入 Qwen3-ASR 适配器，真实跑通 `qwen3-asr-0.6b` 与 `qwen3-asr-1.7b`。
+6. 对 `/v1/models` 中声明的每个后端都做端到端转写验收；若某个后端不能跑通，不要声明它。
+7. 保持 mock 适配器测试可在无 GPU 环境通过。
+8. 增加 systemd user service 或 Windows 启动任务，让服务可后台常驻。
+9. 从 Mac mini 验收局域网调用。
 
 测试命令：
 
@@ -128,6 +207,7 @@ curl --noproxy '*' -v http://192.168.31.137:18080/v1/models
 - 可运行的 FastAPI ASR 服务。
 - README 中写明启动、停止、开机自启、Mac 调用方式。
 - 测试覆盖健康检查、模型列表、加载、卸载、卸载等待当前请求完成、转写接口参数校验。
+- 给出 `scripts/qwen_asr_backend_smoke.py` 在 `transformers` 与 `vllm` 后端的最小转录验收结果。
 - 给出 `qwen3-asr-0.6b` 在所有声明后端上的真实音频转写验收结果。
 - 给出 `qwen3-asr-1.7b` 在所有声明后端上的真实音频转写验收结果。
 

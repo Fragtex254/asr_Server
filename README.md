@@ -10,6 +10,7 @@
 - `asr_server/`：FastAPI 应用、模型注册表、生命周期管理器和 mock ASR 适配器。
 - `tests/`：不依赖 CUDA 的 API 和生命周期行为测试。
 - `scripts/asr_client.py`：Mac 侧验证客户端，会绕过本机代理设置。
+- `scripts/qwen_asr_backend_smoke.py`：WSL 侧真实 Qwen3-ASR 后端最小验收脚本。
 - `test-fixtures/audio/`：给 WSL 侧 ASR 自测使用的音频样本。
 
 ## 部署目标

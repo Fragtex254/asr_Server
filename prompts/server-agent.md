@@ -72,14 +72,11 @@ PY
 ```bash
 uv pip install -U qwen-asr
 
-# 只有需要验收 vLLM 后端时才安装：
-uv pip install -U 'qwen-asr[vllm]'
-
 uv run python - <<'PY'
 import torch
 
-assert torch.version.cuda is not None, "qwen/vllm 安装后 torch 变成 CPU 版"
-assert torch.cuda.is_available(), "qwen/vllm 安装后 CUDA 不可用"
+assert torch.version.cuda is not None, "qwen-asr 安装后 torch 变成 CPU 版"
+assert torch.cuda.is_available(), "qwen-asr 安装后 CUDA 不可用"
 print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))
 PY
 ```

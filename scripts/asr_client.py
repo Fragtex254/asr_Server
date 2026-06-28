@@ -57,6 +57,31 @@ def choose_fallback_model(models: list[dict[str, Any]], current_model: str) -> s
     return None
 
 
+def declared_backends(models: list[dict[str, Any]], model_id: str) -> list[str]:
+    for model in models:
+        if model.get("id") != model_id:
+            continue
+        capabilities = model.get("capabilities")
+        if not isinstance(capabilities, dict):
+            return []
+        backends = capabilities.get("backends")
+        if not isinstance(backends, list):
+            return []
+        return [backend for backend in backends if isinstance(backend, str)]
+    return []
+
+
+def choose_backend(models: list[dict[str, Any]], model_id: str, requested_backend: str) -> str:
+    if requested_backend == "auto":
+        return "auto"
+    backends = declared_backends(models, model_id)
+    if requested_backend in backends:
+        return requested_backend
+    if backends:
+        return backends[0]
+    return "auto"
+
+
 def check_server(base_url: str) -> None:
     with make_client(timeout_seconds=30.0) as client:
         health = client.get(f"{base_url}/health")
@@ -105,6 +130,7 @@ def transcribe(
     with make_client(timeout_seconds=1800.0) as client:
         models = discover_models(client, base_url)
         current_model = model
+        current_backend = choose_backend(models, current_model, backend)
         current_timestamps = timestamps
         capability_downgraded = False
 
@@ -114,7 +140,7 @@ def transcribe(
                 base_url,
                 audio_path,
                 model=current_model,
-                backend=backend,
+                backend=current_backend,
                 language=language,
                 timestamps=current_timestamps,
             )
@@ -132,9 +158,11 @@ def transcribe(
                 fallback = choose_fallback_model(models, current_model)
                 if fallback is not None:
                     current_model = fallback
+                    current_backend = choose_backend(models, current_model, backend)
                     continue
             if response.status_code == 422 and code == "capability_not_supported" and not capability_downgraded:
                 current_timestamps = "none"
+                current_backend = choose_backend(models, current_model, "auto")
                 capability_downgraded = True
                 continue
             response.raise_for_status()
@@ -152,7 +180,7 @@ def main() -> None:
     transcribe_parser = subparsers.add_parser("transcribe", help="上传一个音频文件进行转录。")
     transcribe_parser.add_argument("audio_path", type=Path)
     transcribe_parser.add_argument("--model", default=DEFAULT_MODEL)
-    transcribe_parser.add_argument("--backend", default="auto", choices=["auto", "transformers", "vllm"])
+    transcribe_parser.add_argument("--backend", default="auto", choices=["auto", "transformers"])
     transcribe_parser.add_argument("--language", default="auto")
     transcribe_parser.add_argument("--timestamps", default="none", choices=["none", "word", "char"])
 

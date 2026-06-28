@@ -20,10 +20,10 @@ http://192.168.31.137:18080
 docs/asr-server-prd.md
 ```
 
-下一阶段执行计划：
+下一阶段执行计划已合并到 WSL 项目总览：
 
 ```text
-docs/wsl-next-plan.md
+prompts/wsl-project-brief.md
 ```
 
 技术约束：
@@ -181,7 +181,7 @@ README.md
 7. 保持 mock 适配器测试可在无 GPU 环境通过。
 8. 增加 systemd user service 或 Windows 启动任务，让服务可后台常驻。
 9. 从 Mac mini 验收局域网调用。
-10. 按 `docs/wsl-next-plan.md` 继续做转录耗时记录、长音频切分与合并、Qwen transformers 能力补全。
+10. 按 `prompts/wsl-project-brief.md` 的“下一阶段开发计划”继续做转录耗时记录、长音频切分与合并、Qwen transformers 能力补全。
 
 测试命令：
 

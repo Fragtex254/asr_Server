@@ -599,7 +599,7 @@ limits:
 
 ## 12. 后续路线
 
-当前 WSL 服务端下一阶段按 `docs/wsl-next-plan.md` 执行：先做转录耗时记录，再做长音频切分与合并，再补 Qwen `transformers` 能力，最后再评估 MiMo。
+当前 WSL 服务端下一阶段按 `prompts/wsl-project-brief.md` 的“下一阶段开发计划”执行：先做转录耗时记录，再做长音频切分与合并，再补 Qwen `transformers` 能力，最后再评估 MiMo。
 
 优先级 P0：
 

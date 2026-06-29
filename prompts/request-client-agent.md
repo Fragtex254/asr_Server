@@ -75,7 +75,9 @@ job 规则：
 
 - `409 model_loading`：等待 3 秒后重试，最多 20 次。
 - `409 model_unloading_scheduled`：切换其他可用模型，或提示用户稍后重试。
+- `413 audio_too_large`：提示用户压缩、裁剪或分段音频，不要自动重试同一个文件。
 - `422 capability_not_supported`：去掉不支持的参数后重试一次。
+- `429 job_queue_full`：提示服务端队列已满，等待一段时间后再创建 job；不要切到同步长请求绕过队列。
 - `404 job_not_found`：job 可能已过期、服务重启或 ID 错误；提示重新提交。
 - `503 gpu_unavailable`：提示服务端 GPU/显存不可用，不要无限重试。
 

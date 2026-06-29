@@ -210,6 +210,20 @@ async def test_job_queue_limit_rejects_excess_jobs() -> None:
         await wait_for_status(client, str(first["id"]), {"completed"})
 
 
+async def test_job_creation_rejects_upload_over_size_limit() -> None:
+    app = create_app(settings=Settings(max_upload_mb=1))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/audio/transcription-jobs",
+            files={"file": ("large.wav", b"x" * (1024 * 1024 + 1), "audio/wav")},
+        )
+
+    assert response.status_code == 413
+    body = response.json()
+    assert body["error"]["code"] == "audio_too_large"
+    assert body["error"]["details"]["max_upload_mb"] == 1
+
+
 async def test_sync_transcription_over_duration_threshold_returns_job(
     client: AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

@@ -45,6 +45,33 @@ class UnloadRequest(BaseModel):
     cuda_empty_cache: bool = True
 
 
+UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
+
+
+async def read_upload_limited(file: UploadFile, settings: Settings) -> bytes:
+    max_upload_bytes = settings.max_upload_mb * 1024 * 1024
+    chunks = []
+    total_bytes = 0
+    while True:
+        chunk = await file.read(UPLOAD_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        total_bytes += len(chunk)
+        if total_bytes > max_upload_bytes:
+            raise AsrError(
+                413,
+                "audio_too_large",
+                "audio upload exceeds the server size limit",
+                {
+                    "size_bytes": total_bytes,
+                    "max_upload_bytes": max_upload_bytes,
+                    "max_upload_mb": settings.max_upload_mb,
+                },
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def gpu_health() -> dict[str, object]:
     try:
         torch = importlib.import_module("torch")
@@ -166,7 +193,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             preserve_segments=preserve_segments,
         )
         validated = validate_transcription_request(manager, request)
-        audio = await file.read()
+        audio = await read_upload_limited(file, app_settings)
         duration_seconds = await asyncio.to_thread(probe_audio_duration_seconds, audio)
         if duration_seconds is None:
             normalized = await asyncio.to_thread(normalize_audio_to_wav, audio)
@@ -224,7 +251,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             overlap_seconds=overlap_seconds,
             preserve_segments=preserve_segments,
         )
-        audio = await file.read()
+        audio = await read_upload_limited(file, app_settings)
         job_manager: JobManager = app.state.job_manager
         return await job_manager.create_job(
             audio=audio,

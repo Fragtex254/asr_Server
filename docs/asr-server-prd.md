@@ -664,6 +664,7 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 | 413 | `audio_too_large` | 音频超出服务限制 |
 | 415 | `unsupported_audio_format` | 音频格式不支持 |
 | 422 | `capability_not_supported` | 请求了模型不支持的能力 |
+| 429 | `job_queue_full` | 异步转录队列达到服务端上限 |
 | 500 | `inference_failed` | 模型推理失败 |
 | 503 | `gpu_unavailable` | GPU 不可用或显存不足 |
 

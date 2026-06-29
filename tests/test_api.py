@@ -13,6 +13,7 @@ from asr_server import main as main_module
 from asr_server.adapters.base import TranscriptionResult
 from asr_server.adapters.mock import MockAsrAdapter
 from asr_server.audio import splitter as splitter_module
+from asr_server.config import Settings
 from asr_server.main import create_app
 
 
@@ -366,6 +367,20 @@ async def test_transcription_maps_audio_decode_failure(client: AsyncClient) -> N
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "audio_decode_failed"
+
+
+async def test_transcription_rejects_upload_over_size_limit() -> None:
+    app = create_app(settings=Settings(max_upload_mb=1))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("large.wav", b"x" * (1024 * 1024 + 1), "audio/wav")},
+        )
+
+    assert response.status_code == 413
+    body = response.json()
+    assert body["error"]["code"] == "audio_too_large"
+    assert body["error"]["details"]["max_upload_mb"] == 1
 
 
 async def test_vllm_backend_is_not_declared_for_first_release(client: AsyncClient) -> None:

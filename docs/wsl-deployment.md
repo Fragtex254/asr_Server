@@ -116,6 +116,20 @@ ASR_QWEN_BATCH_SIZE=2 ASR_ADAPTER=qwen uv run uvicorn asr_server.main:app --host
 
 只有 batch size 在 `qwen3-asr-0.6b` 和 `qwen3-asr-1.7b` 上都稳定后，才把更大的值写入常驻服务配置。
 
+## 服务端限制参数
+
+以下限制通过环境变量控制：
+
+```text
+ASR_MAX_UPLOAD_MB=512
+ASR_MAX_QUEUED_JOBS=20
+ASR_JOB_RESULT_TTL_SECONDS=3600
+```
+
+- `ASR_MAX_UPLOAD_MB`：单次上传音频大小上限；同步转录和异步 job 创建都会执行，超限返回 `413 audio_too_large`。
+- `ASR_MAX_QUEUED_JOBS`：queued/running job 总数上限；超限返回 `429 job_queue_full`。
+- `ASR_JOB_RESULT_TTL_SECONDS`：job 完成、失败或取消后结果保留时间；过期后客户端应重新提交。
+
 ## 异步 job 与进度查询
 
 长音频或需要前端展示进度时，优先使用异步 job：

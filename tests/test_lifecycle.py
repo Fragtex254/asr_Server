@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 
@@ -50,9 +51,13 @@ class RecordingAdapter:
         self.active_transcribes = 0
         self.max_parallel_transcribes = 0
         self.unload_while_transcribing = False
+        self.load_while_transcribing = False
+        self.transcribe_started = threading.Event()
 
     async def load(self, backend: str, device: str, dtype: str, max_new_tokens: int | None = None) -> None:
         del backend, device, dtype
+        if self.active_transcribes > 0:
+            self.load_while_transcribing = True
         self.loads.append(max_new_tokens)
 
     async def unload(self, cuda_empty_cache: bool) -> None:
@@ -72,6 +77,7 @@ class RecordingAdapter:
     ) -> TranscriptionResult:
         del audio, model_id, backend, context, max_new_tokens
         self.active_transcribes += 1
+        self.transcribe_started.set()
         self.max_parallel_transcribes = max(self.max_parallel_transcribes, self.active_transcribes)
         await asyncio.sleep(0.03)
         self.active_transcribes -= 1
@@ -135,3 +141,31 @@ async def test_same_model_transcriptions_are_serialized_across_generation_reload
     assert adapter.loads == [512, 256]
     assert adapter.max_parallel_transcribes == 1
     assert adapter.unload_while_transcribing is False
+
+
+async def test_explicit_load_waits_for_active_transcription() -> None:
+    adapter = RecordingAdapter()
+    manager = ModelLifecycleManager(default_models(), lambda _model_id: adapter)
+
+    transcription = asyncio.create_task(
+        manager.transcribe_chunks(
+            [b"audio"],
+            model_id="qwen3-asr-1.7b",
+            backend="transformers",
+            language="auto",
+            timestamps="none",
+            context="",
+            max_new_tokens=512,
+            batch_size=1,
+        )
+    )
+    assert await asyncio.to_thread(adapter.transcribe_started.wait, 1.0)
+
+    load = asyncio.create_task(
+        manager.load_model("qwen3-asr-1.7b", backend="transformers", max_new_tokens=256)
+    )
+
+    await asyncio.gather(transcription, load)
+
+    assert adapter.load_while_transcribing is False
+    assert adapter.loads == [512, 256]

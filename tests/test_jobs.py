@@ -13,6 +13,7 @@ from httpx import ASGITransport, AsyncClient
 from asr_server import main as main_module
 from asr_server.adapters.base import TranscriptionResult
 from asr_server.adapters.mock import MockAsrAdapter
+from asr_server.config import Settings
 from asr_server.errors import AsrError
 from asr_server.main import create_app
 
@@ -193,11 +194,34 @@ async def test_unknown_job_returns_error_envelope(client: AsyncClient) -> None:
     assert response.json()["error"]["code"] == "job_not_found"
 
 
+async def test_job_queue_limit_rejects_excess_jobs() -> None:
+    app = create_app(settings=Settings(max_queued_jobs=1), adapter_delay_seconds=0.08)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        first = await create_job(client)
+
+        response = await client.post(
+            "/v1/audio/transcription-jobs",
+            files={"file": ("sample.wav", make_wav(0.1), "audio/wav")},
+        )
+
+        assert response.status_code == 429
+        assert response.json()["error"]["code"] == "job_queue_full"
+        assert response.json()["error"]["details"]["max_queued_jobs"] == 1
+        await wait_for_status(client, str(first["id"]), {"completed"})
+
+
 async def test_sync_transcription_over_duration_threshold_returns_job(
     client: AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(main_module, "SYNC_JOB_THRESHOLD_SECONDS", 0.01)
+    monkeypatch.setattr(main_module, "probe_audio_duration_seconds", lambda _audio: 0.1)
+
+    def fail_decode(audio: bytes) -> object:
+        del audio
+        raise AssertionError("sync duration threshold should not require full decode before returning 202")
+
+    monkeypatch.setattr(main_module, "normalize_audio_to_wav", fail_decode)
 
     response = await client.post(
         "/v1/audio/transcriptions",

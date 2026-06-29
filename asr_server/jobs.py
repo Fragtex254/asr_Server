@@ -143,38 +143,45 @@ class JobManager:
         self._expire_jobs()
         validated = validate_transcription_request(self._manager, request)
         job_id = f"job_{uuid4().hex}"
-        work_dir = Path(tempfile.mkdtemp(prefix=f"asr_{job_id}_"))
-        upload_name = filename or "upload.bin"
-        upload_path = work_dir / "upload"
-        upload_path.write_bytes(audio)
         created_at = utc_now()
-        job = TranscriptionJob(
-            id=job_id,
-            status="queued",
-            model=validated.selected_model,
-            backend=validated.resolved_backend,
-            language=request.language,
-            request=request,
-            validated=validated,
-            upload_path=upload_path,
-            work_dir=work_dir,
-            created_at=created_at,
-            request_summary={
-                "filename": upload_name,
-                "content_type": content_type,
-                "size_bytes": len(audio),
-                "response_format": request.response_format,
-                "timestamps": request.timestamps,
-                "split_strategy": request.split_strategy,
-                "max_chunk_seconds": request.max_chunk_seconds,
-                "overlap_seconds": request.overlap_seconds,
-                "preserve_segments": request.preserve_segments,
-                "context_chars": len(request.context),
-                "hotwords_chars": len(request.hotwords or ""),
-            },
-            temp_paths=[upload_path, work_dir],
-        )
+        upload_name = filename or "upload.bin"
         async with self._condition:
+            if self._active_job_count() >= self._settings.max_queued_jobs:
+                raise AsrError(
+                    429,
+                    "job_queue_full",
+                    "too many queued or running transcription jobs",
+                    {"max_queued_jobs": self._settings.max_queued_jobs},
+                )
+            work_dir = Path(tempfile.mkdtemp(prefix=f"asr_{job_id}_"))
+            upload_path = work_dir / "upload"
+            upload_path.write_bytes(audio)
+            job = TranscriptionJob(
+                id=job_id,
+                status="queued",
+                model=validated.selected_model,
+                backend=validated.resolved_backend,
+                language=request.language,
+                request=request,
+                validated=validated,
+                upload_path=upload_path,
+                work_dir=work_dir,
+                created_at=created_at,
+                request_summary={
+                    "filename": upload_name,
+                    "content_type": content_type,
+                    "size_bytes": len(audio),
+                    "response_format": request.response_format,
+                    "timestamps": request.timestamps,
+                    "split_strategy": request.split_strategy,
+                    "max_chunk_seconds": request.max_chunk_seconds,
+                    "overlap_seconds": request.overlap_seconds,
+                    "preserve_segments": request.preserve_segments,
+                    "context_chars": len(request.context),
+                    "hotwords_chars": len(request.hotwords or ""),
+                },
+                temp_paths=[upload_path, work_dir],
+            )
             self._jobs[job_id] = job
             self._queue.append(job_id)
             self._condition.notify()
@@ -374,6 +381,9 @@ class JobManager:
         if job_id in self._queue:
             return list(self._queue).index(job_id) + 1
         return 0
+
+    def _active_job_count(self) -> int:
+        return sum(1 for job in self._jobs.values() if job.status not in TERMINAL_STATUSES)
 
     def _elapsed_seconds(self, job: TranscriptionJob) -> float:
         end = job.completed_at or utc_now()

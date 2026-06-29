@@ -16,6 +16,7 @@ class Settings:
     adapter: AdapterMode = "mock"
     qwen_batch_size: int = 1
     job_result_ttl_seconds: int = 3600
+    max_queued_jobs: int = 20
 
 
 def load_settings() -> Settings:
@@ -29,6 +30,9 @@ def load_settings() -> Settings:
     job_result_ttl_seconds = int(os.getenv("ASR_JOB_RESULT_TTL_SECONDS", "3600"))
     if job_result_ttl_seconds < 1:
         raise ValueError("ASR_JOB_RESULT_TTL_SECONDS must be greater than or equal to 1")
+    max_queued_jobs = int(os.getenv("ASR_MAX_QUEUED_JOBS", "20"))
+    if max_queued_jobs < 1:
+        raise ValueError("ASR_MAX_QUEUED_JOBS must be greater than or equal to 1")
     return Settings(
         host=os.getenv("ASR_HOST", "0.0.0.0"),
         port=int(os.getenv("ASR_PORT", "18080")),
@@ -37,4 +41,5 @@ def load_settings() -> Settings:
         adapter=adapter_mode,
         qwen_batch_size=qwen_batch_size,
         job_result_ttl_seconds=job_result_ttl_seconds,
+        max_queued_jobs=max_queued_jobs,
     )

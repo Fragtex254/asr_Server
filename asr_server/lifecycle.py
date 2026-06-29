@@ -109,28 +109,29 @@ class ModelLifecycleManager:
     ) -> dict[str, object]:
         runtime = self.runtime_for(model_id)
         resolved_backend = self.resolve_backend(runtime, backend)
-        async with runtime.lock:
-            if runtime.status in ("unloading", "unloading_scheduled"):
-                raise AsrError(409, "model_unloading_scheduled", f"model is unloading: {model_id}")
-            runtime.status = "loading"
-            try:
-                await _call_adapter(
-                    lambda: runtime.adapter.load(resolved_backend, device, dtype, max_new_tokens=max_new_tokens)
-                )
-            except Exception:
-                runtime.status = "error"
+        async with runtime.request_lock:
+            async with runtime.lock:
+                if runtime.status in ("unloading", "unloading_scheduled"):
+                    raise AsrError(409, "model_unloading_scheduled", f"model is unloading: {model_id}")
+                runtime.status = "loading"
+                try:
+                    await _call_adapter(
+                        lambda: runtime.adapter.load(resolved_backend, device, dtype, max_new_tokens=max_new_tokens)
+                    )
+                except Exception:
+                    runtime.status = "error"
+                    runtime.rejecting_new_requests = False
+                    raise
+                runtime.status = "loaded"
                 runtime.rejecting_new_requests = False
-                raise
-            runtime.status = "loaded"
-            runtime.rejecting_new_requests = False
-            runtime.backend = resolved_backend
-            runtime.max_new_tokens = max_new_tokens
-            runtime.loaded_at = utc_now_iso()
-            return {
-                "id": model_id,
-                "status": runtime.status,
-                "message": "model loaded",
-            }
+                runtime.backend = resolved_backend
+                runtime.max_new_tokens = max_new_tokens
+                runtime.loaded_at = utc_now_iso()
+                return {
+                    "id": model_id,
+                    "status": runtime.status,
+                    "message": "model loaded",
+                }
 
     async def unload_model(
         self,

@@ -17,7 +17,7 @@ from asr_server.adapters.base import AsrAdapter
 from asr_server.adapters.mock import MockAsrAdapter
 from asr_server.adapters.qwen import QwenAsrAdapter
 from asr_server.audio.metadata import inspect_audio
-from asr_server.audio.preprocess import normalize_audio_to_wav
+from asr_server.audio.preprocess import normalize_audio_to_wav, probe_audio_duration_seconds
 from asr_server.config import Settings, load_settings
 from asr_server.errors import AsrError, asr_error_handler, validation_error_handler
 from asr_server.jobs import JobManager
@@ -167,9 +167,12 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         )
         validated = validate_transcription_request(manager, request)
         audio = await file.read()
-        normalized = await asyncio.to_thread(normalize_audio_to_wav, audio)
-        metadata = await asyncio.to_thread(inspect_audio, normalized.audio)
-        if metadata.duration_seconds > SYNC_JOB_THRESHOLD_SECONDS:
+        duration_seconds = await asyncio.to_thread(probe_audio_duration_seconds, audio)
+        if duration_seconds is None:
+            normalized = await asyncio.to_thread(normalize_audio_to_wav, audio)
+            metadata = await asyncio.to_thread(inspect_audio, normalized.audio)
+            duration_seconds = metadata.duration_seconds
+        if duration_seconds > SYNC_JOB_THRESHOLD_SECONDS:
             job_manager: JobManager = app.state.job_manager
             payload = await job_manager.create_job(
                 audio=audio,

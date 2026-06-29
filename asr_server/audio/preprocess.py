@@ -15,6 +15,42 @@ class NormalizedAudio:
     decode_ms: float
 
 
+def probe_audio_duration_seconds(audio: bytes) -> float | None:
+    input_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".input", delete=False) as input_file:
+            input_file.write(audio)
+            input_path = Path(input_file.name)
+        completed = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(input_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    finally:
+        if input_path is not None:
+            input_path.unlink(missing_ok=True)
+    if completed.returncode != 0:
+        return None
+    try:
+        duration = float(completed.stdout.strip())
+    except ValueError:
+        return None
+    return duration if duration > 0 else None
+
+
 def normalize_audio_to_wav(audio: bytes) -> NormalizedAudio:
     started = perf_counter()
     input_path: Path | None = None

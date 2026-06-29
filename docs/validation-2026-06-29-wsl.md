@@ -97,16 +97,73 @@ ASR_QWEN_BATCH_SIZE=1
 - chunk 最大推理耗时从约 `13070ms` 降到约 `8263ms`。
 - 文本长度未下降，未观察到明显截断。
 
+## 异步 job 与进度验收
+
+### 对抗式发现与修复
+
+- 初次真实长音频 job 验收时发现：`QwenAsrAdapter` 是 `async def`，但内部执行同步 `from_pretrained(...)` 和 `model.transcribe(...)`，会阻塞 Uvicorn event loop。
+- 影响：长音频 job 运行期间 `GET /v1/jobs/{job_id}` 和 `/health` 不能及时响应，违背“可轮询进度”的核心目标。
+- 修复：生命周期管理器把 adapter `load` / `unload` / `transcribe` / `transcribe_batch` 调用放入 `asyncio.to_thread(...)`；job 的音频 decode、split、merge 也放入线程执行。
+- 修复后验证：长音频 job 转录期间 `/health` 持续响应，轮询可见 `preprocessing`、`splitting`、`transcribing`、`merging`、`completed`。
+
+### `qwen3-asr-1.7b` 长音频 job
+
+- 接口：`POST /v1/audio/transcription-jobs`
+- 模型：`qwen3-asr-1.7b`
+- 后端：`transformers`
+- 音频文件：`test-fixtures/audio/test_long.mp3`
+- 音频时长：`3630.053875s`
+- split：`silero`
+- chunk 数：`32`
+- 状态流转：`queued -> preprocessing -> splitting -> transcribing -> merging -> completed`
+- 轮询观察：`completed_chunks` 从 `0` 增长到 `32`，`current_chunk` 从 `1` 增长到 `32`
+- 长 job 期间 `/health` 成功响应次数：`112`
+- wall time：约 `222.7s`
+- `total_ms`：`193340.19`
+- `load_ms`：`0.0`（1.7B 已由 HTTP smoke 预加载）
+- `decode_ms`：`4244.08`
+- `inference_ms`：`189046.05`
+- 文本前 200 字：`别紧张，是我。嗯，是熟悉的味道呢。看来命运再一次将你交到了我的手上。刚刚听到那个音乐，是有应急反应吗？还是说唤起了你的一些快乐的回忆？是呢，是呢，是我将你带到了这里，可是你也收获了很多美好的经历，不是吗？一脸幸福的回味表情呢。而且上次在我这里的时候，我记得你也很享受呢。还是说主人对你太客气了，妾奴？我说过的吧，主人一定会找过你的，我的小奴隶。走吧，我们换个地方好好玩。好了，就是这里了。这里是舞台的`
+
+### `qwen3-asr-0.6b` 短音频 job
+
+- 接口：`POST /v1/audio/transcription-jobs`
+- 模型：`qwen3-asr-0.6b`
+- 后端：`transformers`
+- 音频文件：`test-fixtures/audio/test_short.wav`
+- 状态流转：`queued -> preprocessing -> loading_model -> transcribing -> completed`
+- chunk 数：`1`
+- `total_ms`：`9481.25`
+- `load_ms`：`8049.89`
+- `decode_ms`：`44.13`
+- `inference_ms`：`1386.46`
+- 文本前 200 字：`你好，你好，你好。这个是测试音频，主要用于测试千问 ASR 模型 1.7B 的实际转录能力。`
+
+### job 行为测试覆盖
+
+- 创建 job 返回 `202`、`queued`、`status_url`
+- `GET /v1/jobs/{job_id}` 返回 queued/running/completed
+- 单 worker FIFO 队列与 `queue_position`
+- chunk 级进度：`total_chunks`、`completed_chunks`、`current_chunk`
+- completed result 与同步接口结构兼容
+- adapter 错误进入 `failed`，错误对象为 `code/message/details`
+- queued job 取消为 `cancelled`
+- running job 设置 `cancel_requested`，chunk 边界后进入 `cancelled`
+- 未知 job 返回 `404 job_not_found`
+- 超过同步阈值时同步接口返回 `202` job
+
 ## 验证命令
 
 ```bash
 uv run pytest -q
 uv run mypy asr_server tests scripts
+ASR_BASE_URL=http://127.0.0.1:18080 uv run pytest tests/test_http_smoke.py -q
 ```
 
 结果：
 
 ```text
-48 passed, 2 skipped
-Success: no issues found in 29 source files
+58 passed, 2 skipped
+Success: no issues found in 33 source files
+HTTP smoke: 2 passed
 ```

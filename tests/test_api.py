@@ -415,7 +415,7 @@ async def test_unsupported_capability_is_rejected_before_audio_decode(
 
 
 async def test_unload_waits_for_active_request_and_rejects_new_requests() -> None:
-    app = create_app(adapter_delay_seconds=0.05)
+    app = create_app(adapter_delay_seconds=0.2)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
         transcription_task = asyncio.create_task(
             client.post(
@@ -424,7 +424,13 @@ async def test_unload_waits_for_active_request_and_rejects_new_requests() -> Non
                 data={"model": "qwen3-asr-1.7b", "backend": "transformers"},
             )
         )
-        await asyncio.sleep(0.01)
+        for _ in range(30):
+            status_response = await client.get("/v1/models/qwen3-asr-1.7b/status")
+            if status_response.json()["active_requests"] == 1:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("transcription did not enter active request state")
 
         unload_response = await client.request(
             "DELETE",

@@ -1,32 +1,35 @@
 from __future__ import annotations
 
-import json
+import asyncio
 import socket
 import importlib
-from dataclasses import replace
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Annotated, Any, cast
 
 from fastapi import Body, FastAPI, File, Form, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from asr_server import __version__
 from asr_server.adapters.base import AsrAdapter
 from asr_server.adapters.mock import MockAsrAdapter
 from asr_server.adapters.qwen import QwenAsrAdapter
-from asr_server.audio.merger import merge_transcription_results
+from asr_server.audio.metadata import inspect_audio
 from asr_server.audio.preprocess import normalize_audio_to_wav
-from asr_server.audio.splitter import split_audio
 from asr_server.config import Settings, load_settings
 from asr_server.errors import AsrError, asr_error_handler, validation_error_handler
+from asr_server.jobs import JobManager
 from asr_server.lifecycle import ModelLifecycleManager
 from asr_server.registry import Backend, default_models
-
-
-MAX_CONTEXT_CHARS = 4000
-DEFAULT_MAX_NEW_TOKENS = 512
-MAX_NEW_TOKENS = 4096
+from asr_server.transcription import (
+    SYNC_JOB_THRESHOLD_SECONDS,
+    TranscriptionRequest,
+    run_transcription,
+    validate_max_new_tokens,
+    validate_transcription_request,
+)
 
 
 class LoadRequest(BaseModel):
@@ -57,53 +60,6 @@ def gpu_health() -> dict[str, object]:
     }
 
 
-def build_adapter_context(context: str, hotwords: str | None) -> str:
-    parts = []
-    stripped_context = context.strip()
-    if stripped_context:
-        parts.append(stripped_context)
-    normalized_hotwords = parse_hotwords(hotwords)
-    if normalized_hotwords:
-        parts.append("Hotwords: " + ", ".join(normalized_hotwords))
-    adapter_context = "\n".join(parts)
-    if len(adapter_context) > MAX_CONTEXT_CHARS:
-        raise AsrError(
-            400,
-            "bad_request",
-            "context exceeds the server context length limit",
-            {"context_chars": len(adapter_context), "max_context_chars": MAX_CONTEXT_CHARS},
-        )
-    return adapter_context
-
-
-def parse_hotwords(hotwords: str | None) -> list[str]:
-    if hotwords is None or not hotwords.strip():
-        return []
-    stripped = hotwords.strip()
-    if stripped.startswith("["):
-        try:
-            parsed = json.loads(stripped)
-        except json.JSONDecodeError as exc:
-            raise AsrError(400, "bad_request", "hotwords must be a JSON string array or comma-separated string") from exc
-        if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
-            raise AsrError(400, "bad_request", "hotwords JSON value must be an array of strings")
-        return [item.strip() for item in parsed if item.strip()]
-    return [item.strip() for item in stripped.split(",") if item.strip()]
-
-
-def validate_max_new_tokens(max_new_tokens: int | None) -> int | None:
-    if max_new_tokens is None:
-        return DEFAULT_MAX_NEW_TOKENS
-    if max_new_tokens > MAX_NEW_TOKENS:
-        raise AsrError(
-            400,
-            "bad_request",
-            "max_new_tokens exceeds the server limit",
-            {"max_new_tokens": max_new_tokens, "max_new_tokens_limit": MAX_NEW_TOKENS},
-        )
-    return max_new_tokens
-
-
 def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 0.0) -> FastAPI:
     app_settings = settings or load_settings()
 
@@ -112,11 +68,21 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             return QwenAsrAdapter(model_id)
         return MockAsrAdapter(delay_seconds=adapter_delay_seconds)
 
-    app = FastAPI(title="WSL ASR Server", version=__version__)
+    @asynccontextmanager
+    async def lifespan(lifespan_app: FastAPI) -> AsyncIterator[None]:
+        job_manager: JobManager = lifespan_app.state.job_manager
+        await job_manager.start()
+        try:
+            yield
+        finally:
+            await job_manager.shutdown()
+
+    app = FastAPI(title="WSL ASR Server", version=__version__, lifespan=lifespan)
     app.add_exception_handler(AsrError, cast(Any, asr_error_handler))
     app.add_exception_handler(RequestValidationError, cast(Any, validation_error_handler))
     app.state.manager = ModelLifecycleManager(default_models(app_settings.default_model), adapter_factory)
     app.state.settings = app_settings
+    app.state.job_manager = JobManager(app.state.manager, app_settings)
 
     @app.get("/health")
     async def health() -> dict[str, object]:
@@ -182,74 +148,97 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         max_chunk_seconds: Annotated[float | None, Form()] = None,
         overlap_seconds: Annotated[float | None, Form()] = None,
         preserve_segments: Annotated[bool, Form()] = False,
-    ) -> dict[str, object] | PlainTextResponse:
+    ) -> dict[str, object] | PlainTextResponse | JSONResponse:
         del temperature
-        if response_format not in {"json", "text", "verbose_json"}:
-            raise AsrError(400, "bad_request", f"unsupported response_format: {response_format}")
-        if timestamps not in {"none", "word", "char"}:
-            raise AsrError(400, "bad_request", f"unsupported timestamps value: {timestamps}")
         manager: ModelLifecycleManager = app.state.manager
-        selected_model = model or manager.default_model_id
-        runtime = manager.runtime_for(selected_model)
-        manager.resolve_backend(runtime, backend)
-        if timestamps != "none" and not runtime.definition.capabilities.timestamps:
-            raise AsrError(
-                422,
-                "capability_not_supported",
-                f"{selected_model} does not support timestamps in this server",
-                {"timestamps": timestamps},
-            )
-        adapter_context = build_adapter_context(context, hotwords)
-        adapter_max_new_tokens = validate_max_new_tokens(max_new_tokens)
-        audio = await file.read()
-        normalized = normalize_audio_to_wav(audio)
-        split = split_audio(
-            normalized.audio,
+        request = _transcription_request(
+            model=model,
+            language=language,
+            response_format=response_format,
+            timestamps=timestamps,
+            backend=backend,
+            max_new_tokens=max_new_tokens,
+            context=context,
+            hotwords=hotwords,
             split_strategy=split_strategy,
             max_chunk_seconds=max_chunk_seconds,
             overlap_seconds=overlap_seconds,
-        )
-        resolved_backend, chunk_results, timings = await manager.transcribe_chunks(
-            [chunk.audio for chunk in split.chunks],
-            model_id=model,
-            backend=backend,
-            language=language,
-            timestamps=timestamps,
-            context=adapter_context,
-            max_new_tokens=adapter_max_new_tokens,
-            batch_size=app_settings.qwen_batch_size,
-        )
-        timings = replace(
-            timings,
-            total_ms=timings.total_ms + normalized.decode_ms,
-            decode_ms=timings.decode_ms + normalized.decode_ms,
-        )
-        result = merge_transcription_results(
-            split.chunks,
-            chunk_results,
-            source_duration=split.metadata.duration_seconds,
             preserve_segments=preserve_segments,
-            timings=timings,
         )
-        generation_warnings = [f"max_new_tokens_override:{adapter_max_new_tokens}"] if max_new_tokens is not None else []
-        warnings = list(dict.fromkeys([*result.warnings, *split.warnings, *generation_warnings]))
+        validated = validate_transcription_request(manager, request)
+        audio = await file.read()
+        normalized = await asyncio.to_thread(normalize_audio_to_wav, audio)
+        metadata = await asyncio.to_thread(inspect_audio, normalized.audio)
+        if metadata.duration_seconds > SYNC_JOB_THRESHOLD_SECONDS:
+            job_manager: JobManager = app.state.job_manager
+            payload = await job_manager.create_job(
+                audio=audio,
+                filename=file.filename,
+                content_type=file.content_type,
+                request=request,
+            )
+            return JSONResponse(status_code=202, content=payload)
+        result = await run_transcription(
+            audio,
+            manager=manager,
+            settings=app_settings,
+            request=request,
+            validated=validated,
+        )
         if response_format == "text":
-            return PlainTextResponse(result.text)
-        return {
-            "id": "tr_mock",
-            "model": selected_model,
-            "backend": resolved_backend,
-            "language": result.language,
-            "text": result.text,
-            "duration": result.duration,
-            "timestamps": [],
-            "segments": [],
-            "split": split.summary(),
-            "chunks": result.chunks,
-            "usage": {"audio_seconds": result.duration},
-            "timings": result.timings.to_api(),
-            "warnings": warnings,
-        }
+            return PlainTextResponse(cast(str, result["text"]))
+        return result
+
+    @app.post("/v1/audio/transcription-jobs", status_code=202)
+    async def create_transcription_job(
+        file: Annotated[UploadFile, File()],
+        model: Annotated[str | None, Form()] = None,
+        language: Annotated[str, Form()] = "auto",
+        response_format: Annotated[str, Form()] = "json",
+        timestamps: Annotated[str, Form()] = "none",
+        backend: Annotated[Backend, Form()] = "auto",
+        temperature: Annotated[float | None, Form()] = None,
+        max_new_tokens: Annotated[int | None, Form(ge=1)] = None,
+        context: Annotated[str, Form()] = "",
+        hotwords: Annotated[str | None, Form()] = None,
+        split_strategy: Annotated[str, Form()] = "auto",
+        max_chunk_seconds: Annotated[float | None, Form()] = None,
+        overlap_seconds: Annotated[float | None, Form()] = None,
+        preserve_segments: Annotated[bool, Form()] = False,
+    ) -> dict[str, object]:
+        del temperature
+        request = _transcription_request(
+            model=model,
+            language=language,
+            response_format=response_format,
+            timestamps=timestamps,
+            backend=backend,
+            max_new_tokens=max_new_tokens,
+            context=context,
+            hotwords=hotwords,
+            split_strategy=split_strategy,
+            max_chunk_seconds=max_chunk_seconds,
+            overlap_seconds=overlap_seconds,
+            preserve_segments=preserve_segments,
+        )
+        audio = await file.read()
+        job_manager: JobManager = app.state.job_manager
+        return await job_manager.create_job(
+            audio=audio,
+            filename=file.filename,
+            content_type=file.content_type,
+            request=request,
+        )
+
+    @app.get("/v1/jobs/{job_id}")
+    async def get_transcription_job(job_id: str) -> dict[str, object]:
+        job_manager: JobManager = app.state.job_manager
+        return await job_manager.get_job(job_id)
+
+    @app.delete("/v1/jobs/{job_id}")
+    async def cancel_transcription_job(job_id: str) -> dict[str, object]:
+        job_manager: JobManager = app.state.job_manager
+        return await job_manager.cancel_job(job_id)
 
     @app.post("/v1/audio/alignments")
     async def alignments() -> dict[str, object]:
@@ -260,6 +249,37 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         )
 
     return app
+
+
+def _transcription_request(
+    *,
+    model: str | None,
+    language: str,
+    response_format: str,
+    timestamps: str,
+    backend: Backend,
+    max_new_tokens: int | None,
+    context: str,
+    hotwords: str | None,
+    split_strategy: str,
+    max_chunk_seconds: float | None,
+    overlap_seconds: float | None,
+    preserve_segments: bool,
+) -> TranscriptionRequest:
+    return TranscriptionRequest(
+        model=model,
+        language=language,
+        response_format=response_format,
+        timestamps=timestamps,
+        backend=backend,
+        max_new_tokens=max_new_tokens,
+        context=context,
+        hotwords=hotwords,
+        split_strategy=split_strategy,
+        max_chunk_seconds=max_chunk_seconds,
+        overlap_seconds=overlap_seconds,
+        preserve_segments=preserve_segments,
+    )
 
 
 app = create_app()

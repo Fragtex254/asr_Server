@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from time import perf_counter
+from typing import Any, TypeVar
 
 from asr_server.adapters.base import AsrAdapter, TranscriptionResult, TranscriptionTimings
 from asr_server.errors import AsrError
 from asr_server.registry import Backend, ModelDefinition, ModelStatus
+
+
+ChunkProgressCallback = Callable[[int, int], Awaitable[None]]
+ChunkResultCallback = Callable[[int, int, TranscriptionResult], Awaitable[None]]
+T = TypeVar("T")
 
 
 def utc_now_iso() -> str:
@@ -108,7 +114,9 @@ class ModelLifecycleManager:
                 raise AsrError(409, "model_unloading_scheduled", f"model is unloading: {model_id}")
             runtime.status = "loading"
             try:
-                await runtime.adapter.load(resolved_backend, device, dtype, max_new_tokens=max_new_tokens)
+                await _call_adapter(
+                    lambda: runtime.adapter.load(resolved_backend, device, dtype, max_new_tokens=max_new_tokens)
+                )
             except Exception:
                 runtime.status = "error"
                 runtime.rejecting_new_requests = False
@@ -190,6 +198,8 @@ class ModelLifecycleManager:
         context: str,
         max_new_tokens: int | None,
         batch_size: int,
+        before_chunk: ChunkProgressCallback | None = None,
+        after_chunk: ChunkResultCallback | None = None,
     ) -> tuple[str, list[TranscriptionResult], TranscriptionTimings]:
         if not audio_chunks:
             raise AsrError(400, "bad_request", "audio request did not contain any chunks")
@@ -226,6 +236,8 @@ class ModelLifecycleManager:
                     context=context,
                     max_new_tokens=max_new_tokens,
                     batch_size=batch_size,
+                    before_chunk=before_chunk,
+                    after_chunk=after_chunk,
                 )
                 runtime.last_used_at = utc_now_iso()
                 timings = TranscriptionTimings(
@@ -250,36 +262,52 @@ class ModelLifecycleManager:
         context: str,
         max_new_tokens: int | None,
         batch_size: int,
+        before_chunk: ChunkProgressCallback | None,
+        after_chunk: ChunkResultCallback | None,
     ) -> list[TranscriptionResult]:
         if len(audio_chunks) == 1:
+            if before_chunk is not None:
+                await before_chunk(0, 1)
             chunk_started = perf_counter()
-            result = await runtime.adapter.transcribe(
-                audio_chunks[0],
-                model_id=model_id,
-                backend=backend,
-                language=language,
-                context=context,
-                max_new_tokens=max_new_tokens,
+            result = await _call_adapter(
+                lambda: runtime.adapter.transcribe(
+                    audio_chunks[0],
+                    model_id=model_id,
+                    backend=backend,
+                    language=language,
+                    context=context,
+                    max_new_tokens=max_new_tokens,
+                )
             )
             if result.timings.total_ms == 0:
                 result = replace(
                     result,
                     timings=replace(result.timings, total_ms=(perf_counter() - chunk_started) * 1000),
                 )
+            if after_chunk is not None:
+                await after_chunk(0, 1, result)
             return [result]
 
         results = []
         effective_batch_size = max(batch_size, 1)
+        completed_count = 0
+        total_count = len(audio_chunks)
         for batch in _chunked(audio_chunks, effective_batch_size):
+            batch_start_index = completed_count
+            if before_chunk is not None:
+                for offset in range(len(batch)):
+                    await before_chunk(batch_start_index + offset, total_count)
             batch_started = perf_counter()
             try:
-                batch_results = await runtime.adapter.transcribe_batch(
-                    batch,
-                    model_id=model_id,
-                    backend=backend,
-                    language=language,
-                    context=context,
-                    max_new_tokens=max_new_tokens,
+                batch_results = await _call_adapter(
+                    lambda: runtime.adapter.transcribe_batch(
+                        batch,
+                        model_id=model_id,
+                        backend=backend,
+                        language=language,
+                        context=context,
+                        max_new_tokens=max_new_tokens,
+                    )
                 )
             except AsrError:
                 raise
@@ -299,10 +327,13 @@ class ModelLifecycleManager:
                 )
             batch_ms = (perf_counter() - batch_started) * 1000
             per_chunk_ms = batch_ms / len(batch)
-            for result in batch_results:
+            for offset, result in enumerate(batch_results):
                 if result.timings.total_ms == 0:
                     result = replace(result, timings=replace(result.timings, total_ms=per_chunk_ms))
                 results.append(result)
+                completed_count += 1
+                if after_chunk is not None:
+                    await after_chunk(batch_start_index + offset, total_count, result)
         return results
 
     async def _begin_request(
@@ -335,7 +366,7 @@ class ModelLifecycleManager:
                 and runtime.max_new_tokens != max_new_tokens
             )
             if needs_reload_for_generation:
-                await runtime.adapter.unload(cuda_empty_cache=True)
+                await _call_adapter(lambda: runtime.adapter.unload(cuda_empty_cache=True))
                 runtime.status = "unloaded"
                 runtime.backend = None
                 runtime.max_new_tokens = None
@@ -344,7 +375,9 @@ class ModelLifecycleManager:
                 runtime.status = "loading"
                 load_started = perf_counter()
                 try:
-                    await runtime.adapter.load(resolved_backend, "cuda", "auto", max_new_tokens=max_new_tokens)
+                    await _call_adapter(
+                        lambda: runtime.adapter.load(resolved_backend, "cuda", "auto", max_new_tokens=max_new_tokens)
+                    )
                 except Exception:
                     runtime.status = "error"
                     runtime.rejecting_new_requests = False
@@ -367,7 +400,7 @@ class ModelLifecycleManager:
 
     async def _unload_now(self, runtime: ModelRuntime, *, cuda_empty_cache: bool) -> None:
         runtime.status = "unloading"
-        await runtime.adapter.unload(cuda_empty_cache)
+        await _call_adapter(lambda: runtime.adapter.unload(cuda_empty_cache))
         runtime.status = "unloaded"
         runtime.rejecting_new_requests = False
         runtime.backend = None
@@ -378,3 +411,7 @@ class ModelLifecycleManager:
 
 def _chunked(items: list[bytes], batch_size: int) -> list[list[bytes]]:
     return [items[index : index + batch_size] for index in range(0, len(items), batch_size)]
+
+
+async def _call_adapter(factory: Callable[[], Coroutine[Any, Any, T]]) -> T:
+    return await asyncio.to_thread(lambda: asyncio.run(factory()))

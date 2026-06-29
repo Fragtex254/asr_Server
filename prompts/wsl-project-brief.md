@@ -128,114 +128,132 @@ uv run python scripts/qwen_asr_backend_smoke.py \
 
 ## 下一阶段开发计划
 
-完成 Qwen `transformers` 最小链路后，按下面顺序推进。不要跳到 MiMo 或 vLLM，除非前面的 Qwen `transformers` 路径已经稳定验收。
+下一版只围绕 Qwen3-ASR `transformers` 后端完善主转录链路。不要做 vLLM、streaming、MiMo、Web UI 或公网访问。
 
-### 1. 转录耗时记录
+### Issue 1：升级 Silero VAD
 
-先实现转录耗时记录。这一项风险最小，但能为后续长音频和真实推理性能分析提供基础数据。
+目标：把当前 RMS 能量阈值 VAD 升级成 Silero VAD，让长音频切分更接近真实人声边界。
 
-建议响应字段：
+实现要求：
 
-```json
-{
-  "timings": {
-    "total_ms": 12345,
-    "load_ms": 0,
-    "decode_ms": 120,
-    "inference_ms": 11800,
-    "postprocess_ms": 200
-  }
-}
-```
+- 保留当前能量 VAD 作为 fallback，命名为 `energy` 或内部 fallback，不要直接删除。
+- 新增 `split_strategy=auto|none|fixed|silero|energy`。`vad` 可以作为兼容别名映射到 `silero`，但响应里要能说明实际策略。
+- `auto` 策略：短音频不切分；超过 soft chunk 后优先 Silero；Silero 不可用或失败时 fallback 到 energy；再失败才 fixed。
+- Silero 依赖只能在 WSL 真实环境中启用。Mac/mock 环境的基础 import 和测试不能要求安装 CUDA、torch GPU 包或模型缓存。
+- 如果使用 PyTorch 版 Silero，必须复用已验收的 CUDA/torch 环境；如果采用 ONNX Runtime，必须记录依赖和模型缓存位置。
+- 返回 `split.strategy`、`split.requested_strategy`、`split.vad_backend`、`chunk_count`、`overlap_seconds`，方便对比。
 
-要求：
+测试要求：
 
-- `total_ms` 必须覆盖一次转录请求的端到端服务端耗时。
-- 自动加载模型时记录 `load_ms`；模型已加载时 `load_ms` 可以为 0。
-- 真实 Qwen adapter 至少记录 `inference_ms`。
-- 不要把完整音频内容写入日志。
-- 保持原有 `usage.audio_seconds` 字段。
+- 无 Silero 依赖时，Mac/mock 测试仍通过，并 fallback 到 energy/fixed。
+- `split_strategy=silero` 在 Silero 不可用时返回稳定错误或明确 fallback；不要静默产生空 chunk。
+- `split_strategy=energy` 继续覆盖当前 RMS VAD 行为。
+- `auto` 对短音频不切分，对长音频优先走 Silero。
+- chunk 时间线有序，chunk 时长不超过 hard limit，overlap 小于 chunk 长度。
 
-测试：
+验收要求：
 
-- mock adapter 下返回 `timings.total_ms`，且数值大于等于 0。
-- 自动加载模型时有 `load_ms` 字段。
-- 已加载模型再次转录时 `load_ms` 为 0 或接近 0。
-- 错误响应仍使用统一 error envelope。
+- 用 `test-fixtures/audio/test_long.mp3` 同时跑 energy 和 Silero，记录 chunk 数、总音频时长、平均 chunk 时长、最长 chunk、空白 chunk 数。
+- Silero 输出的 chunk 不应比 energy 明显更碎；如果更碎，必须说明阈值原因。
+- 长音频真实 Qwen 转录结果必须能合并为完整文本，且没有明显段落乱序。
 
-### 2. 长音频切分与合并
+### Issue 2：接入 context / 热词 / 专有名词提示
 
-第二步做长音频切分与合并。先用纯 Python 模块和 mock adapter 测透，不要一开始就绑定真实 Qwen。
+目标：让客户端能按领域传入术语、人名、产品名、项目名，提高专有名词识别稳定性。
 
-建议模块：
+实现要求：
 
-```text
-asr_server/audio/
-  metadata.py
-  splitter.py
-  merger.py
-```
+- `POST /v1/audio/transcriptions` 增加 `context` 字段，类型为字符串，默认空。
+- 可选增加 `hotwords` 字段，支持逗号分隔或 JSON 数组；服务端统一合并成 Qwen `context`。
+- 给 context 做长度限制，默认建议不超过 4000 字符；超限返回 `400 bad_request`。
+- 长音频切 chunk 后，每个 chunk 都传同一份 context。
+- 不要把完整 context 直接写入普通日志；最多记录长度和 hash。
+- mock adapter 要在测试中能证明 context 被接收，但不要污染真实转录文本。
 
-第一版先支持：
+测试要求：
 
-- `split_strategy=auto|none|fixed`
-- `max_chunk_seconds`
-- `overlap_seconds`
-- `preserve_segments`
-- 返回 chunk 级元数据
+- API 能接收 `context` 并传到 adapter。
+- 超长 context 返回 `400 bad_request`。
+- `response_format=text` 时仍正常返回文本。
+- context 不影响无 context 的旧请求。
 
-先不要急着做 VAD。固定切分和时间线合并先跑通。
+验收要求：
 
-测试：
+- 准备一段包含专有名词的测试音频，至少包含 5 个易错词，例如 `Qwen3-ASR`、`Silero VAD`、`Hugging Face`、`RTX 5070 Ti`、`uv`。
+- 分别用空 context 和带 context 请求同一音频，记录专有名词命中数量。
+- 带 context 的版本不应降低普通文本可读性；如果出现幻觉插词，必须记录。
 
-- 短音频不切分。
-- 长音频按 chunk 秒数切分。
-- overlap 不超过 chunk 长度。
-- chunk 时间线连续且不乱序。
-- 合并后返回完整文本。
-- `preserve_segments=true` 时返回 chunk 级结果。
-- 超过服务端限制返回 `422 duration_limit_exceeded` 或 PRD 指定错误码。
+### Issue 3：让 max_new_tokens 真正生效
 
-验收音频：
+目标：避免长 chunk 或复杂音频被默认生成长度截断。
 
-```text
-test-fixtures/audio/test_short.wav
-test-fixtures/audio/test_long.mp3
-```
+实现要求：
 
-### 3. Qwen transformers 能力补全
+- HTTP 层不再丢弃 `max_new_tokens`。
+- 将 `max_new_tokens` 传入 Qwen adapter，并最终传给 `model.transcribe(...)` 或模型加载/生成配置中实际生效的位置。
+- 设置服务端上限，默认建议 `4096` 或 WSL 实测后的保守值；超限返回 `400 bad_request`。
+- 响应的 `warnings` 中标记是否使用了非默认 `max_new_tokens`。
 
-第三步只围绕 Qwen `transformers` 后端补能力。不要碰 vLLM。
+测试要求：
 
-优先补：
+- mock adapter 能收到 `max_new_tokens`。
+- 非法值、超限值被拒绝。
+- 未传值时保持当前默认行为。
 
-- `qwen3-asr-0.6b` 和 `qwen3-asr-1.7b` 都能真实转录。
-- `language=auto|zh|en` 参数映射正确。
-- 临时音频文件推理结束后清理。
-- Qwen 异常转换成统一 error envelope。
-- 真实模型加载耗时和推理耗时记录到 `timings`。
-- `test_short.wav` 和 `test_long.mp3` 都有验收记录。
+验收要求：
 
-高级能力策略：
+- 用长 chunk 音频对比默认值和较大 `max_new_tokens`，记录文本是否被截断、推理耗时变化和显存峰值。
 
-- timestamps、forced alignment、streaming 不要默认打开。
-- 只有 transformers 后端真实跑通并测试后，才能在 `/v1/models` capabilities 中声明。
-- 没跑通的能力必须返回 `capability_not_supported`，或不暴露入口。
+### Issue 4：Qwen chunk batch transcription
 
-### 4. MiMo transformers 后续调研
+目标：长音频切分后不要逐 chunk 串行调用 Qwen，优先使用 Qwen 官方批量转录能力提升吞吐。
 
-MiMo 放到 Qwen transformers 稳定之后。
+实现要求：
 
-开始 MiMo 前必须满足：
+- 扩展 adapter 协议，支持 `transcribe_batch(chunks, language, context, max_new_tokens)`。
+- mock adapter 覆盖 batch 路径；真实 Qwen adapter 使用 `model.transcribe(audio=[...], language=[...], context=[...])` 或官方等效接口。
+- 增加配置 `ASR_QWEN_BATCH_SIZE`，默认先保守设为 `1` 或 `2`，WSL 实测后再调整。
+- 如果 batch OOM，返回统一 `gpu_unavailable` 或 `inference_failed`，不要让服务崩溃。
+- 保留逐 chunk fallback，方便定位问题。
 
-- Qwen 0.6B / 1.7B transformers 已稳定。
-- 长音频切分在 mock 和 Qwen 下都能跑。
-- `timings` 能记录真实耗时。
-- `/v1/models` 能准确声明模型与能力。
+测试要求：
 
-MiMo 第一阶段只做调研和最小 adapter，不默认加入 `/v1/models`。只有真实转录验收通过后，才允许声明。
+- 多 chunk 请求会走 batch adapter。
+- batch 返回数量必须等于 chunk 数；不一致返回 `inference_failed`。
+- batch fallback 不改变最终合并文本顺序。
 
-不要先做 MiMo，也不要回到 vLLM。
+验收要求：
+
+- 用 `test_long.mp3` 对比 batch size 1、2、4 的总耗时、`inference_ms`、峰值显存和错误率。
+- 只有 batch size 在 0.6B 和 1.7B 上都稳定，才能写入推荐配置。
+
+### Issue 5：Qwen 错误映射与质量基准
+
+目标：让真实部署出现问题时，Mac 客户端和 WSL agent 能快速判断是依赖、CUDA、显存、模型下载、音频还是 Qwen 推理问题。
+
+实现要求：
+
+- 捕获并映射：CPU 版 torch、CUDA 不可用、CUDA OOM、模型下载失败、`qwen_asr` 缺失、音频解码失败、Qwen 空结果、batch 数量不匹配。
+- 所有错误都走统一 error envelope。
+- `warnings` 中保留非致命问题，例如 Silero fallback、context 超过推荐长度但未超硬限制、batch fallback。
+- `docs/validation-template.md` 补充 Silero、context、max_new_tokens、batch benchmark 记录项。
+
+测试要求：
+
+- 单元测试覆盖主要错误映射。
+- 不安装 GPU 依赖的 Mac 环境仍能跑 mock 测试。
+
+验收要求：
+
+- WSL agent 必须在验收记录里写下：模型 ID、backend、VAD backend、batch size、context 是否开启、max_new_tokens、torch 版本、CUDA 版本、GPU 名称、总耗时、推理耗时、chunk 数、文本前 200 字。
+
+### 不进入下一版
+
+- vLLM 后端。
+- WebSocket streaming。
+- ForcedAligner / word-char timestamps。
+- 原生 `*-hf` Transformers 加载路径。
+- MiMo。
 
 ## 你不要做什么
 

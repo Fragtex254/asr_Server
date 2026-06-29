@@ -286,7 +286,9 @@ Content-Type: `multipart/form-data`
 - `timestamps`：`none`、`word`、`char`，默认 `none`。
 - `backend`：`auto`、`transformers`、`vllm`，默认 `auto`。
 - `temperature`：可选。
-- `max_new_tokens`：可选。
+- `max_new_tokens`：可选；用于控制 Qwen 生成长度，服务端必须设置上限，避免长音频请求失控。
+- `context`：可选；本次转录的领域提示、术语、人名、产品名、项目名等，服务端应限制长度并传给 Qwen adapter。
+- `hotwords`：可选；热词列表，可用逗号分隔字符串或 JSON 数组表达，服务端可合并到 `context`。
 
 返回：
 
@@ -416,7 +418,7 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 输入字段扩展：
 
 - `files`：音频数组，可选；与单个 `file` 二选一。
-- `split_strategy`：`auto`、`none`、`fixed`、`vad`，默认 `auto`。
+- `split_strategy`：`auto`、`none`、`fixed`、`silero`、`energy`、`vad`，默认 `auto`；`vad` 是兼容别名，下一版默认语义应指向 Silero VAD。
 - `max_chunk_seconds`：可选；用户给上限时不得超过服务端模型上限。
 - `overlap_seconds`：可选；默认由服务端决定。
 - `preserve_segments`：是否返回 chunk 级别结果，默认 `false`。
@@ -425,8 +427,8 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 
 1. 使用 FFmpeg 解码并规范化音频元数据，生成服务端临时 WAV/PCM。
 2. 统计总时长、采样率、声道数、文件大小。
-3. 如果音频短于当前模型的 `soft_chunk_seconds`，不切分。
-4. 如果音频较长，优先使用 VAD 在静音或低能量边界切分。
+3. 如果音频短于当前模型的 `soft_chunk_seconds`，默认不切分。
+4. 如果音频较长，优先使用 Silero VAD 在人声边界切分；Silero 不可用时 fallback 到 energy VAD，再失败才固定窗口切分。
 5. 每个 chunk 保留少量 overlap，降低切断词、切断句的概率。
 6. 合并时按原始时间线排序，去掉 overlap 中重复的文本或时间戳。
 7. 返回 `chunks` 调试信息，包括每段起止时间、模型、耗时、错误与警告。
@@ -455,7 +457,9 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
   "text": "完整合并后的转写文本。",
   "duration": 742.3,
   "split": {
-    "strategy": "vad",
+    "strategy": "silero",
+    "requested_strategy": "auto",
+    "vad_backend": "silero",
     "chunk_count": 5,
     "soft_chunk_seconds": 180,
     "hard_chunk_seconds": 300,
@@ -599,7 +603,7 @@ limits:
 
 ## 12. 后续路线
 
-当前 WSL 服务端下一阶段按 `prompts/wsl-project-brief.md` 的“下一阶段开发计划”执行：先做转录耗时记录，再做长音频切分与合并，再补 Qwen `transformers` 能力，最后再评估 MiMo。
+当前 WSL 服务端下一阶段按 `prompts/wsl-project-brief.md` 的“下一阶段开发计划”执行：先升级 Silero VAD，再补 `context`/热词、`max_new_tokens`、Qwen chunk batch transcription 和真实错误映射。下一版不做 vLLM、streaming、MiMo、ForcedAligner 或 `*-hf` 路径。
 
 优先级 P0：
 

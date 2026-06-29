@@ -51,11 +51,60 @@
 
 - 使用音频文件：`test-fixtures/audio/test_long.mp3`
 - 切分策略：
+- VAD backend：
 - chunk 数量：
 - overlap 秒数：
+- 平均 chunk 时长：
+- 最长 chunk 时长：
+- 空白/低质量 chunk 数：
 - 是否返回 chunk 元数据：
 - 合并文本前 200 字：
 - 是否通过：
+
+## Silero VAD 对比
+
+- energy VAD chunk 数：
+- energy VAD 总转录耗时：
+- Silero VAD chunk 数：
+- Silero VAD 总转录耗时：
+- Silero 是否 fallback：
+- Silero fallback 原因：
+- 观察到的切断句/重复文本问题：
+- 结论：
+
+## context / 热词验收
+
+- 测试音频：
+- context 内容摘要：
+- context 字符数：
+- 易错专有名词清单：
+- 无 context 命中数：
+- 有 context 命中数：
+- 是否出现 context 幻觉插词：
+- 结论：
+
+## max_new_tokens 验收
+
+- 测试音频：
+- 默认 `max_new_tokens`：
+- 对照 `max_new_tokens`：
+- 默认输出是否截断：
+- 对照输出是否截断：
+- 推理耗时变化：
+- 峰值显存变化：
+- 结论：
+
+## Qwen batch transcription 验收
+
+- 测试音频：`test-fixtures/audio/test_long.mp3`
+- batch size 1 总耗时：
+- batch size 2 总耗时：
+- batch size 4 总耗时：
+- 0.6B 稳定 batch size：
+- 1.7B 稳定 batch size：
+- batch fallback 次数：
+- CUDA OOM 或异常日志：
+- 推荐配置：
 
 ## Mac 局域网验收
 

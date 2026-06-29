@@ -181,7 +181,7 @@ README.md
 7. 保持 mock 适配器测试可在无 GPU 环境通过。
 8. 增加 systemd user service 或 Windows 启动任务，让服务可后台常驻。
 9. 从 Mac mini 验收局域网调用。
-10. 按 `prompts/wsl-project-brief.md` 的“下一阶段开发计划”继续做转录耗时记录、长音频切分与合并、Qwen transformers 能力补全。
+10. 按 `prompts/wsl-project-brief.md` 的“下一阶段开发计划”继续做 Silero VAD、context/热词、max_new_tokens、Qwen batch transcription 和错误映射。不要做 vLLM、streaming、MiMo、ForcedAligner 或 `*-hf` 路径。
 
 测试命令：
 

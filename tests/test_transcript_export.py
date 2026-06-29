@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from asr_server.audio.transcript import build_transcript_document, write_transcript_artifacts
+from scripts.export_transcript_artifacts import parse_markdown
 
 
 def test_dedupes_prefix_only_when_segments_overlap() -> None:
@@ -56,3 +57,43 @@ def test_writes_json_txt_and_srt_artifacts(tmp_path: Path) -> None:
     assert paths["txt"].read_text(encoding="utf-8") == "你好\n\n世界\n"
     assert "00:00:01,000 --> 00:00:02,500" in paths["srt"].read_text(encoding="utf-8")
     assert "00:00:02,000 --> 00:00:04,000" in paths["srt"].read_text(encoding="utf-8")
+
+
+def test_parse_markdown_stops_chunk_text_at_deduped_full_text_section(tmp_path: Path) -> None:
+    markdown_path = tmp_path / "sample.qwen.md"
+    markdown_path.write_text(
+        "\n".join(
+            [
+                "# sample.wav Qwen3-ASR 1.7B Transformers Transcript",
+                "",
+                "- audio: sample.wav",
+                "",
+                "## Segmented Raw Transcript",
+                "",
+                "### Chunk 01 [00:00:00.000 - 00:00:10.000]",
+                "",
+                "- language: zh",
+                "",
+                "第一段",
+                "",
+                "### Chunk 02 [00:00:08.000 - 00:00:18.000]",
+                "",
+                "- language: zh",
+                "",
+                "第二段",
+                "",
+                "## Deduped Full Text",
+                "",
+                "第一段",
+                "",
+                "第二段",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    metadata, segments = parse_markdown(markdown_path)
+
+    assert metadata["audio"] == "sample.wav"
+    assert [segment["text"] for segment in segments] == ["第一段", "第二段"]

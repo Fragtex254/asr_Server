@@ -58,7 +58,7 @@ def parse_markdown(markdown_path: Path) -> tuple[dict[str, Any], list[dict[str, 
             index += 1
 
         text_lines = []
-        while index < len(lines) and not lines[index].startswith("### Chunk ") and lines[index] != "## Full Text":
+        while index < len(lines) and not lines[index].startswith("### Chunk ") and not lines[index].startswith("## "):
             text_lines.append(lines[index])
             index += 1
         text = "\n".join(text_lines).strip()

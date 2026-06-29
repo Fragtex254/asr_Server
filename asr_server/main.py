@@ -132,6 +132,16 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         if timestamps not in {"none", "word", "char"}:
             raise AsrError(400, "bad_request", f"unsupported timestamps value: {timestamps}")
         manager: ModelLifecycleManager = app.state.manager
+        selected_model = model or manager.default_model_id
+        runtime = manager.runtime_for(selected_model)
+        manager.resolve_backend(runtime, backend)
+        if timestamps != "none" and not runtime.definition.capabilities.timestamps:
+            raise AsrError(
+                422,
+                "capability_not_supported",
+                f"{selected_model} does not support timestamps in this server",
+                {"timestamps": timestamps},
+            )
         audio = await file.read()
         normalized = normalize_audio_to_wav(audio)
         split = split_audio(
@@ -161,7 +171,6 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         )
         if response_format == "text":
             return PlainTextResponse(result.text)
-        selected_model = model or manager.default_model_id
         return {
             "id": "tr_mock",
             "model": selected_model,

@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from asr_server import main as main_module
 from asr_server.main import create_app
 
 
@@ -238,6 +239,30 @@ async def test_unsupported_capability_returns_422(client: AsyncClient) -> None:
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "capability_not_supported"
+
+
+async def test_unsupported_capability_is_rejected_before_audio_decode(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def fail_decode(audio: bytes) -> object:
+        nonlocal called
+        called = True
+        raise AssertionError("decode should not run for unsupported capabilities")
+
+    monkeypatch.setattr(main_module, "normalize_audio_to_wav", fail_decode)
+
+    response = await client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("sample.wav", b"not actually audio", "audio/wav")},
+        data={"model": "qwen3-asr-1.7b", "timestamps": "word"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "capability_not_supported"
+    assert called is False
 
 
 async def test_unload_waits_for_active_request_and_rejects_new_requests() -> None:

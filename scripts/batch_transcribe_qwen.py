@@ -131,6 +131,8 @@ def transcribe_audio_file(
         "source_duration_seconds": split.metadata.duration_seconds,
         "split_strategy": split.strategy,
         "requested_strategy": split.requested_strategy,
+        "vad_backend": split.vad_backend,
+        "split_warnings": split.warnings,
         "chunk_count": len(split.chunks),
         "overlap_seconds": split.overlap_seconds,
         "timestamp_source": "vad_chunk_window",
@@ -225,7 +227,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("directory", type=Path)
     parser.add_argument("--model", default="Qwen/Qwen3-ASR-1.7B")
     parser.add_argument("--output-suffix", default=".qwen3-asr-1_7b")
-    parser.add_argument("--max-chunk-seconds", type=float, default=180.0)
+    parser.add_argument("--max-chunk-seconds", type=float, default=120.0)
     parser.add_argument("--overlap-seconds", type=float, default=2.0)
     return parser.parse_args()
 

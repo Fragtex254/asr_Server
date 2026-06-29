@@ -32,7 +32,7 @@ class TranscriptionResult:
 
 
 class AsrAdapter(Protocol):
-    async def load(self, backend: str, device: str, dtype: str) -> None:
+    async def load(self, backend: str, device: str, dtype: str, max_new_tokens: int | None = None) -> None:
         ...
 
     async def unload(self, cuda_empty_cache: bool) -> None:
@@ -45,5 +45,19 @@ class AsrAdapter(Protocol):
         model_id: str,
         backend: str,
         language: str,
+        context: str,
+        max_new_tokens: int | None,
     ) -> TranscriptionResult:
+        ...
+
+    async def transcribe_batch(
+        self,
+        audio_chunks: list[bytes],
+        *,
+        model_id: str,
+        backend: str,
+        language: str,
+        context: str,
+        max_new_tokens: int | None,
+    ) -> list[TranscriptionResult]:
         ...

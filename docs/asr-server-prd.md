@@ -437,8 +437,8 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 
 | 模型 | 默认 soft chunk | 默认 hard chunk | overlap | 说明 |
 | --- | --- | --- | --- | --- |
-| `qwen3-asr-1.7b` | 180 秒 | 300 秒 | 2 秒 | Qwen3-ASR 官方说明支持 long audio；为了稳定延迟和显存，默认仍按 3 分钟软切分。请求时间戳或强制对齐时，单段不得超过 300 秒。 |
-| `qwen3-asr-0.6b` | 180 秒 | 300 秒 | 2 秒 | 与 1.7B 保持一致；后续可根据吞吐测试放宽。 |
+| `qwen3-asr-1.7b` | 120 秒 | 300 秒 | 2 秒 | WSL RTX 5070 Ti 实测后默认按 2 分钟软切分，配合默认 `max_new_tokens=512` 降低显存峰值。请求时间戳或强制对齐时，单段不得超过 300 秒。 |
+| `qwen3-asr-0.6b` | 120 秒 | 300 秒 | 2 秒 | 与 1.7B 保持一致；后续可根据吞吐测试放宽。 |
 
 同步与异步阈值：
 
@@ -461,7 +461,7 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
     "requested_strategy": "auto",
     "vad_backend": "silero",
     "chunk_count": 5,
-    "soft_chunk_seconds": 180,
+    "soft_chunk_seconds": 120,
     "hard_chunk_seconds": 300,
     "overlap_seconds": 2
   },

@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import io
+import importlib
 import math
 import wave
 from array import array
-from dataclasses import dataclass
-from typing import Literal, cast
+from dataclasses import dataclass, field
+from typing import Any, Literal, cast
 
 from asr_server.audio.metadata import AudioMetadata, inspect_audio
 from asr_server.errors import AsrError
 
 
-SplitStrategy = Literal["auto", "none", "fixed", "vad"]
+SplitStrategy = Literal["auto", "none", "fixed", "silero", "energy"]
 
-DEFAULT_SOFT_CHUNK_SECONDS = 180.0
+DEFAULT_SOFT_CHUNK_SECONDS = 120.0
 DEFAULT_HARD_CHUNK_SECONDS = 300.0
 DEFAULT_OVERLAP_SECONDS = 2.0
 MAX_AUDIO_SECONDS_PER_FILE = 7200.0
@@ -45,15 +46,19 @@ class SplitResult:
     soft_chunk_seconds: float
     hard_chunk_seconds: float
     overlap_seconds: float
+    vad_backend: str | None = None
+    warnings: list[str] = field(default_factory=list)
 
     def summary(self) -> dict[str, object]:
         return {
             "strategy": self.strategy,
             "requested_strategy": self.requested_strategy,
+            "vad_backend": self.vad_backend,
             "chunk_count": len(self.chunks),
             "soft_chunk_seconds": self.soft_chunk_seconds,
             "hard_chunk_seconds": self.hard_chunk_seconds,
             "overlap_seconds": self.overlap_seconds,
+            "warnings": self.warnings,
         }
 
 
@@ -64,6 +69,7 @@ def split_audio(
     max_chunk_seconds: float | None,
     overlap_seconds: float | None,
 ) -> SplitResult:
+    requested_strategy = split_strategy
     strategy = _parse_strategy(split_strategy)
     metadata = inspect_audio(audio)
     if metadata.duration_seconds > MAX_AUDIO_SECONDS_PER_FILE:
@@ -79,54 +85,80 @@ def split_audio(
     _validate_chunk_options(chunk_seconds, overlap)
 
     if strategy == "none":
-        return _single_chunk(audio, metadata, requested_strategy=strategy, overlap_seconds=overlap)
+        return _single_chunk(audio, metadata, requested_strategy=requested_strategy, overlap_seconds=overlap)
 
-    if strategy in {"auto", "vad"}:
-        vad_chunks = _split_vad(audio, metadata, chunk_seconds, overlap)
-        if vad_chunks:
+    if strategy == "auto" and metadata.duration_seconds <= chunk_seconds:
+        return _single_chunk(audio, metadata, requested_strategy=requested_strategy, overlap_seconds=overlap)
+
+    warnings: list[str] = []
+    if strategy in {"auto", "silero"}:
+        silero_chunks, silero_warning = _try_split_silero(audio, metadata, chunk_seconds, overlap)
+        if silero_warning is not None:
+            warnings.append(silero_warning)
+        if silero_chunks:
             return SplitResult(
-                strategy="vad",
-                requested_strategy=strategy,
-                chunks=vad_chunks,
+                strategy="silero",
+                requested_strategy=requested_strategy,
+                chunks=silero_chunks,
                 metadata=metadata,
                 soft_chunk_seconds=DEFAULT_SOFT_CHUNK_SECONDS,
                 hard_chunk_seconds=DEFAULT_HARD_CHUNK_SECONDS,
                 overlap_seconds=overlap,
+                vad_backend="silero",
+                warnings=warnings,
             )
-        if strategy == "vad":
+
+    if strategy in {"auto", "silero", "energy"}:
+        energy_chunks = _split_energy(audio, metadata, chunk_seconds, overlap)
+        if energy_chunks:
+            return SplitResult(
+                strategy="energy",
+                requested_strategy=requested_strategy,
+                chunks=energy_chunks,
+                metadata=metadata,
+                soft_chunk_seconds=DEFAULT_SOFT_CHUNK_SECONDS,
+                hard_chunk_seconds=DEFAULT_HARD_CHUNK_SECONDS,
+                overlap_seconds=overlap,
+                vad_backend="energy",
+                warnings=warnings,
+            )
+        warnings.append("energy_vad_no_speech_fallback")
+        if metadata.duration_seconds <= chunk_seconds:
             return _single_chunk(
                 audio,
                 metadata,
-                requested_strategy=strategy,
-                resolved_strategy="vad",
+                requested_strategy=requested_strategy,
+                resolved_strategy="energy" if strategy == "energy" else "none",
                 overlap_seconds=overlap,
+                vad_backend="energy" if strategy == "energy" else None,
+                warnings=warnings,
             )
-
-    if strategy == "auto" and metadata.duration_seconds <= chunk_seconds:
-        return _single_chunk(audio, metadata, requested_strategy=strategy, overlap_seconds=overlap)
 
     chunks = _split_wav(audio, metadata, chunk_seconds, overlap)
     if chunks is None:
         chunks = _split_raw(audio, metadata, chunk_seconds, overlap)
     return SplitResult(
         strategy="fixed",
-        requested_strategy=strategy,
+        requested_strategy=requested_strategy,
         chunks=chunks,
         metadata=metadata,
         soft_chunk_seconds=DEFAULT_SOFT_CHUNK_SECONDS,
         hard_chunk_seconds=DEFAULT_HARD_CHUNK_SECONDS,
         overlap_seconds=overlap,
+        warnings=warnings,
     )
 
 
 def _parse_strategy(value: str) -> SplitStrategy:
-    if value in {"auto", "none", "fixed", "vad"}:
+    if value == "vad":
+        return "silero"
+    if value in {"auto", "none", "fixed", "silero", "energy"}:
         return cast(SplitStrategy, value)
     raise AsrError(
         400,
         "bad_request",
         f"unsupported split_strategy: {value}",
-        {"supported": ["auto", "none", "fixed", "vad"]},
+        {"supported": ["auto", "none", "fixed", "silero", "energy", "vad"]},
     )
 
 
@@ -157,6 +189,8 @@ def _single_chunk(
     requested_strategy: str,
     overlap_seconds: float,
     resolved_strategy: str = "none",
+    vad_backend: str | None = None,
+    warnings: list[str] | None = None,
 ) -> SplitResult:
     return SplitResult(
         strategy=resolved_strategy,
@@ -166,6 +200,8 @@ def _single_chunk(
         soft_chunk_seconds=DEFAULT_SOFT_CHUNK_SECONDS,
         hard_chunk_seconds=DEFAULT_HARD_CHUNK_SECONDS,
         overlap_seconds=overlap_seconds,
+        vad_backend=vad_backend,
+        warnings=warnings or [],
     )
 
 
@@ -198,20 +234,102 @@ def _interval_windows(
     return windows
 
 
-def _split_vad(
+def _try_split_silero(
+    audio: bytes,
+    metadata: AudioMetadata,
+    chunk_seconds: float,
+    overlap_seconds: float,
+) -> tuple[list[AudioChunk], str | None]:
+    try:
+        intervals = _silero_intervals(audio, metadata, padding_seconds=overlap_seconds)
+    except _SileroUnavailable as exc:
+        return [], f"silero_vad_unavailable: {exc}"
+    except Exception as exc:
+        return [], f"silero_vad_failed: {type(exc).__name__}"
+    if not intervals:
+        return [], "silero_vad_no_speech_fallback"
+    windows = _pack_vad_intervals(intervals, chunk_seconds, overlap_seconds)
+    chunks = _slice_wav_windows(audio, metadata, windows) or []
+    if not chunks:
+        return [], "silero_vad_slice_failed_fallback"
+    return chunks, None
+
+
+def _split_energy(
     audio: bytes,
     metadata: AudioMetadata,
     chunk_seconds: float,
     overlap_seconds: float,
 ) -> list[AudioChunk]:
-    intervals = _vad_intervals(audio, metadata, padding_seconds=overlap_seconds)
+    intervals = _energy_intervals(audio, metadata, padding_seconds=overlap_seconds)
     if not intervals:
         return []
     windows = _pack_vad_intervals(intervals, chunk_seconds, overlap_seconds)
     return _slice_wav_windows(audio, metadata, windows) or []
 
 
-def _vad_intervals(
+class _SileroUnavailable(RuntimeError):
+    pass
+
+
+def _silero_intervals(
+    audio: bytes,
+    metadata: AudioMetadata,
+    *,
+    padding_seconds: float,
+) -> list[tuple[float, float]]:
+    if metadata.format != "wav":
+        raise _SileroUnavailable("audio is not wav")
+    if metadata.sample_rate not in {8_000, 16_000}:
+        raise _SileroUnavailable("Silero VAD requires 8000 Hz or 16000 Hz wav input")
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as source:
+            if source.getsampwidth() != 2 or source.getnchannels() != 1:
+                raise _SileroUnavailable("Silero VAD requires mono 16-bit PCM wav input")
+            frame_rate = source.getframerate()
+            pcm = source.readframes(source.getnframes())
+    except (EOFError, wave.Error) as exc:
+        raise _SileroUnavailable("wav decode failed") from exc
+
+    samples = array("h")
+    samples.frombytes(pcm)
+    if not samples:
+        return []
+
+    try:
+        torch = importlib.import_module("torch")
+        silero_vad = importlib.import_module("silero_vad")
+    except ModuleNotFoundError as exc:
+        raise _SileroUnavailable("torch or silero_vad is not installed") from exc
+
+    waveform = torch.tensor([sample / 32768.0 for sample in samples], dtype=torch.float32)
+    model = _load_silero_model(silero_vad)
+    get_speech_timestamps = getattr(silero_vad, "get_speech_timestamps", None)
+    if not callable(get_speech_timestamps):
+        raise _SileroUnavailable("silero_vad.get_speech_timestamps is not available")
+    speech_timestamps = get_speech_timestamps(waveform, model, sampling_rate=frame_rate)
+    intervals = []
+    for item in speech_timestamps:
+        if not isinstance(item, dict):
+            continue
+        start_sample = int(item.get("start", 0))
+        end_sample = int(item.get("end", 0))
+        if end_sample <= start_sample:
+            continue
+        start = max((start_sample / frame_rate) - padding_seconds, 0.0)
+        end = min((end_sample / frame_rate) + padding_seconds, metadata.duration_seconds)
+        intervals.append((start, end))
+    return intervals
+
+
+def _load_silero_model(silero_vad: Any) -> Any:
+    load_silero_vad = getattr(silero_vad, "load_silero_vad", None)
+    if not callable(load_silero_vad):
+        raise _SileroUnavailable("silero_vad.load_silero_vad is not available")
+    return load_silero_vad()
+
+
+def _energy_intervals(
     audio: bytes,
     metadata: AudioMetadata,
     *,

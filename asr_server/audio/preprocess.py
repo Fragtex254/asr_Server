@@ -56,7 +56,7 @@ def normalize_audio_to_wav(audio: bytes) -> NormalizedAudio:
             message = completed.stderr.decode("utf-8", errors="replace").strip()
             raise AsrError(
                 400,
-                "bad_request",
+                "audio_decode_failed",
                 "audio decode failed",
                 {"ffmpeg": message[-1000:]},
             )

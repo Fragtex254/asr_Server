@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import socket
 import importlib
 from dataclasses import replace
@@ -23,10 +24,16 @@ from asr_server.lifecycle import ModelLifecycleManager
 from asr_server.registry import Backend, default_models
 
 
+MAX_CONTEXT_CHARS = 4000
+DEFAULT_MAX_NEW_TOKENS = 512
+MAX_NEW_TOKENS = 4096
+
+
 class LoadRequest(BaseModel):
     backend: Backend = "auto"
     device: str = "cuda"
     dtype: str = "auto"
+    max_new_tokens: int | None = None
 
 
 class UnloadRequest(BaseModel):
@@ -48,6 +55,53 @@ def gpu_health() -> dict[str, object]:
         "name": torch.cuda.get_device_name(0),
         "vram_total_mb": int(properties.total_memory / 1024 / 1024),
     }
+
+
+def build_adapter_context(context: str, hotwords: str | None) -> str:
+    parts = []
+    stripped_context = context.strip()
+    if stripped_context:
+        parts.append(stripped_context)
+    normalized_hotwords = parse_hotwords(hotwords)
+    if normalized_hotwords:
+        parts.append("Hotwords: " + ", ".join(normalized_hotwords))
+    adapter_context = "\n".join(parts)
+    if len(adapter_context) > MAX_CONTEXT_CHARS:
+        raise AsrError(
+            400,
+            "bad_request",
+            "context exceeds the server context length limit",
+            {"context_chars": len(adapter_context), "max_context_chars": MAX_CONTEXT_CHARS},
+        )
+    return adapter_context
+
+
+def parse_hotwords(hotwords: str | None) -> list[str]:
+    if hotwords is None or not hotwords.strip():
+        return []
+    stripped = hotwords.strip()
+    if stripped.startswith("["):
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise AsrError(400, "bad_request", "hotwords must be a JSON string array or comma-separated string") from exc
+        if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+            raise AsrError(400, "bad_request", "hotwords JSON value must be an array of strings")
+        return [item.strip() for item in parsed if item.strip()]
+    return [item.strip() for item in stripped.split(",") if item.strip()]
+
+
+def validate_max_new_tokens(max_new_tokens: int | None) -> int | None:
+    if max_new_tokens is None:
+        return DEFAULT_MAX_NEW_TOKENS
+    if max_new_tokens > MAX_NEW_TOKENS:
+        raise AsrError(
+            400,
+            "bad_request",
+            "max_new_tokens exceeds the server limit",
+            {"max_new_tokens": max_new_tokens, "max_new_tokens_limit": MAX_NEW_TOKENS},
+        )
+    return max_new_tokens
 
 
 def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 0.0) -> FastAPI:
@@ -94,6 +148,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             backend=request.backend,
             device=request.device,
             dtype=request.dtype,
+            max_new_tokens=validate_max_new_tokens(request.max_new_tokens),
         )
 
     @app.delete("/v1/models/{model_id}")
@@ -121,12 +176,14 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         backend: Annotated[Backend, Form()] = "auto",
         temperature: Annotated[float | None, Form()] = None,
         max_new_tokens: Annotated[int | None, Form(ge=1)] = None,
+        context: Annotated[str, Form()] = "",
+        hotwords: Annotated[str | None, Form()] = None,
         split_strategy: Annotated[str, Form()] = "auto",
         max_chunk_seconds: Annotated[float | None, Form()] = None,
         overlap_seconds: Annotated[float | None, Form()] = None,
         preserve_segments: Annotated[bool, Form()] = False,
     ) -> dict[str, object] | PlainTextResponse:
-        del temperature, max_new_tokens
+        del temperature
         if response_format not in {"json", "text", "verbose_json"}:
             raise AsrError(400, "bad_request", f"unsupported response_format: {response_format}")
         if timestamps not in {"none", "word", "char"}:
@@ -142,6 +199,8 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
                 f"{selected_model} does not support timestamps in this server",
                 {"timestamps": timestamps},
             )
+        adapter_context = build_adapter_context(context, hotwords)
+        adapter_max_new_tokens = validate_max_new_tokens(max_new_tokens)
         audio = await file.read()
         normalized = normalize_audio_to_wav(audio)
         split = split_audio(
@@ -156,6 +215,9 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             backend=backend,
             language=language,
             timestamps=timestamps,
+            context=adapter_context,
+            max_new_tokens=adapter_max_new_tokens,
+            batch_size=app_settings.qwen_batch_size,
         )
         timings = replace(
             timings,
@@ -169,6 +231,8 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             preserve_segments=preserve_segments,
             timings=timings,
         )
+        generation_warnings = [f"max_new_tokens_override:{adapter_max_new_tokens}"] if max_new_tokens is not None else []
+        warnings = list(dict.fromkeys([*result.warnings, *split.warnings, *generation_warnings]))
         if response_format == "text":
             return PlainTextResponse(result.text)
         return {
@@ -184,7 +248,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             "chunks": result.chunks,
             "usage": {"audio_seconds": result.duration},
             "timings": result.timings.to_api(),
-            "warnings": result.warnings,
+            "warnings": warnings,
         }
 
     @app.post("/v1/audio/alignments")

@@ -12,6 +12,7 @@ def test_load_settings_from_environment(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("ASR_PUBLIC_BASE_URL", "http://127.0.0.1:19000")
     monkeypatch.setenv("ASR_DEFAULT_MODEL", "qwen3-asr-0.6b")
     monkeypatch.setenv("ASR_ADAPTER", "qwen")
+    monkeypatch.setenv("ASR_QWEN_BATCH_SIZE", "2")
 
     settings = load_settings()
 
@@ -20,12 +21,20 @@ def test_load_settings_from_environment(monkeypatch: pytest.MonkeyPatch) -> None
     assert settings.public_base_url == "http://127.0.0.1:19000"
     assert settings.default_model == "qwen3-asr-0.6b"
     assert settings.adapter == "qwen"
+    assert settings.qwen_batch_size == 2
 
 
 def test_invalid_adapter_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ASR_ADAPTER", "cpu")
 
     with pytest.raises(ValueError, match="ASR_ADAPTER"):
+        load_settings()
+
+
+def test_invalid_qwen_batch_size_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASR_QWEN_BATCH_SIZE", "0")
+
+    with pytest.raises(ValueError, match="ASR_QWEN_BATCH_SIZE"):
         load_settings()
 
 

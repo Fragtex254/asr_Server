@@ -40,6 +40,29 @@ def test_dedupes_prefix_found_near_previous_tail_with_punctuation_changes() -> N
     assert document.segments[2].deduped_prefix_chars == len("主人的命令，")
 
 
+def test_fuzzy_dedupes_overlap_with_minor_asr_variation() -> None:
+    document = build_transcript_document(
+        [
+            {
+                "start": 0.0,
+                "end": 196.7,
+                "text": "来吧，这是设备配套的耳机，我来帮你戴上去吧。很舒服吧？耳机内的柔软上毛，轻轻飘落在你的。",
+                "language": "zh",
+            },
+            {
+                "start": 191.3,
+                "end": 370.9,
+                "text": "耳际内的柔软羽毛，轻轻飘落在你的耳腔内部，很舒服呢。还不止这些。",
+                "language": "zh",
+            },
+        ],
+        metadata={"audio": "sample.wav"},
+    )
+
+    assert document.segments[1].text == "耳腔内部，很舒服呢。还不止这些。"
+    assert document.segments[1].deduped_prefix_chars == len("耳际内的柔软羽毛，轻轻飘落在你的")
+
+
 def test_writes_json_txt_and_srt_artifacts(tmp_path: Path) -> None:
     document = build_transcript_document(
         [

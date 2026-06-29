@@ -104,18 +104,28 @@ def post_transcription(
     backend: str,
     language: str,
     timestamps: str,
+    context: str,
+    hotwords: str | None,
+    max_new_tokens: int | None,
 ) -> httpx.Response:
+    data = {
+        "model": model,
+        "backend": backend,
+        "language": language,
+        "response_format": "json",
+        "timestamps": timestamps,
+    }
+    if context:
+        data["context"] = context
+    if hotwords:
+        data["hotwords"] = hotwords
+    if max_new_tokens is not None:
+        data["max_new_tokens"] = str(max_new_tokens)
     with audio_path.open("rb") as audio_file:
         return client.post(
             f"{base_url}/v1/audio/transcriptions",
             files={"file": (audio_path.name, audio_file, "application/octet-stream")},
-            data={
-                "model": model,
-                "backend": backend,
-                "language": language,
-                "response_format": "json",
-                "timestamps": timestamps,
-            },
+            data=data,
         )
 
 
@@ -126,6 +136,9 @@ def transcribe(
     backend: str,
     language: str,
     timestamps: str,
+    context: str = "",
+    hotwords: str | None = None,
+    max_new_tokens: int | None = None,
 ) -> dict[str, Any]:
     with make_client(timeout_seconds=1800.0) as client:
         models = discover_models(client, base_url)
@@ -143,6 +156,9 @@ def transcribe(
                 backend=current_backend,
                 language=language,
                 timestamps=current_timestamps,
+                context=context,
+                hotwords=hotwords,
+                max_new_tokens=max_new_tokens,
             )
             if response.status_code == 200:
                 result = response.json()
@@ -183,13 +199,26 @@ def main() -> None:
     transcribe_parser.add_argument("--backend", default="auto", choices=["auto", "transformers"])
     transcribe_parser.add_argument("--language", default="auto")
     transcribe_parser.add_argument("--timestamps", default="none", choices=["none", "word", "char"])
+    transcribe_parser.add_argument("--context", default="")
+    transcribe_parser.add_argument("--hotwords", default=None)
+    transcribe_parser.add_argument("--max-new-tokens", type=int, default=None)
 
     args = parser.parse_args()
     if args.command == "check":
         check_server(args.base_url)
         return
 
-    result = transcribe(args.base_url, args.audio_path, args.model, args.backend, args.language, args.timestamps)
+    result = transcribe(
+        args.base_url,
+        args.audio_path,
+        args.model,
+        args.backend,
+        args.language,
+        args.timestamps,
+        context=args.context,
+        hotwords=args.hotwords,
+        max_new_tokens=args.max_new_tokens,
+    )
     print(result)
 
 

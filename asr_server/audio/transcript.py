@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,10 @@ from typing import Any
 OVERLAP_SEARCH_CHARS = 300
 OVERLAP_PUNCTUATION = set(" \t\r\n，。！？；：、“”‘’（）()[]【】,.!?;:\"'")
 LEADING_DEDUPED_PUNCTUATION = " \t\r\n，。！？；：,.!?;:"
+FUZZY_OVERLAP_MIN_CHARS = 10
+FUZZY_OVERLAP_MAX_PREFIX_CHARS = 120
+FUZZY_OVERLAP_MIN_RATIO = 0.78
+FUZZY_OVERLAP_TAIL_MARGIN_CHARS = 24
 
 
 @dataclass(frozen=True)
@@ -105,7 +110,53 @@ def _overlap_prefix_length(previous_text: str, current_text: str) -> int:
             normalized_tail.endswith(normalized_prefix) or normalized_prefix in normalized_tail
         ):
             return length
+    return _fuzzy_overlap_prefix_length(previous, current)
+
+
+def _fuzzy_overlap_prefix_length(previous: str, current: str) -> int:
+    previous_tail = previous[-OVERLAP_SEARCH_CHARS:]
+    normalized_tail = _normalize_overlap_text(previous_tail)
+    if len(normalized_tail) < FUZZY_OVERLAP_MIN_CHARS:
+        return 0
+
+    best_length = 0
+    best_ratio = 0.0
+    max_length = min(len(current), FUZZY_OVERLAP_MAX_PREFIX_CHARS)
+    for length in range(max_length, FUZZY_OVERLAP_MIN_CHARS - 1, -1):
+        prefix = current[:length]
+        normalized_prefix = _normalize_overlap_text(prefix)
+        prefix_length = len(normalized_prefix)
+        if prefix_length < FUZZY_OVERLAP_MIN_CHARS:
+            continue
+        candidate = _best_tail_aligned_match(normalized_tail, normalized_prefix)
+        if candidate is None:
+            continue
+        ratio, candidate_end = candidate
+        tail_distance = len(normalized_tail) - candidate_end
+        if tail_distance <= FUZZY_OVERLAP_TAIL_MARGIN_CHARS and (
+            ratio > best_ratio or (ratio == best_ratio and length > best_length)
+        ):
+            best_ratio = ratio
+            best_length = length
+    if best_ratio >= FUZZY_OVERLAP_MIN_RATIO:
+        return best_length
     return 0
+
+
+def _best_tail_aligned_match(previous_tail: str, current_prefix: str) -> tuple[float, int] | None:
+    prefix_length = len(current_prefix)
+    min_window = max(FUZZY_OVERLAP_MIN_CHARS, prefix_length - 8)
+    max_window = min(len(previous_tail), prefix_length + 8)
+    best: tuple[float, int] | None = None
+    for window_length in range(min_window, max_window + 1):
+        first_end = max(window_length, len(previous_tail) - FUZZY_OVERLAP_TAIL_MARGIN_CHARS)
+        for end in range(first_end, len(previous_tail) + 1):
+            start = end - window_length
+            candidate = previous_tail[start:end]
+            ratio = SequenceMatcher(None, candidate, current_prefix).ratio()
+            if best is None or ratio > best[0]:
+                best = (ratio, end)
+    return best
 
 
 def _normalize_overlap_text(text: str) -> str:

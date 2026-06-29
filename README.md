@@ -72,4 +72,5 @@ uv sync
 ```bash
 uv run python scripts/asr_client.py --base-url http://192.168.31.137:18080 check
 uv run python scripts/asr_client.py --base-url http://192.168.31.137:18080 transcribe /path/to/audio.wav --model qwen3-asr-1.7b --backend auto
+uv run python scripts/asr_client.py --base-url http://192.168.31.137:18080 transcribe /path/to/audio.wav --context "Qwen3-ASR, Silero VAD, Hugging Face" --max-new-tokens 512
 ```

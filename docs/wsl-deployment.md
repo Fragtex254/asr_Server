@@ -79,6 +79,49 @@ PY
 ASR_ADAPTER=qwen uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
 ```
 
+## 可选 Silero VAD
+
+长音频 `split_strategy=auto` 会优先尝试 Silero VAD；如果 WSL 环境没有安装 Silero 依赖，服务会明确 fallback 到 energy VAD，再失败才使用 fixed window。Mac/mock 环境不需要安装 Silero、CUDA torch 或模型缓存。
+
+Silero 依赖只在 WSL 真实环境中安装，并且应在 CUDA 版 torch 验收通过后安装：
+
+```bash
+uv pip install silero-vad
+```
+
+当前实现通过 `silero_vad` Python 包懒加载模型，不在基础 import 或普通 mock 测试阶段加载；响应中的 `split.vad_backend` 和 `split.warnings` 会记录实际使用的 VAD 后端与 fallback 原因。
+
+## 转录调优参数
+
+同步转录接口支持以下调优字段：
+
+- `context`：专有名词、领域背景或热词提示，服务端硬限制 4000 字符。
+- `hotwords`：逗号分隔字符串或 JSON 字符串数组，服务端会合并到 Qwen `context`，普通日志不记录完整内容。
+- `max_new_tokens`：可选生成长度上限，默认 512，服务端硬限制 4096；响应 `warnings` 会标记非默认值。
+- `split_strategy`：`auto`、`none`、`fixed`、`silero`、`energy`、`vad`；`vad` 是兼容别名，实际优先走 Silero。
+
+长音频默认按 WSL 实测后的稳定组合执行：
+
+```text
+max_chunk_seconds=120
+max_new_tokens=512
+ASR_QWEN_BATCH_SIZE=1
+```
+
+Qwen chunk batch size 通过环境变量配置，默认保守为 `1`：
+
+```bash
+ASR_QWEN_BATCH_SIZE=2 ASR_ADAPTER=qwen uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
+```
+
+只有 batch size 在 `qwen3-asr-0.6b` 和 `qwen3-asr-1.7b` 上都稳定后，才把更大的值写入常驻服务配置。
+
+本轮 WSL 实测记录见：
+
+```text
+docs/validation-2026-06-29-wsl.md
+```
+
 ## 后端预验收
 
 开发或启用真实 adapter 前，先跑：

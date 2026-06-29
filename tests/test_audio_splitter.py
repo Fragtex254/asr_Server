@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from asr_server.audio import splitter as splitter_module
 from asr_server.audio.preprocess import normalize_audio_to_wav
 from asr_server.audio.splitter import split_audio
 from asr_server.errors import AsrError
@@ -91,7 +92,7 @@ def test_fixed_strategy_keeps_wav_chunks_decodable() -> None:
     assert wav_duration(result.chunks[-1].audio) == pytest.approx(0.02)
 
 
-def test_vad_strategy_splits_wav_on_silence() -> None:
+def test_energy_strategy_splits_wav_on_silence() -> None:
     audio = make_segmented_wav(
         [
             (0.2, 0),
@@ -101,6 +102,37 @@ def test_vad_strategy_splits_wav_on_silence() -> None:
             (0.2, 0),
         ]
     )
+
+    result = split_audio(
+        audio,
+        split_strategy="energy",
+        max_chunk_seconds=0.8,
+        overlap_seconds=0.03,
+    )
+
+    assert result.strategy == "energy"
+    assert result.vad_backend == "energy"
+    assert len(result.chunks) == 2
+    assert result.chunks[0].start < 0.22
+    assert result.chunks[0].end > 0.55
+    assert result.chunks[1].start > 1.0
+    assert result.chunks[1].end < 1.6
+
+
+def test_vad_alias_falls_back_to_energy_when_silero_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    audio = make_segmented_wav(
+        [
+            (0.2, 0),
+            (0.4, 10_000),
+            (0.5, 0),
+            (0.4, 10_000),
+        ]
+    )
+
+    def unavailable(*args: object, **kwargs: object) -> list[tuple[float, float]]:
+        raise splitter_module._SileroUnavailable("test unavailable")
+
+    monkeypatch.setattr(splitter_module, "_silero_intervals", unavailable)
 
     result = split_audio(
         audio,
@@ -109,15 +141,14 @@ def test_vad_strategy_splits_wav_on_silence() -> None:
         overlap_seconds=0.03,
     )
 
-    assert result.strategy == "vad"
+    assert result.strategy == "energy"
+    assert result.requested_strategy == "vad"
+    assert result.vad_backend == "energy"
+    assert any(warning.startswith("silero_vad_unavailable") for warning in result.warnings)
     assert len(result.chunks) == 2
-    assert result.chunks[0].start < 0.22
-    assert result.chunks[0].end > 0.55
-    assert result.chunks[1].start > 1.0
-    assert result.chunks[1].end < 1.6
 
 
-def test_auto_uses_vad_by_default_for_wav_audio() -> None:
+def test_auto_prefers_silero_for_long_audio_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
     audio = make_segmented_wav(
         [
             (0.2, 0),
@@ -127,6 +158,11 @@ def test_auto_uses_vad_by_default_for_wav_audio() -> None:
         ]
     )
 
+    def silero_intervals(*args: object, **kwargs: object) -> list[tuple[float, float]]:
+        return [(0.17, 0.63), (1.07, 1.5)]
+
+    monkeypatch.setattr(splitter_module, "_silero_intervals", silero_intervals)
+
     result = split_audio(
         audio,
         split_strategy="auto",
@@ -134,8 +170,39 @@ def test_auto_uses_vad_by_default_for_wav_audio() -> None:
         overlap_seconds=0.03,
     )
 
-    assert result.strategy == "vad"
+    assert result.strategy == "silero"
+    assert result.requested_strategy == "auto"
+    assert result.vad_backend == "silero"
     assert len(result.chunks) == 2
+
+
+def test_auto_falls_back_to_energy_when_silero_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    audio = make_segmented_wav(
+        [
+            (0.2, 0),
+            (0.4, 10_000),
+            (0.5, 0),
+            (0.4, 10_000),
+        ]
+    )
+
+    def unavailable(*args: object, **kwargs: object) -> list[tuple[float, float]]:
+        raise splitter_module._SileroUnavailable("test unavailable")
+
+    monkeypatch.setattr(splitter_module, "_silero_intervals", unavailable)
+
+    result = split_audio(
+        audio,
+        split_strategy="auto",
+        max_chunk_seconds=0.8,
+        overlap_seconds=0.03,
+    )
+
+    assert result.strategy == "energy"
+    assert result.requested_strategy == "auto"
+    assert result.vad_backend == "energy"
+    assert len(result.chunks) == 2
+    assert any(warning.startswith("silero_vad_unavailable") for warning in result.warnings)
 
 
 def test_overlap_must_be_smaller_than_chunk_length() -> None:
@@ -162,7 +229,12 @@ def test_duration_limit_is_enforced_before_sync_transcription() -> None:
     assert exc_info.value.code == "duration_limit_exceeded"
 
 
-def test_long_mp3_fixture_is_preprocessed_and_vad_split() -> None:
+def test_long_mp3_fixture_is_preprocessed_and_energy_split(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unavailable(*args: object, **kwargs: object) -> list[tuple[float, float]]:
+        raise splitter_module._SileroUnavailable("test unavailable")
+
+    monkeypatch.setattr(splitter_module, "_silero_intervals", unavailable)
+
     normalized = normalize_audio_to_wav(LONG_MP3_FIXTURE.read_bytes())
     result = split_audio(
         normalized.audio,
@@ -175,7 +247,8 @@ def test_long_mp3_fixture_is_preprocessed_and_vad_split() -> None:
     assert result.metadata.sample_rate == 16_000
     assert result.metadata.channels == 1
     assert result.metadata.duration_seconds == pytest.approx(3630.0, abs=2.0)
-    assert result.strategy == "vad"
+    assert result.strategy == "energy"
+    assert result.vad_backend == "energy"
     assert len(result.chunks) > 1
     assert all(chunk.duration <= 180.0 for chunk in result.chunks)
     assert all(chunk.start < chunk.end for chunk in result.chunks)

@@ -61,6 +61,35 @@
 - 合并文本前 200 字：
 - 是否通过：
 
+## 异步 job 与进度验收
+
+- `POST /v1/audio/transcription-jobs` 是否返回 `202`：
+- 返回的 `job_id`：
+- 返回的 `status_url`：
+- 短音频 job 模型 ID：
+- 短音频 job backend：
+- 短音频 job 最终状态：
+- 短音频 job 文本前 200 字：
+- 长音频 job 使用音频：`test-fixtures/audio/test_long.mp3`
+- 长音频 job 模型 ID：
+- 长音频 job backend：
+- 长音频 job 状态流转时间线：
+- queued/preprocessing/splitting 阶段轮询样例 JSON：
+- transcribing 阶段轮询样例 JSON：
+- completed 阶段轮询样例 JSON：
+- `progress.total_chunks`：
+- `progress.completed_chunks` 是否真实增长：
+- `progress.current_chunk` 是否真实变化：
+- `queue_position` 验收结果：
+- 同时提交两个 job 时是否只运行一个：
+- 第二个 job 是否显示 queued：
+- job 失败错误对象是否使用统一 `code/message/details`：
+- queued job 取消结果：
+- running job 取消是否等待当前 chunk 结束：
+- job 临时文件是否清理：
+- job result TTL 配置：
+- 进程重启后内存 job 丢失行为是否记录：
+
 ## Silero VAD 对比
 
 - energy VAD chunk 数：
@@ -112,6 +141,9 @@
 - `curl --noproxy '*' http://192.168.31.137:18080/health` 结果：
 - `curl --noproxy '*' http://192.168.31.137:18080/v1/models` 结果：
 - Mac 上传真实音频转录摘要：
+- Mac 创建 job 请求摘要：
+- Mac 轮询 job 到 completed 的状态摘要：
+- Mac 侧观察到的 chunk 进度变化：
 
 ## 结论
 

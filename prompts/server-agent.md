@@ -121,9 +121,21 @@ POST /v1/models/{model_id}/load
 DELETE /v1/models/{model_id}
 DELETE /v1/models
 POST /v1/audio/transcriptions
+POST /v1/audio/transcription-jobs
+GET /v1/jobs/{job_id}
+DELETE /v1/jobs/{job_id}
 ```
 
 `POST /v1/audio/alignments`、WebSocket 流式转写、时间戳等高级能力只在真实实现并验收后再打开能力声明；未打开时返回 `capability_not_supported` 或不暴露入口。
+
+异步 job 是下一阶段主任务：
+
+- `POST /v1/audio/transcription-jobs` 快速返回 `202 Accepted`、`job_id`、`status_url`，不要在这个 HTTP 请求内执行完整转录。
+- `GET /v1/jobs/{job_id}` 返回 job 状态、队列位置、阶段、chunk 级进度、错误或最终结果。
+- `DELETE /v1/jobs/{job_id}` 支持保守取消；正在 Qwen 推理的 chunk 不要强杀，等当前 chunk 完成后停止后续 chunk。
+- 只做内存 JobManager 和单 worker FIFO 队列；不要引入 Redis、Celery、数据库、多 worker 或多 GPU 调度。
+- 服务端可接收多个 job，但同一时间只运行一个转录 job；后来的 job 显示 `queued` 和 `queue_position`。
+- 进度只承诺阶段和 chunk 级真实进度；不要伪造单个 Qwen chunk 内部百分比。
 
 模型状态枚举：
 
@@ -181,7 +193,7 @@ README.md
 7. 保持 mock 适配器测试可在无 GPU 环境通过。
 8. 增加 systemd user service 或 Windows 启动任务，让服务可后台常驻。
 9. 从 Mac mini 验收局域网调用。
-10. 按 `prompts/wsl-project-brief.md` 的“下一阶段开发计划”继续做 Silero VAD、context/热词、max_new_tokens、Qwen batch transcription 和错误映射。不要做 vLLM、streaming、MiMo、ForcedAligner 或 `*-hf` 路径。
+10. 按 `prompts/wsl-project-brief.md` 的“下一阶段开发计划”实现异步转录 job、FIFO 串行队列、轮询状态和 chunk 级真实进度。不要做 vLLM、WebSocket streaming、MiMo、ForcedAligner、数据库队列、多 worker 并发推理或 `*-hf` 路径。
 
 测试命令：
 
@@ -204,9 +216,11 @@ curl --noproxy '*' -v http://192.168.31.137:18080/v1/models
 - 可运行的 FastAPI ASR 服务。
 - README 中写明启动、停止、开机自启、Mac 调用方式。
 - 测试覆盖健康检查、模型列表、加载、卸载、卸载等待当前请求完成、转写接口参数校验。
+- 测试覆盖异步 job 创建、状态轮询、串行队列、chunk 进度、完成结果、失败错误和取消语义。
 - 给出 `scripts/qwen_asr_backend_smoke.py` 在 `transformers` 后端的最小转录验收结果。
 - 给出 `qwen3-asr-0.6b` 在所有声明后端上的真实音频转写验收结果。
 - 给出 `qwen3-asr-1.7b` 在所有声明后端上的真实音频转写验收结果。
+- 给出 Mac 到 WSL 局域网 job 创建和轮询到 completed 的验收结果。
 
 不要做：
 

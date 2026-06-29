@@ -38,7 +38,7 @@ qwen3-asr-1.7b
 qwen3-asr-0.6b
 ```
 
-4. 实现一个最小请求函数，使用 `multipart/form-data` 调用：
+4. 实现一个最小同步请求函数，使用 `multipart/form-data` 调用：
 
 ```text
 POST /v1/audio/transcriptions
@@ -52,23 +52,46 @@ POST /v1/audio/transcriptions
 - `response_format`：默认 `json`。
 - `timestamps`：默认 `none`，只有在服务端声明模型支持时才传 `word` 或 `char`。
 
-5. 处理错误码：
+5. 如果音频较长、前端需要进度条、或不希望 HTTP 长连接阻塞，实现异步 job 调用：
+
+```text
+POST /v1/audio/transcription-jobs
+GET /v1/jobs/{job_id}
+DELETE /v1/jobs/{job_id}
+```
+
+job 规则：
+
+- 创建 job 后应收到 `202`、`job_id` 和 `status_url`。
+- 用 `GET /v1/jobs/{job_id}` 轮询状态，不要用前端假进度代替服务端状态。
+- 队列状态看 `status=queued` 和 `queue_position`。
+- 转录进度看 `progress.phase`、`total_chunks`、`completed_chunks`、`current_chunk` 和 `percent`。
+- 单个 Qwen chunk 内部没有真实百分比，前端只能显示“正在处理第 N 段”。
+- `completed` 后读取 `result.text`。
+- `failed` 后读取 `error.code/message/details`。
+- 用户取消时调用 `DELETE /v1/jobs/{job_id}`；如果服务端正在推理当前 chunk，取消可能要等当前 chunk 完成后生效。
+
+6. 处理错误码：
 
 - `409 model_loading`：等待 3 秒后重试，最多 20 次。
 - `409 model_unloading_scheduled`：切换其他可用模型，或提示用户稍后重试。
 - `422 capability_not_supported`：去掉不支持的参数后重试一次。
+- `404 job_not_found`：job 可能已过期、服务重启或 ID 错误；提示重新提交。
 - `503 gpu_unavailable`：提示服务端 GPU/显存不可用，不要无限重试。
 
-6. 所有局域网 ASR 请求都必须设置超时：
+7. 所有局域网 ASR 请求都必须设置超时：
 
 - 连接超时：5 秒。
 - 同步转写读取超时：至少 1800 秒。
+- job 创建读取超时：30 秒。
+- job 轮询读取超时：30 秒；轮询间隔建议 1-3 秒。
 
-7. 完成后给出以下验收结果：
+8. 完成后给出以下验收结果：
 
 - `/health` 响应摘要。
 - `/v1/models` 中发现的模型列表。
 - 一个真实音频文件的转写结果，至少包含模型 ID、语言、文本前 200 字。
+- 如果实现 job，给出 job 创建响应、至少一次 transcribing 轮询响应、completed 响应摘要。
 - 如果失败，给出 HTTP 状态码、错误 JSON、是否经过代理、是否能 ping 通 `192.168.31.137`。
 
 不要硬编码 MiMo 或任何服务端未在 `/v1/models` 声明的模型。不要修改 ASR 服务端。不要把请求发往公网。不要通过代理访问 `192.168.31.137`。

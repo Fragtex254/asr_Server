@@ -1,6 +1,6 @@
 # WSL ASR Server PRD
 
-更新时间：2026-06-27
+更新时间：2026-06-29
 
 ## 1. 背景
 
@@ -31,6 +31,7 @@ MiMo-V2.5-ASR 不进入初版交付范围，保留为后续扩展候选。
 - 请求卸载指定模型或全部模型。
 - 卸载模型时保证当前正在执行的请求完成后再卸载，并拒绝新的同模型请求。
 - 上传音频并获取转写结果。
+- 创建异步转录任务，并通过轮询获取阶段状态和 chunk 级真实进度。
 - 跑通 `qwen3-asr-0.6b` 和 `qwen3-asr-1.7b` 的端到端转录流程。
 - 对每个 Qwen3-ASR 模型跑通所有在 `/v1/models` 中声明支持的推理后端；第一版只声明 `transformers` 后端，`vllm` 后端延后到后续版本。
 - `/v1/models` 只声明已经实现并通过验收的能力；时间戳、强制对齐、流式转写等高级能力不作为初版发布验收前提。
@@ -354,15 +355,173 @@ Content-Type: `multipart/form-data`
 }
 ```
 
-### 6.9 异步任务
-
-第一版可以先不实现，但接口预留如下：
+### 6.9 异步任务与进度查询
 
 - `POST /v1/audio/transcription-jobs`
 - `GET /v1/jobs/{job_id}`
 - `DELETE /v1/jobs/{job_id}`
 
-适合长音频、批处理和 Mac 项目不希望 HTTP 长连接阻塞的场景。
+适合长音频、批处理、前端需要进度展示、或 Mac 项目不希望 HTTP 长连接阻塞的场景。
+
+第一版采用内存 job manager 和单 worker FIFO 队列：
+
+- 服务端可以接收多个 job，但同一时间只运行一个转录 job。
+- 后提交的 job 保持 `queued`，通过 `queue_position` 暴露排队位置。
+- 不引入 Redis、Celery、数据库或多 worker 推理。
+- 进程重启后内存 job 可以丢失；客户端应将 `job_not_found` 视为需要重新提交。
+- job 结果默认保留 1 小时，之后可过期清理。
+
+进度边界：
+
+- 服务端必须暴露真实阶段：`queued`、`preprocessing`、`splitting`、`loading_model`、`transcribing`、`merging`、`completed`、`failed`。
+- 切分完成后，必须暴露真实 chunk 级进度：`total_chunks`、`completed_chunks`、`current_chunk`、`percent`。
+- Qwen adapter 当前拿不到单个 chunk 内部推理百分比，不能伪造模型内部 token/帧级进度。
+
+`POST /v1/audio/transcription-jobs`
+
+Content-Type: `multipart/form-data`
+
+字段与同步转写接口保持一致，第一版只要求支持单个 `file`。服务端收到请求后应快速返回 `202 Accepted`，不在该 HTTP 请求内执行真实转录。
+
+返回：
+
+```json
+{
+  "id": "job_01JZ0000000000000000000000",
+  "status": "queued",
+  "model": "qwen3-asr-1.7b",
+  "backend": "transformers",
+  "queue_position": 1,
+  "created_at": "2026-06-29T12:00:00Z",
+  "status_url": "/v1/jobs/job_01JZ0000000000000000000000"
+}
+```
+
+`GET /v1/jobs/{job_id}`
+
+队列中返回：
+
+```json
+{
+  "id": "job_01JZ0000000000000000000000",
+  "status": "queued",
+  "model": "qwen3-asr-1.7b",
+  "backend": "transformers",
+  "queue_position": 2,
+  "progress": {
+    "phase": "queued",
+    "percent": 0.0,
+    "message": "waiting for previous transcription jobs"
+  },
+  "created_at": "2026-06-29T12:00:00Z",
+  "started_at": null,
+  "completed_at": null,
+  "elapsed_seconds": 0.0
+}
+```
+
+转录中返回：
+
+```json
+{
+  "id": "job_01JZ0000000000000000000000",
+  "status": "transcribing",
+  "model": "qwen3-asr-1.7b",
+  "backend": "transformers",
+  "queue_position": 0,
+  "progress": {
+    "phase": "transcribing",
+    "percent": 37.5,
+    "total_chunks": 32,
+    "completed_chunks": 12,
+    "current_chunk": 13,
+    "current_chunk_start": 1412.4,
+    "current_chunk_end": 1530.1,
+    "message": "transcribing chunk 13 of 32"
+  },
+  "split": {
+    "strategy": "silero",
+    "requested_strategy": "auto",
+    "vad_backend": "silero",
+    "chunk_count": 32,
+    "soft_chunk_seconds": 120,
+    "hard_chunk_seconds": 300,
+    "overlap_seconds": 2
+  },
+  "created_at": "2026-06-29T12:00:00Z",
+  "started_at": "2026-06-29T12:00:03Z",
+  "completed_at": null,
+  "elapsed_seconds": 74.3
+}
+```
+
+完成后返回：
+
+```json
+{
+  "id": "job_01JZ0000000000000000000000",
+  "status": "completed",
+  "progress": {
+    "phase": "completed",
+    "percent": 100.0,
+    "total_chunks": 32,
+    "completed_chunks": 32
+  },
+  "result": {
+    "id": "tr_01JZ0000000000000000000000",
+    "model": "qwen3-asr-1.7b",
+    "backend": "transformers",
+    "language": "zh",
+    "text": "完整合并后的转写文本。",
+    "duration": 3630.05,
+    "split": {},
+    "chunks": [],
+    "usage": {
+      "audio_seconds": 3630.05
+    },
+    "timings": {},
+    "warnings": []
+  },
+  "error": null,
+  "created_at": "2026-06-29T12:00:00Z",
+  "started_at": "2026-06-29T12:00:03Z",
+  "completed_at": "2026-06-29T12:04:12Z",
+  "elapsed_seconds": 249.0
+}
+```
+
+失败后返回：
+
+```json
+{
+  "id": "job_01JZ0000000000000000000000",
+  "status": "failed",
+  "progress": {
+    "phase": "failed",
+    "percent": 37.5,
+    "total_chunks": 32,
+    "completed_chunks": 12
+  },
+  "result": null,
+  "error": {
+    "code": "gpu_unavailable",
+    "message": "CUDA out of memory during Qwen ASR",
+    "details": {
+      "phase": "transcribing",
+      "chunk_index": 12
+    }
+  }
+}
+```
+
+`DELETE /v1/jobs/{job_id}`
+
+取消语义：
+
+- `queued` job 可以直接取消为 `cancelled`。
+- `preprocessing`、`splitting`、`merging` 阶段尽量在阶段边界取消。
+- `transcribing` 阶段不要强杀 Qwen 推理，不要卸载模型；设置 `cancel_requested`，等当前 chunk 完成后停止后续 chunk。
+- 已结束 job 的 DELETE 返回当前状态，不应报 500。
 
 ### 6.10 流式转写
 
@@ -443,7 +602,7 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 同步与异步阈值：
 
 - 单个请求总音频时长小于等于 10 分钟时，允许走同步 `POST /v1/audio/transcriptions`。
-- 单个请求总音频时长超过 10 分钟时，服务端应返回 `202 accepted` 并建议使用异步 job，或由请求端直接调用 `POST /v1/audio/transcription-jobs`。
+- 单个请求总音频时长超过 10 分钟时，同步接口应返回 `202 accepted` 并创建异步 job，响应包含 `job_id` 和 `status_url`；如果暂未实现自动创建 job，必须返回明确错误并提示客户端使用 `POST /v1/audio/transcription-jobs`。
 - 单文件默认最大 2 小时。
 - 单请求数组默认最多 50 个文件，总时长默认最多 6 小时。
 - 超过服务端限制返回 `413 audio_too_large` 或 `422 duration_limit_exceeded`。
@@ -498,8 +657,10 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 | --- | --- | --- |
 | 400 | `bad_request` | 参数缺失、非法枚举值 |
 | 404 | `model_not_found` | 模型 ID 不存在 |
+| 404 | `job_not_found` | job ID 不存在、已过期或服务重启后丢失 |
 | 409 | `model_loading` | 模型正在加载，暂不能处理请求 |
 | 409 | `model_unloading_scheduled` | 模型已安排卸载，拒绝新请求 |
+| 409 | `job_cancel_requested` | job 已请求取消，不能重复启动或修改 |
 | 413 | `audio_too_large` | 音频超出服务限制 |
 | 415 | `unsupported_audio_format` | 音频格式不支持 |
 | 422 | `capability_not_supported` | 请求了模型不支持的能力 |
@@ -560,8 +721,10 @@ models:
 
 limits:
   max_upload_mb: 512
-  max_audio_seconds_sync: 1800
+  max_audio_seconds_sync: 600
   request_timeout_seconds: 3600
+  job_result_ttl_seconds: 3600
+  max_queued_jobs: 20
 ```
 
 ## 10. 安全要求
@@ -589,6 +752,15 @@ limits:
 - 默认模型 `qwen3-asr-1.7b` 在不显式传 `backend` 时可以用 `backend=auto` 完成转录。
 - 前端 Mac 客户端只依赖 `GET /v1/models` 的模型与后端发现结果，不硬编码服务端未声明的能力。
 
+异步 job：
+
+- Mac mini 能创建 `POST /v1/audio/transcription-jobs`，拿到 `202`、`job_id` 和 `status_url`。
+- `GET /v1/jobs/{job_id}` 能看到 `queued`、运行中状态和最终 `completed`。
+- 长音频转录中，`progress.total_chunks`、`completed_chunks`、`current_chunk` 会随真实 chunk 完成而变化。
+- 多个 job 同时提交时，服务端只运行一个，其余 job 显示 `queued` 和正确 `queue_position`。
+- job 完成后 `result.text` 非空，结构与同步转写结果兼容。
+- job 失败时返回统一 error 对象，包含错误 code、message、details 和失败阶段。
+
 模型管理：
 
 - 模型处于 `loaded` 时，`DELETE /v1/models/{model_id}` 能将其卸载。
@@ -603,7 +775,7 @@ limits:
 
 ## 12. 后续路线
 
-当前 WSL 服务端下一阶段按 `prompts/wsl-project-brief.md` 的“下一阶段开发计划”执行：先升级 Silero VAD，再补 `context`/热词、`max_new_tokens`、Qwen chunk batch transcription 和真实错误映射。下一版不做 vLLM、streaming、MiMo、ForcedAligner 或 `*-hf` 路径。
+当前 WSL 服务端下一阶段按 `prompts/wsl-project-brief.md` 的“下一阶段开发计划”执行：实现异步转录 job、FIFO 串行队列、可轮询状态和 chunk 级真实进度。下一版不做 vLLM、WebSocket streaming、MiMo、ForcedAligner、数据库队列、多 worker 并发推理或 `*-hf` 路径。
 
 优先级 P0：
 
@@ -618,6 +790,7 @@ limits:
 
 - 转录耗时记录，包括总耗时、加载耗时、推理耗时和后处理耗时。
 - 长音频切分与合并，先支持固定切分和 chunk 元数据。
+- 异步转录 job 和 chunk 级进度查询。
 - 异步任务。
 - 上传文件大小、时长、格式限制。
 - systemd user service 或 Windows 开机启动。

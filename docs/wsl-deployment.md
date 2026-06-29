@@ -93,7 +93,7 @@ uv pip install silero-vad
 
 ## 转录调优参数
 
-同步转录接口支持以下调优字段：
+同步转录接口和异步 job 接口支持以下调优字段：
 
 - `context`：专有名词、领域背景或热词提示，服务端硬限制 4000 字符。
 - `hotwords`：逗号分隔字符串或 JSON 字符串数组，服务端会合并到 Qwen `context`，普通日志不记录完整内容。
@@ -115,6 +115,45 @@ ASR_QWEN_BATCH_SIZE=2 ASR_ADAPTER=qwen uv run uvicorn asr_server.main:app --host
 ```
 
 只有 batch size 在 `qwen3-asr-0.6b` 和 `qwen3-asr-1.7b` 上都稳定后，才把更大的值写入常驻服务配置。
+
+## 异步 job 与进度查询
+
+长音频或需要前端展示进度时，优先使用异步 job：
+
+```text
+POST /v1/audio/transcription-jobs
+GET /v1/jobs/{job_id}
+DELETE /v1/jobs/{job_id}
+```
+
+设计边界：
+
+- 服务端使用内存 JobManager 和单 worker FIFO 队列。
+- 可以提交多个 job，但同一时间只运行一个真实 Qwen 转录；后续 job 显示 `queued` 和 `queue_position`。
+- 进度是服务端阶段和 chunk 级真实进度，包括 `total_chunks`、`completed_chunks`、`current_chunk`。
+- 不承诺单个 Qwen chunk 内部 token/帧级百分比。
+- 进程重启后内存 job 可以丢失；客户端应重新提交。
+- job 完成或失败后清理上传音频和中间临时文件。
+- job 结果默认保留 1 小时，可用 `ASR_JOB_RESULT_TTL_SECONDS` 调整。
+
+示例：
+
+```bash
+curl --noproxy '*' -sS \
+  -F file=@test-fixtures/audio/test_long.mp3 \
+  -F model=qwen3-asr-1.7b \
+  -F backend=auto \
+  -F language=auto \
+  http://127.0.0.1:18080/v1/audio/transcription-jobs
+```
+
+返回 `job_id` 后轮询：
+
+```bash
+curl --noproxy '*' -sS http://127.0.0.1:18080/v1/jobs/<job_id>
+```
+
+Mac 侧局域网验收同样使用 `http://192.168.31.137:18080`，并且必须绕过本机代理。
 
 本轮 WSL 实测记录见：
 

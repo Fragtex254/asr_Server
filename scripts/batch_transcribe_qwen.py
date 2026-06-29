@@ -9,8 +9,6 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-import torch
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from asr_server.audio.preprocess import normalize_audio_to_wav
@@ -66,6 +64,7 @@ def result_time_stamps(result: object) -> Any:
 
 
 def assert_cuda_runtime() -> None:
+    torch = importlib.import_module("torch")
     print("torch:", torch.__version__)
     print("torch cuda:", torch.version.cuda)
     print("cuda available:", torch.cuda.is_available())
@@ -81,6 +80,7 @@ def assert_cuda_runtime() -> None:
 
 def load_model(model_id: str) -> Any:
     print(f"loading model: {model_id}", flush=True)
+    torch = importlib.import_module("torch")
     qwen_asr: Any = importlib.import_module("qwen_asr")
     model = qwen_asr.Qwen3ASRModel.from_pretrained(
         model_id,
@@ -106,6 +106,7 @@ def transcribe_audio_file(
     max_chunk_seconds: float,
     overlap_seconds: float,
 ) -> dict[str, Path]:
+    torch = importlib.import_module("torch")
     started = perf_counter()
     print(f"\n=== {audio_path} ===", flush=True)
     normalized = normalize_audio_to_wav(audio_path.read_bytes())

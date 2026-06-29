@@ -28,6 +28,7 @@ class ModelRuntime:
     last_used_at: str | None = None
     vram_allocated_mb: int | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    request_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def model_summary(self) -> dict[str, object]:
         return {
@@ -106,7 +107,12 @@ class ModelLifecycleManager:
             if runtime.status in ("unloading", "unloading_scheduled"):
                 raise AsrError(409, "model_unloading_scheduled", f"model is unloading: {model_id}")
             runtime.status = "loading"
-            await runtime.adapter.load(resolved_backend, device, dtype, max_new_tokens=max_new_tokens)
+            try:
+                await runtime.adapter.load(resolved_backend, device, dtype, max_new_tokens=max_new_tokens)
+            except Exception:
+                runtime.status = "error"
+                runtime.rejecting_new_requests = False
+                raise
             runtime.status = "loaded"
             runtime.rejecting_new_requests = False
             runtime.backend = resolved_backend
@@ -197,33 +203,41 @@ class ModelLifecycleManager:
                 f"{selected_model_id} does not support timestamps in this server",
                 {"timestamps": timestamps},
             )
-        resolved_backend, load_ms = await self._begin_request(
-            runtime,
-            backend=backend,
-            max_new_tokens=max_new_tokens,
-        )
-        try:
-            results = await self._transcribe_chunk_results(
+        async with runtime.lock:
+            if runtime.status == "unloading_scheduled" or runtime.rejecting_new_requests:
+                raise AsrError(
+                    409,
+                    "model_unloading_scheduled",
+                    f"model is scheduled for unloading: {runtime.definition.id}",
+                )
+        async with runtime.request_lock:
+            resolved_backend, load_ms = await self._begin_request(
                 runtime,
-                audio_chunks,
-                model_id=selected_model_id,
-                backend=resolved_backend,
-                language=language,
-                context=context,
+                backend=backend,
                 max_new_tokens=max_new_tokens,
-                batch_size=batch_size,
             )
-            runtime.last_used_at = utc_now_iso()
-            timings = TranscriptionTimings(
-                total_ms=(perf_counter() - request_started) * 1000,
-                load_ms=load_ms,
-                decode_ms=sum(result.timings.decode_ms for result in results),
-                inference_ms=sum(result.timings.inference_ms for result in results),
-                postprocess_ms=sum(result.timings.postprocess_ms for result in results),
-            )
-            return resolved_backend, results, timings
-        finally:
-            await self._finish_request(runtime)
+            try:
+                results = await self._transcribe_chunk_results(
+                    runtime,
+                    audio_chunks,
+                    model_id=selected_model_id,
+                    backend=resolved_backend,
+                    language=language,
+                    context=context,
+                    max_new_tokens=max_new_tokens,
+                    batch_size=batch_size,
+                )
+                runtime.last_used_at = utc_now_iso()
+                timings = TranscriptionTimings(
+                    total_ms=(perf_counter() - request_started) * 1000,
+                    load_ms=load_ms,
+                    decode_ms=sum(result.timings.decode_ms for result in results),
+                    inference_ms=sum(result.timings.inference_ms for result in results),
+                    postprocess_ms=sum(result.timings.postprocess_ms for result in results),
+                )
+                return resolved_backend, results, timings
+            finally:
+                await self._finish_request(runtime)
 
     async def _transcribe_chunk_results(
         self,
@@ -329,7 +343,12 @@ class ModelLifecycleManager:
             if runtime.status in ("unloaded", "error") or runtime.backend != resolved_backend:
                 runtime.status = "loading"
                 load_started = perf_counter()
-                await runtime.adapter.load(resolved_backend, "cuda", "auto", max_new_tokens=max_new_tokens)
+                try:
+                    await runtime.adapter.load(resolved_backend, "cuda", "auto", max_new_tokens=max_new_tokens)
+                except Exception:
+                    runtime.status = "error"
+                    runtime.rejecting_new_requests = False
+                    raise
                 load_ms = (perf_counter() - load_started) * 1000
                 runtime.status = "loaded"
                 runtime.backend = resolved_backend

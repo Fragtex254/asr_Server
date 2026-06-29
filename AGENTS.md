@@ -136,6 +136,9 @@ uv run python scripts/qwen_asr_backend_smoke.py \
 - 每个模型必须维护活跃请求计数和生命周期锁。
 - 如果卸载请求到来时仍有活跃请求，设置 `unloading_scheduled`，新的同模型请求返回 `409 model_unloading_scheduled`，等活跃请求完成后再卸载。
 - 推理仍在执行时，不要强制卸载模型。
+- 异步转录使用 `POST /v1/audio/transcription-jobs`、`GET /v1/jobs/{job_id}`、`DELETE /v1/jobs/{job_id}`。
+- 下一阶段异步 job 采用内存 JobManager 和单 worker FIFO 队列；允许排队多个 job，但同一时间只运行一个真实 Qwen 转录。
+- job 进度只承诺服务端阶段和 chunk 级真实进度，不要伪造单个 Qwen chunk 内部百分比。
 - 错误必须使用 PRD 错误信封：
 
 ```json
@@ -167,6 +170,7 @@ uv run python scripts/qwen_asr_backend_smoke.py \
 - 卸载等待活跃请求完成。
 - `unloading_scheduled` 状态下拒绝新请求。
 - 转录接口参数校验。
+- 异步 job 创建、状态轮询、队列位置、chunk 进度、完成结果、失败错误和取消语义。
 - 未声明能力的错误处理，例如 timestamps、forced alignment 或 streaming 返回 `capability_not_supported`。
 - Qwen 两个尺寸和 `/v1/models` 中声明的所有后端的转录路径。
 

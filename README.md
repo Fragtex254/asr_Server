@@ -42,6 +42,8 @@ curl --noproxy '*' http://192.168.31.137:18080/health
 
 真实 Qwen3-ASR 模型依赖、CUDA 验证和正式部署仍然由 WSL Arch Linux 侧完成。
 
+下一阶段主线是异步转录 job：长音频或前端需要进度时，Mac 创建 `POST /v1/audio/transcription-jobs`，再轮询 `GET /v1/jobs/{job_id}` 获取队列状态、阶段和 chunk 级真实进度。服务端采用单 worker FIFO 队列，同一时间只跑一个真实 Qwen 转录。
+
 ## 本地开发
 
 Python 和依赖以 uv 为准：
@@ -74,3 +76,9 @@ uv run python scripts/asr_client.py --base-url http://192.168.31.137:18080 check
 uv run python scripts/asr_client.py --base-url http://192.168.31.137:18080 transcribe /path/to/audio.wav --model qwen3-asr-1.7b --backend auto
 uv run python scripts/asr_client.py --base-url http://192.168.31.137:18080 transcribe /path/to/audio.wav --context "Qwen3-ASR, Silero VAD, Hugging Face" --max-new-tokens 512
 ```
+
+接口使用原则：
+
+- 短音频或脚本验证可以继续使用 `POST /v1/audio/transcriptions` 同步接口。
+- 长音频或需要前端进度展示时使用 `POST /v1/audio/transcription-jobs`。
+- job 进度只承诺服务端阶段和 chunk 级真实进度，不承诺单个 Qwen chunk 内部百分比。

@@ -126,126 +126,376 @@ uv run python scripts/qwen_asr_backend_smoke.py \
 10. 从 Mac mini 用 `curl --noproxy '*'` 验收局域网入口。
 11. 把结果填写到 `docs/validation-template.md` 对应格式里。
 
-## 下一阶段开发计划
+## 下一阶段开发计划：异步转录 Job 与可轮询进度
 
-下一版只围绕 Qwen3-ASR `transformers` 后端完善主转录链路。不要做 vLLM、streaming、MiMo、Web UI 或公网访问。
+下一版只围绕 Qwen3-ASR `transformers` 后端增加异步任务和进度查询。不要做 vLLM、WebSocket streaming、MiMo、Web UI、公网访问、数据库队列或多机调度。
 
-### Issue 1：升级 Silero VAD
+### 从第一性原理理解这个任务
 
-目标：把当前 RMS 能量阈值 VAD 升级成 Silero VAD，让长音频切分更接近真实人声边界。
+当前 `POST /v1/audio/transcriptions` 是同步 HTTP 请求。Mac 前端发出请求后，只能看到“请求还没结束”；服务端完成所有解码、切分、模型加载、chunk 转录、合并后才一次性返回结果。
 
-实现要求：
+这带来两个问题：
 
-- 保留当前能量 VAD 作为 fallback，命名为 `energy` 或内部 fallback，不要直接删除。
-- 新增 `split_strategy=auto|none|fixed|silero|energy`。`vad` 可以作为兼容别名映射到 `silero`，但响应里要能说明实际策略。
-- `auto` 策略：短音频不切分；超过 soft chunk 后优先 Silero；Silero 不可用或失败时 fallback 到 energy；再失败才 fixed。
-- Silero 依赖只能在 WSL 真实环境中启用。Mac/mock 环境的基础 import 和测试不能要求安装 CUDA、torch GPU 包或模型缓存。
-- 如果使用 PyTorch 版 Silero，必须复用已验收的 CUDA/torch 环境；如果采用 ONNX Runtime，必须记录依赖和模型缓存位置。
-- 返回 `split.strategy`、`split.requested_strategy`、`split.vad_backend`、`chunk_count`、`overlap_seconds`，方便对比。
+- 用户不知道服务还在正常工作，还是卡在解码、模型加载、某个 chunk 推理或合并阶段。
+- 长音频请求会长时间占住一个 HTTP 连接；前端刷新或网络中断后，服务端和用户都缺少可恢复的任务状态。
 
-测试要求：
+真实进度的边界也要讲清楚：
 
-- 无 Silero 依赖时，Mac/mock 测试仍通过，并 fallback 到 energy/fixed。
-- `split_strategy=silero` 在 Silero 不可用时返回稳定错误或明确 fallback；不要静默产生空 chunk。
-- `split_strategy=energy` 继续覆盖当前 RMS VAD 行为。
-- `auto` 对短音频不切分，对长音频优先走 Silero。
-- chunk 时间线有序，chunk 时长不超过 hard limit，overlap 小于 chunk 长度。
+- 我们可以做“服务端真实阶段进度”：`queued`、`preprocessing`、`splitting`、`loading_model`、`transcribing`、`merging`、`completed`、`failed`。
+- 切分完成后，可以做“真实 chunk 级进度”：总 chunk 数、已完成 chunk 数、当前 chunk index、百分比。
+- 当前 Qwen adapter 拿不到单个 chunk 内部的 token/帧级进度，所以不要伪造“模型内部 37%”这种精度。单个 chunk 正在推理时，只能说当前 chunk 正在处理。
 
-验收要求：
+### 并发与算力边界
 
-- 用 `test-fixtures/audio/test_long.mp3` 同时跑 energy 和 Silero，记录 chunk 数、总音频时长、平均 chunk 时长、最长 chunk、空白 chunk 数。
-- Silero 输出的 chunk 不应比 energy 明显更碎；如果更碎，必须说明阈值原因。
-- 长音频真实 Qwen 转录结果必须能合并为完整文本，且没有明显段落乱序。
+用户当前没有同时转录多个音频的需求。为了保护 RTX 5070 Ti 显存和模型状态，下一版采用最简单、可解释、可验收的串行模型：
 
-### Issue 2：接入 context / 热词 / 专有名词提示
+- Mac mini 仍然只作为轻量客户端，不安装 CUDA、torch GPU 包、Qwen 模型包或模型缓存。
+- 真实 Qwen 推理只在 WSL Arch Linux 内执行。
+- 服务端可以接收多个 job，但同一时间只运行一个转录 job；后来的 job 进入 FIFO 队列。
+- 不追求并发吞吐，不要为了并发引入 Redis、Celery、数据库、进程池或多 worker 推理。
+- 如果多个 HTTP 请求同时到达，服务端应按队列顺序依次转录，并在 `GET /v1/jobs/{job_id}` 中暴露 `queue_position`。
+- 不要在活跃推理时强制卸载模型；卸载请求仍按现有生命周期规则排队或拒绝新同模型请求。
 
-目标：让客户端能按领域传入术语、人名、产品名、项目名，提高专有名词识别稳定性。
+### API 目标
 
-实现要求：
+新增三个接口，沿用 PRD 预留路径：
 
-- `POST /v1/audio/transcriptions` 增加 `context` 字段，类型为字符串，默认空。
-- 可选增加 `hotwords` 字段，支持逗号分隔或 JSON 数组；服务端统一合并成 Qwen `context`。
-- 给 context 做长度限制，默认建议不超过 4000 字符；超限返回 `400 bad_request`。
-- 长音频切 chunk 后，每个 chunk 都传同一份 context。
-- 不要把完整 context 直接写入普通日志；最多记录长度和 hash。
-- mock adapter 要在测试中能证明 context 被接收，但不要污染真实转录文本。
+```text
+POST /v1/audio/transcription-jobs
+GET /v1/jobs/{job_id}
+DELETE /v1/jobs/{job_id}
+```
 
-测试要求：
+保留现有同步接口：
 
-- API 能接收 `context` 并传到 adapter。
-- 超长 context 返回 `400 bad_request`。
-- `response_format=text` 时仍正常返回文本。
-- context 不影响无 context 的旧请求。
+```text
+POST /v1/audio/transcriptions
+```
 
-验收要求：
+同步接口用于短音频和简单脚本；异步 job 用于中长音频、前端需要进度条、或不希望长 HTTP 连接阻塞的场景。
 
-- 准备一段包含专有名词的测试音频，至少包含 5 个易错词，例如 `Qwen3-ASR`、`Silero VAD`、`Hugging Face`、`RTX 5070 Ti`、`uv`。
-- 分别用空 context 和带 context 请求同一音频，记录专有名词命中数量。
-- 带 context 的版本不应降低普通文本可读性；如果出现幻觉插词，必须记录。
+### POST /v1/audio/transcription-jobs
 
-### Issue 3：让 max_new_tokens 真正生效
+请求格式使用 `multipart/form-data`，字段尽量复用同步转录接口：
 
-目标：避免长 chunk 或复杂音频被默认生成长度截断。
+- `file`：音频文件，必填；先只支持单文件，不做 `files[]` 数组。
+- `model`：默认 `qwen3-asr-1.7b`。
+- `language`：默认 `auto`。
+- `response_format`：默认 `json`；job 最终结果先只保证 JSON。
+- `timestamps`：默认 `none`；如果请求 `word` 或 `char`，按现有能力返回 `capability_not_supported`。
+- `backend`：默认 `auto`；第一版只能解析到 `transformers`。
+- `max_new_tokens`、`context`、`hotwords`、`split_strategy`、`max_chunk_seconds`、`overlap_seconds`、`preserve_segments`：语义与同步接口一致。
 
-实现要求：
+接口必须快速返回，不在这个 HTTP 请求里执行真实转录。
 
-- HTTP 层不再丢弃 `max_new_tokens`。
-- 将 `max_new_tokens` 传入 Qwen adapter，并最终传给 `model.transcribe(...)` 或模型加载/生成配置中实际生效的位置。
-- 设置服务端上限，默认建议 `4096` 或 WSL 实测后的保守值；超限返回 `400 bad_request`。
-- 响应的 `warnings` 中标记是否使用了非默认 `max_new_tokens`。
+建议返回 `202 Accepted`：
 
-测试要求：
-
-- mock adapter 能收到 `max_new_tokens`。
-- 非法值、超限值被拒绝。
-- 未传值时保持当前默认行为。
-
-验收要求：
-
-- 用长 chunk 音频对比默认值和较大 `max_new_tokens`，记录文本是否被截断、推理耗时变化和显存峰值。
-
-### Issue 4：Qwen chunk batch transcription
-
-目标：长音频切分后不要逐 chunk 串行调用 Qwen，优先使用 Qwen 官方批量转录能力提升吞吐。
+```json
+{
+  "id": "job_01JZ0000000000000000000000",
+  "status": "queued",
+  "model": "qwen3-asr-1.7b",
+  "backend": "transformers",
+  "queue_position": 1,
+  "created_at": "2026-06-29T12:00:00Z",
+  "status_url": "/v1/jobs/job_01JZ0000000000000000000000"
+}
+```
 
 实现要求：
 
-- 扩展 adapter 协议，支持 `transcribe_batch(chunks, language, context, max_new_tokens)`。
-- mock adapter 覆盖 batch 路径；真实 Qwen adapter 使用 `model.transcribe(audio=[...], language=[...], context=[...])` 或官方等效接口。
-- 增加配置 `ASR_QWEN_BATCH_SIZE`，默认先保守设为 `1` 或 `2`，WSL 实测后再调整。
-- 如果 batch OOM，返回统一 `gpu_unavailable` 或 `inference_failed`，不要让服务崩溃。
-- 保留逐 chunk fallback，方便定位问题。
+- 上传音频必须写入服务端临时 job 工作目录，不要把完整音频保存在 Git 目录。
+- job 完成或失败后要清理上传原始音频和中间 chunk 临时文件。
+- 普通日志不要记录完整 context、hotwords 或音频内容；最多记录长度、hash、文件大小、时长和 job id。
+- job id 使用不可预测 ID，例如 `uuid4` 或 ULID 风格字符串，不要用递增整数暴露请求量。
+- 内存中保存 job 状态和最终结果即可；进程重启后 job 丢失可以接受，但要在文档和验收记录中说明。
+- 给 job 结果设置内存保留时间，建议默认 1 小时，可通过环境变量配置，例如 `ASR_JOB_RESULT_TTL_SECONDS=3600`。
 
-测试要求：
+### GET /v1/jobs/{job_id}
 
-- 多 chunk 请求会走 batch adapter。
-- batch 返回数量必须等于 chunk 数；不一致返回 `inference_failed`。
-- batch fallback 不改变最终合并文本顺序。
+返回 job 当前状态、阶段进度、错误或最终结果。
 
-验收要求：
+状态枚举建议：
 
-- 用 `test_long.mp3` 对比 batch size 1、2、4 的总耗时、`inference_ms`、峰值显存和错误率。
-- 只有 batch size 在 0.6B 和 1.7B 上都稳定，才能写入推荐配置。
+```text
+queued
+preprocessing
+splitting
+loading_model
+transcribing
+merging
+completed
+failed
+cancel_requested
+cancelled
+expired
+```
 
-### Issue 5：Qwen 错误映射与质量基准
+队列中示例：
 
-目标：让真实部署出现问题时，Mac 客户端和 WSL agent 能快速判断是依赖、CUDA、显存、模型下载、音频还是 Qwen 推理问题。
+```json
+{
+  "id": "job_01JZ0000000000000000000000",
+  "status": "queued",
+  "model": "qwen3-asr-1.7b",
+  "backend": "transformers",
+  "queue_position": 2,
+  "progress": {
+    "phase": "queued",
+    "percent": 0.0,
+    "message": "waiting for previous transcription jobs"
+  },
+  "created_at": "2026-06-29T12:00:00Z",
+  "started_at": null,
+  "completed_at": null,
+  "elapsed_seconds": 0.0
+}
+```
 
-实现要求：
+转录中示例：
 
-- 捕获并映射：CPU 版 torch、CUDA 不可用、CUDA OOM、模型下载失败、`qwen_asr` 缺失、音频解码失败、Qwen 空结果、batch 数量不匹配。
-- 所有错误都走统一 error envelope。
-- `warnings` 中保留非致命问题，例如 Silero fallback、context 超过推荐长度但未超硬限制、batch fallback。
-- `docs/validation-template.md` 补充 Silero、context、max_new_tokens、batch benchmark 记录项。
+```json
+{
+  "id": "job_01JZ0000000000000000000000",
+  "status": "transcribing",
+  "model": "qwen3-asr-1.7b",
+  "backend": "transformers",
+  "queue_position": 0,
+  "progress": {
+    "phase": "transcribing",
+    "percent": 37.5,
+    "total_chunks": 32,
+    "completed_chunks": 12,
+    "current_chunk": 13,
+    "current_chunk_start": 1412.4,
+    "current_chunk_end": 1530.1,
+    "message": "transcribing chunk 13 of 32"
+  },
+  "split": {
+    "strategy": "silero",
+    "requested_strategy": "auto",
+    "vad_backend": "silero",
+    "chunk_count": 32,
+    "soft_chunk_seconds": 120,
+    "hard_chunk_seconds": 300,
+    "overlap_seconds": 2
+  },
+  "created_at": "2026-06-29T12:00:00Z",
+  "started_at": "2026-06-29T12:00:03Z",
+  "completed_at": null,
+  "elapsed_seconds": 74.3
+}
+```
 
-测试要求：
+完成示例：
 
-- 单元测试覆盖主要错误映射。
-- 不安装 GPU 依赖的 Mac 环境仍能跑 mock 测试。
+```json
+{
+  "id": "job_01JZ0000000000000000000000",
+  "status": "completed",
+  "progress": {
+    "phase": "completed",
+    "percent": 100.0,
+    "total_chunks": 32,
+    "completed_chunks": 32
+  },
+  "result": {
+    "id": "tr_01JZ0000000000000000000000",
+    "model": "qwen3-asr-1.7b",
+    "backend": "transformers",
+    "language": "zh",
+    "text": "完整合并后的转写文本。",
+    "duration": 3630.05,
+    "split": {},
+    "chunks": [],
+    "usage": {
+      "audio_seconds": 3630.05
+    },
+    "timings": {},
+    "warnings": []
+  },
+  "error": null,
+  "created_at": "2026-06-29T12:00:00Z",
+  "started_at": "2026-06-29T12:00:03Z",
+  "completed_at": "2026-06-29T12:04:12Z",
+  "elapsed_seconds": 249.0
+}
+```
 
-验收要求：
+失败示例必须使用统一 error envelope 的内部形状：
 
-- WSL agent 必须在验收记录里写下：模型 ID、backend、VAD backend、batch size、context 是否开启、max_new_tokens、torch 版本、CUDA 版本、GPU 名称、总耗时、推理耗时、chunk 数、文本前 200 字。
+```json
+{
+  "id": "job_01JZ0000000000000000000000",
+  "status": "failed",
+  "progress": {
+    "phase": "failed",
+    "percent": 37.5,
+    "total_chunks": 32,
+    "completed_chunks": 12
+  },
+  "result": null,
+  "error": {
+    "code": "gpu_unavailable",
+    "message": "CUDA out of memory during Qwen ASR",
+    "details": {
+      "phase": "transcribing",
+      "chunk_index": 12
+    }
+  }
+}
+```
+
+未知 job 返回：
+
+```json
+{
+  "error": {
+    "code": "job_not_found",
+    "message": "unknown job: job_xxx",
+    "details": {}
+  }
+}
+```
+
+### DELETE /v1/jobs/{job_id}
+
+取消语义要保守：
+
+- 如果 job 还在 `queued`，可以直接变成 `cancelled`，不进入模型推理。
+- 如果 job 正在 `preprocessing`、`splitting` 或 `merging`，尽量在阶段边界取消。
+- 如果 job 正在 Qwen 推理某个 chunk，不要强杀推理线程或卸载模型；设置 `cancel_requested`，等当前 chunk 结束后停止后续 chunk，并把状态改为 `cancelled`。
+- 如果 job 已经 `completed`、`failed`、`cancelled` 或 `expired`，DELETE 返回当前状态，不要报 500。
+
+建议返回：
+
+```json
+{
+  "id": "job_01JZ0000000000000000000000",
+  "status": "cancel_requested",
+  "message": "cancellation will take effect after the current chunk finishes"
+}
+```
+
+### 同步接口与异步接口的关系
+
+不要删除现有同步接口。下一版推荐行为：
+
+- 小于等于 10 分钟的音频：同步接口继续允许 `200 OK` 返回完整结果。
+- 超过 10 分钟的音频：同步接口不要长时间阻塞；建议创建 job 并返回 `202 Accepted`，响应里给出 `job_id` 和 `status_url`。
+- 如果暂时不想让同步接口自动创建 job，也可以返回 `422 duration_limit_exceeded` 并在 details 中提示使用 `/v1/audio/transcription-jobs`。但优先实现自动创建 job，更符合 PRD。
+- job 接口不受 10 分钟同步阈值限制，但仍受单文件 2 小时和服务端上传大小限制。
+
+### 内部实现建议
+
+新增一个轻量 `JobManager`，不要引入外部基础设施：
+
+- 位置建议：`asr_server/jobs.py` 或 `asr_server/jobs/manager.py`。
+- `app.state.job_manager` 持有内存 job 表、FIFO 队列、单 worker task。
+- FastAPI startup 时启动 worker；shutdown 时尽量停止 worker 并清理临时文件。
+- 用 `asyncio.Queue` 或受锁保护的 `deque` 实现队列。
+- job 状态更新必须集中在 JobManager，不要散落在多个 endpoint 里。
+- job worker 可以复用现有同步转录的内部函数，但要能在关键阶段更新 progress。
+- 如果当前同步转录逻辑太难复用，先抽出一个内部 service 函数，例如 `run_transcription_request(...)`，让同步接口和 job worker 共用同一条解码、切分、转录、合并路径。
+- 不要复制两套 Qwen adapter 调用逻辑，避免同步接口和 job 接口行为分叉。
+
+关键进度更新点：
+
+1. `queued`：job 创建后进入队列。
+2. `preprocessing`：开始读取上传文件、检查大小、FFmpeg 解码/规范化。
+3. `splitting`：开始获取音频元数据、VAD/fixed 切分。
+4. `loading_model`：切分完成后，进入模型加载或确认模型已加载。
+5. `transcribing`：每个 chunk 开始前更新 `current_chunk`；每个 chunk 完成后更新 `completed_chunks` 和 `percent`。
+6. `merging`：所有 chunk 完成后开始合并文本、去重、构造响应。
+7. `completed`：保存最终 result。
+8. `failed`：保存统一 error，清理临时文件。
+9. `cancel_requested` / `cancelled`：在安全阶段边界停止。
+
+百分比规则：
+
+- 切分前不知道总 chunk 数，`percent` 可以是 `0.0` 到 `5.0` 的阶段性估计，但不要假装精确。
+- 切分后，以 chunk 为主计算真实进度。建议公式：`percent = completed_chunks / total_chunks * 100`，或给 preprocessing/splitting/merging 留少量权重，但必须在文档里说明。
+- 用户最关心“是不是在动”和“转到第几段”，优先保证 `completed_chunks`、`total_chunks`、`current_chunk` 准确。
+
+### 数据结构要求
+
+job 记录至少包含：
+
+- `id`
+- `status`
+- `model`
+- `backend`
+- `language`
+- `created_at`
+- `started_at`
+- `completed_at`
+- `expires_at`
+- `queue_position`
+- `progress`
+- `request` 的安全摘要：文件名、大小、参数、context hash，不保存完整 context 到普通日志。
+- `split` 摘要。
+- `result`：完成后保存与同步接口兼容的 JSON 结果。
+- `error`：失败后保存统一错误对象。
+- `warnings`
+- `temp_paths`：用于清理。
+
+### 测试要求
+
+Mac/mock 环境必须能跑完整测试，不需要 CUDA、torch GPU 包、Qwen 模型缓存或真实模型下载。
+
+至少增加这些测试：
+
+- 创建 job 返回 `202`、`status=queued`、`status_url`。
+- `GET /v1/jobs/{job_id}` 能看到 queued/running/completed 状态。
+- mock adapter 延迟时，进度从 queued/running 变化到 completed。
+- 多个 job 同时提交时，只运行一个，另一个显示 `queued` 和正确 `queue_position`。
+- chunk 转录时进度按 `completed_chunks` 增长。
+- job 完成后 `result.text` 非空，响应结构与同步接口兼容。
+- adapter 抛错时 job 进入 `failed`，错误对象使用统一 code/message/details。
+- queued job 可以取消为 `cancelled`。
+- running job 取消时不强杀当前 chunk，当前 chunk 完成后进入 `cancelled`。
+- 未知 job 返回 `404 job_not_found`。
+- 超过 10 分钟的同步请求返回 `202` job，或明确返回 `422` 提示使用 job；优先实现 `202`。
+- 不安装 GPU 依赖的 Mac 环境仍然 `uv run pytest -q` 通过。
+- `uv run mypy asr_server tests scripts` 通过；WSL-only torch import 必须懒加载或做类型兼容，不能让 Mac 环境静态检查失败。
+
+### WSL 真实验收要求
+
+完成代码后在 WSL Arch Linux 内验收：
+
+1. `uv run pytest -q`
+2. `uv run mypy asr_server tests scripts`
+3. CUDA torch 验收：确认 torch 不是 CPU 版。
+4. 启动真实服务：
+
+```bash
+ASR_ADAPTER=qwen uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
+```
+
+5. 用 `test-fixtures/audio/test_short.wav` 创建 job，轮询到 `completed`，记录 `result.text` 前 200 字。
+6. 用 `test-fixtures/audio/test_long.mp3` 创建 job，轮询过程中至少记录三次状态：queued 或 preprocessing、transcribing 中间状态、completed。
+7. 验证 `progress.total_chunks`、`completed_chunks`、`current_chunk` 在长音频转录中真实变化。
+8. 分别对 `qwen3-asr-0.6b` 和 `qwen3-asr-1.7b` 跑一次 job API，后端均为 `transformers`，返回非空文本。
+9. 从 Mac mini 通过局域网入口请求：
+
+```bash
+curl --noproxy '*' http://192.168.31.137:18080/health
+curl --noproxy '*' http://192.168.31.137:18080/v1/models
+```
+
+10. 从 Mac mini 创建一个 job 并轮询 `GET /v1/jobs/{job_id}` 到 completed，证明进度不是只在 WSL localhost 可见。
+
+验收记录至少写下：
+
+- 模型 ID。
+- backend。
+- torch 版本、CUDA 版本、GPU 名称。
+- 音频文件、音频时长、chunk 数。
+- job 状态流转时间线。
+- 轮询样例 JSON。
+- 总耗时、加载耗时、推理耗时、合并耗时。
+- 文本前 200 字。
+- 如果失败，写清楚错误 code、阶段、chunk index、下一步判断。
 
 ### 不进入下一版
 
@@ -254,6 +504,9 @@ uv run python scripts/qwen_asr_backend_smoke.py \
 - ForcedAligner / word-char timestamps。
 - 原生 `*-hf` Transformers 加载路径。
 - MiMo。
+- Web UI。
+- Redis、Celery、数据库持久化队列。
+- 多 GPU、多 worker 并发推理。
 
 ## 你不要做什么
 

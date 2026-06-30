@@ -49,6 +49,7 @@ deploy/wsl-deploy.sh
 - 校验 `torch==2.11.0+cu128`、CUDA 可用和 `qwen_asr` 可导入。
 - 跑一次 `Qwen/Qwen3-ASR-0.6B` + `test-fixtures/audio/test_short.wav` 的 `transformers` 后端 smoke。
 - 安装并启动 `systemd --user` 服务 `asr-server.service`。
+- 常驻服务通过 `/home/fragt/services/asr-server/.venv/bin/uvicorn` 直接启动，避免 `uv run` 在 systemd 或 Windows 任务计划程序启动时联网同步依赖，导致服务没有监听 `18080`。
 - 常驻服务默认设置 `ASR_IDLE_UNLOAD_SECONDS=180`，转录完成后 3 分钟无新增同模型请求就自动卸载模型并释放 CUDA cache。
 - 常驻服务默认设置 `HF_HUB_OFFLINE=1` 和 `TRANSFORMERS_OFFLINE=1`，使用部署 smoke 已拉取并验收过的本地模型缓存，避免运行时被 Hugging Face HEAD 请求超时拖住。
 - 对 `http://127.0.0.1:18080` 运行 HTTP smoke test。
@@ -117,10 +118,21 @@ print("qwen_asr import ok:", qwen_asr.Qwen3ASRModel)
 PY
 ```
 
-真实 Qwen adapter 启动时使用：
+交互式调试真实 Qwen adapter 时可以使用：
 
 ```bash
 ASR_ADAPTER=qwen uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
+```
+
+常驻服务和 Windows 启动任务不要使用 `uv run uvicorn` 作为启动命令。`uv run` 可能在启动时尝试同步依赖并访问 PyPI 镜像；如果网络超时，systemd 会显示 service 已启动过但 API 端口没有监听。部署脚本和 service 模板统一使用已创建好的虚拟环境入口：
+
+```bash
+ASR_ADAPTER=qwen \
+ASR_QWEN_BATCH_SIZE=1 \
+ASR_IDLE_UNLOAD_SECONDS=180 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+/home/fragt/services/asr-server/.venv/bin/uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
 ```
 
 ## 可选 Silero VAD
@@ -259,6 +271,13 @@ cp deploy/asr-server.service ~/.config/systemd/user/asr-server.service
 systemctl --user daemon-reload
 systemctl --user enable --now asr-server.service
 systemctl --user status asr-server.service
+```
+
+`deploy/asr-server.service` 的 `ExecStart` 必须指向部署目录里的 `.venv/bin/uvicorn`，不要改回 `uv run uvicorn`。服务重启后用下面两个命令同时确认 systemd 状态和端口健康：
+
+```bash
+systemctl --user status asr-server.service --no-pager
+curl --noproxy '*' http://127.0.0.1:18080/health
 ```
 
 ## Windows 启动任务

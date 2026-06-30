@@ -347,11 +347,9 @@ install_user_service() {
   command -v systemctl >/dev/null 2>&1 || die "systemctl is required to install the user service"
   systemctl --user show-environment >/dev/null 2>&1 || die "systemd user manager is not available; enable WSL systemd or use --no-enable-service"
 
-  local uv_bin
   local service_dir
   local service_file
   local tmp_file
-  uv_bin="$(command -v uv)"
   service_dir="${HOME}/.config/systemd/user"
   service_file="${service_dir}/asr-server.service"
   tmp_file="$(mktemp)"
@@ -374,7 +372,7 @@ Environment=ASR_QWEN_BATCH_SIZE=${QWEN_BATCH_SIZE}
 Environment=ASR_IDLE_UNLOAD_SECONDS=${IDLE_UNLOAD_SECONDS}
 Environment=HF_HUB_OFFLINE=${HF_HUB_OFFLINE}
 Environment=TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE}
-ExecStart=${uv_bin} run uvicorn asr_server.main:app --host ${HOST} --port ${PORT}
+ExecStart=${DEPLOY_DIR}/.venv/bin/uvicorn asr_server.main:app --host ${HOST} --port ${PORT}
 Restart=on-failure
 RestartSec=5
 

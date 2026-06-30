@@ -63,6 +63,8 @@ WSL 真实部署优先使用一键脚本：
 deploy/wsl-deploy.sh
 ```
 
+常驻 systemd 服务和 Windows 启动任务使用部署目录里的 `.venv/bin/uvicorn` 直接启动，不使用 `uv run uvicorn`，避免服务启动时因依赖同步访问 PyPI 镜像而卡住。
+
 Python 通过 `.python-version` 和 `pyproject.toml` 固定为 3.12；具体 Python 包版本锁定在 `uv.lock`。
 
 如果某台机器必须先用 conda，只用 conda 创建外层 Python/uv 环境：

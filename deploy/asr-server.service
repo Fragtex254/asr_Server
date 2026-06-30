@@ -13,7 +13,7 @@ Environment=ASR_QWEN_BATCH_SIZE=1
 Environment=ASR_IDLE_UNLOAD_SECONDS=180
 Environment=HF_HUB_OFFLINE=1
 Environment=TRANSFORMERS_OFFLINE=1
-ExecStart=/home/fragt/.local/bin/uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
+ExecStart=/home/fragt/services/asr-server/.venv/bin/uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
 Restart=on-failure
 RestartSec=5
 

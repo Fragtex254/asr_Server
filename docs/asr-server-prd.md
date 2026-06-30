@@ -1,6 +1,6 @@
 # WSL ASR Server PRD
 
-更新时间：2026-06-29
+更新时间：2026-06-30
 
 ## 1. 背景
 
@@ -577,7 +577,7 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 输入字段扩展：
 
 - `files`：音频数组，可选；与单个 `file` 二选一。
-- `split_strategy`：`auto`、`none`、`fixed`、`silero`、`energy`、`vad`，默认 `auto`；`vad` 是兼容别名，下一版默认语义应指向 Silero VAD。
+- `split_strategy`：`auto`、`none`、`fixed`、`silero`、`energy`、`vad`，默认 `auto`；`vad` 是兼容别名，当前默认语义指向 Silero VAD，Silero 不可用时 fallback 到 energy VAD。
 - `max_chunk_seconds`：可选；用户给上限时不得超过服务端模型上限。
 - `overlap_seconds`：可选；默认由服务端决定。
 - `preserve_segments`：是否返回 chunk 级别结果，默认 `false`。
@@ -704,7 +704,7 @@ Windows 防火墙：
 - 服务崩溃后可自动重启。
 - 模型不必开机即加载，可 lazy load。
 - 首次请求某个模型时可自动加载，但返回时间可能较长。
-- 支持空闲自动卸载策略，默认可关闭。
+- 转录完成后 3 分钟内没有新的同模型转录请求时，自动卸载模型并清理 CUDA cache；新请求到来时取消上一轮空闲卸载计时，直到该请求结束后重新计时。
 
 建议配置：
 
@@ -717,7 +717,7 @@ server:
 models:
   default: qwen3-asr-1.7b
   auto_load_on_request: true
-  idle_unload_seconds: 1800
+  idle_unload_seconds: 180
   max_loaded_models: 1
 
 limits:
@@ -736,6 +736,7 @@ limits:
 - 默认只监听局域网地址或 `0.0.0.0` 配合 Windows 专用网络防火墙。
 - 不允许公网端口映射。
 - 上传音频写入临时目录，推理结束后清理。
+- 同步转录、异步 job、音频解码、切分和模型适配器产生的临时文件必须在请求完成、失败或取消后清理；job 结果 TTL 只允许保留内存中的结果和状态，不保留上传音频或中间音频文件。
 - 日志不默认保存完整音频内容。
 
 ## 11. 验收标准
@@ -776,7 +777,7 @@ limits:
 
 ## 12. 后续路线
 
-当前 WSL 服务端下一阶段按 `prompts/wsl-project-brief.md` 的“下一阶段开发计划”执行：实现异步转录 job、FIFO 串行队列、可轮询状态和 chunk 级真实进度。下一版不做 vLLM、WebSocket streaming、MiMo、ForcedAligner、数据库队列、多 worker 并发推理或 `*-hf` 路径。
+当前 WSL 服务端已经实现异步转录 job、FIFO 串行队列、可轮询状态和 chunk 级真实进度。后续阶段不做 vLLM、WebSocket streaming、MiMo、ForcedAligner、数据库队列、多 worker 并发推理或 `*-hf` 路径，除非 PRD 明确扩展范围。
 
 优先级 P0：
 

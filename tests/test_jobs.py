@@ -5,6 +5,7 @@ import io
 import wave
 from array import array
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -63,6 +64,19 @@ async def wait_for_status(client: AsyncClient, job_id: str, statuses: set[str]) 
     raise AssertionError(f"job {job_id} did not reach {statuses}")
 
 
+def patch_job_tempdir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    counter = 0
+
+    def mkdtemp(prefix: str) -> str:
+        nonlocal counter
+        counter += 1
+        path = tmp_path / f"{prefix}{counter}"
+        path.mkdir()
+        return str(path)
+
+    monkeypatch.setattr("asr_server.jobs.tempfile.mkdtemp", mkdtemp)
+
+
 async def test_create_job_returns_accepted_and_status_url(client: AsyncClient) -> None:
     body = await create_job(client)
 
@@ -78,6 +92,40 @@ async def test_create_job_returns_accepted_and_status_url(client: AsyncClient) -
     assert completed_result["text"]
     assert completed_result["model"] == "qwen3-asr-1.7b"
     assert completed_progress["percent"] == 100.0
+
+
+async def test_completed_job_removes_uploaded_temp_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    patch_job_tempdir(monkeypatch, tmp_path)
+    app = create_app()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        created = await create_job(client)
+        await wait_for_status(client, str(created["id"]), {"completed"})
+
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_job_manager_start_removes_stale_job_temp_dirs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    stale = tmp_path / "asr_job_stale_abc"
+    stale.mkdir()
+    (stale / "upload").write_bytes(b"old audio")
+    unrelated = tmp_path / "other_temp"
+    unrelated.mkdir()
+    monkeypatch.setattr("asr_server.jobs.tempfile.gettempdir", lambda: str(tmp_path))
+
+    app = create_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver"):
+        await app.state.job_manager.start()
+        await app.state.job_manager.shutdown()
+
+    assert not stale.exists()
+    assert unrelated.exists()
 
 
 async def test_multiple_jobs_are_serialized_and_show_queue_position() -> None:
@@ -152,6 +200,35 @@ async def test_job_failure_uses_error_shape(monkeypatch: pytest.MonkeyPatch) -> 
     assert details["phase"] == "transcribing"
 
 
+async def test_failed_job_removes_uploaded_temp_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    patch_job_tempdir(monkeypatch, tmp_path)
+
+    async def fail_transcribe(
+        self: MockAsrAdapter,
+        audio: bytes,
+        *,
+        model_id: str,
+        backend: str,
+        language: str,
+        context: str,
+        max_new_tokens: int | None,
+    ) -> TranscriptionResult:
+        del self, audio, model_id, backend, language, context, max_new_tokens
+        raise AsrError(503, "gpu_unavailable", "CUDA out of memory during Qwen ASR", {"phase": "transcribing"})
+
+    monkeypatch.setattr(MockAsrAdapter, "transcribe", fail_transcribe)
+
+    app = create_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        created = await create_job(client)
+        await wait_for_status(client, str(created["id"]), {"failed"})
+
+    assert list(tmp_path.iterdir()) == []
+
+
 async def test_queued_job_can_be_cancelled() -> None:
     app = create_app(adapter_delay_seconds=0.08)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
@@ -165,6 +242,26 @@ async def test_queued_job_can_be_cancelled() -> None:
         cancelled = await client.get(f"/v1/jobs/{second['id']}")
         assert cancelled.json()["status"] == "cancelled"
         await wait_for_status(client, str(first["id"]), {"completed"})
+
+
+async def test_cancelled_queued_job_removes_uploaded_temp_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    patch_job_tempdir(monkeypatch, tmp_path)
+    app = create_app(adapter_delay_seconds=0.08)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        first = await create_job(client)
+        second = await create_job(client)
+
+        response = await client.delete(f"/v1/jobs/{second['id']}")
+        assert response.status_code == 200
+        assert response.json()["status"] == "cancelled"
+
+        await wait_for_status(client, str(first["id"]), {"completed"})
+
+    assert list(tmp_path.iterdir()) == []
 
 
 async def test_running_job_cancel_waits_for_chunk_boundary() -> None:

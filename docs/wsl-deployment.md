@@ -31,6 +31,50 @@ uv run pytest -q
 uv run mypy asr_server tests scripts
 ```
 
+## 一键部署
+
+在 WSL Arch Linux 内，从项目 checkout 目录运行：
+
+```bash
+deploy/wsl-deploy.sh
+```
+
+默认行为：
+
+- 同步当前项目到 `/home/fragt/services/asr-server`。
+- 安装 Arch 系统包 `uv`、`rsync`、`ffmpeg`、`libsndfile`。
+- 创建 Python 3.12 uv 环境并执行 `uv sync --frozen`。
+- 运行 `pytest` 和 `mypy`。
+- 安装 `requirements/wsl-gpu-cu128.txt` 中固定的 CUDA 12.8 Qwen 运行时依赖。
+- 校验 `torch==2.11.0+cu128`、CUDA 可用和 `qwen_asr` 可导入。
+- 跑一次 `Qwen/Qwen3-ASR-0.6B` + `test-fixtures/audio/test_short.wav` 的 `transformers` 后端 smoke。
+- 安装并启动 `systemd --user` 服务 `asr-server.service`。
+- 常驻服务默认设置 `ASR_IDLE_UNLOAD_SECONDS=180`，转录完成后 3 分钟无新增同模型请求就自动卸载模型并释放 CUDA cache。
+- 常驻服务默认设置 `HF_HUB_OFFLINE=1` 和 `TRANSFORMERS_OFFLINE=1`，使用部署 smoke 已拉取并验收过的本地模型缓存，避免运行时被 Hugging Face HEAD 请求超时拖住。
+- 对 `http://127.0.0.1:18080` 运行 HTTP smoke test。
+
+如果需要让常驻服务启动后仍可在线拉取 Hugging Face 模型文件：
+
+```bash
+deploy/wsl-deploy.sh --online-service
+```
+
+如果只想更新代码并重启服务，不重装 GPU 依赖和不重新下载模型：
+
+```bash
+deploy/wsl-deploy.sh \
+  --skip-system-packages \
+  --skip-gpu-deps \
+  --skip-cuda-check \
+  --skip-qwen-backend-smoke
+```
+
+如果只是验证部署流程，不启用真实 Qwen/GPU：
+
+```bash
+deploy/wsl-deploy.sh --mock
+```
+
 ## GPU 运行时依赖
 
 WSL 侧真实 Qwen3-ASR 运行时统一使用这组 PyTorch CUDA 版本：
@@ -124,11 +168,13 @@ ASR_QWEN_BATCH_SIZE=2 ASR_ADAPTER=qwen uv run uvicorn asr_server.main:app --host
 ASR_MAX_UPLOAD_MB=512
 ASR_MAX_QUEUED_JOBS=20
 ASR_JOB_RESULT_TTL_SECONDS=3600
+ASR_IDLE_UNLOAD_SECONDS=180
 ```
 
 - `ASR_MAX_UPLOAD_MB`：单次上传音频大小上限；同步转录和异步 job 创建都会执行，超限返回 `413 audio_too_large`。
 - `ASR_MAX_QUEUED_JOBS`：queued/running job 总数上限；超限返回 `429 job_queue_full`。
 - `ASR_JOB_RESULT_TTL_SECONDS`：job 完成、失败或取消后结果保留时间；过期后客户端应重新提交。
+- `ASR_IDLE_UNLOAD_SECONDS`：模型最后一次转录结束后等待多少秒自动卸载；默认 `180`，设为 `0` 可关闭自动空闲卸载。
 
 ## 异步 job 与进度查询
 
@@ -147,7 +193,7 @@ DELETE /v1/jobs/{job_id}
 - 进度是服务端阶段和 chunk 级真实进度，包括 `total_chunks`、`completed_chunks`、`current_chunk`。
 - 不承诺单个 Qwen chunk 内部 token/帧级百分比。
 - 进程重启后内存 job 可以丢失；客户端应重新提交。
-- job 完成或失败后清理上传音频和中间临时文件。
+- job 完成、失败或取消后清理上传音频和中间临时文件；TTL 只保留内存中的 job 状态和结果，不保留音频文件。
 - job 结果默认保留 1 小时，可用 `ASR_JOB_RESULT_TTL_SECONDS` 调整。
 
 示例：

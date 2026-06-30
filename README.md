@@ -1,6 +1,6 @@
 # WSL ASR 服务
 
-这个仓库包含一个局域网 ASR 网关的规划文档、代理提示词、FastAPI 服务骨架和测试。目标服务运行在 Windows WSL Arch Linux 内，由 Mac mini 项目通过 HTTP 调用。
+这个仓库包含一个局域网 ASR 网关、部署脚本、代理提示词和验收测试。目标服务运行在 Windows WSL Arch Linux 内，由 Mac mini 项目通过 HTTP 调用。
 
 ## 目录结构
 
@@ -8,12 +8,12 @@
 - `prompts/server-agent.md`：给 WSL Arch Linux 服务端开发代理的实现提示词。
 - `prompts/wsl-project-brief.md`：给 WSL 侧代理开工前阅读的项目总览提示词。
 - `prompts/request-client-agent.md`：给 Mac 侧客户端项目的接入提示词。
-- `asr_server/`：FastAPI 应用、模型注册表、生命周期管理器和 mock ASR 适配器。
-- `tests/`：不依赖 CUDA 的 API 和生命周期行为测试。
+- `asr_server/`：FastAPI 应用、模型注册表、生命周期管理器、异步 job 队列和 ASR 适配器。
+- `tests/`：不依赖 CUDA 的 API、生命周期、临时文件清理和 job 行为测试。
 - `scripts/asr_client.py`：Mac 侧验证客户端，会绕过本机代理设置。
 - `scripts/qwen_asr_backend_smoke.py`：WSL 侧真实 Qwen3-ASR 后端最小验收脚本。
 - `scripts/wsl_smoke.sh`：WSL 侧启动服务并运行 HTTP smoke test 的脚本。
-- `deploy/`：systemd user service 和 Windows 启动脚本模板。
+- `deploy/`：WSL 一键部署脚本、systemd user service 和 Windows 启动脚本模板。
 - `test-fixtures/audio/`：给 WSL 侧 ASR 自测使用的音频样本。
 
 ## 部署目标
@@ -38,11 +38,13 @@ curl --noproxy '*' http://192.168.31.137:18080/health
 
 ## 当前状态
 
-仓库已经包含可在 macOS 上运行的 FastAPI 服务骨架、mock ASR 适配器、生命周期管理器和 API 测试，不需要 CUDA 或模型下载。
+当前代码已经实现 FastAPI 网关、mock 适配器、Qwen 真实适配器、模型生命周期管理、同步转录、异步转录 job、单 worker FIFO 队列、chunk 级进度、长音频切分与合并、上传大小限制和统一错误信封。
 
-真实 Qwen3-ASR 模型依赖、CUDA 验证和正式部署仍然由 WSL Arch Linux 侧完成。
+转录过程中产生的上传文件、解码文件和 Qwen 临时音频文件只用于当次请求。同步请求在返回前清理临时文件；异步 job 在完成、失败或取消后清理 job 工作目录，只在内存里按 `ASR_JOB_RESULT_TTL_SECONDS` 保留 job 结果。
 
-下一阶段主线是异步转录 job：长音频或前端需要进度时，Mac 创建 `POST /v1/audio/transcription-jobs`，再轮询 `GET /v1/jobs/{job_id}` 获取队列状态、阶段和 chunk 级真实进度。服务端采用单 worker FIFO 队列，同一时间只跑一个真实 Qwen 转录。
+模型默认 lazy load。转录完成后如果 `ASR_IDLE_UNLOAD_SECONDS` 秒内没有新的同模型转录请求，服务会自动卸载该模型并释放 CUDA cache；默认值为 `180` 秒。
+
+真实 Qwen3-ASR 模型依赖、CUDA 验证和常驻部署仍然只在 WSL Arch Linux 侧完成，Mac mini 只作为轻量客户端和验收机。
 
 ## 本地开发
 
@@ -53,6 +55,12 @@ uv sync
 uv run pytest -q
 uv run mypy asr_server tests scripts
 uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
+```
+
+WSL 真实部署优先使用一键脚本：
+
+```bash
+deploy/wsl-deploy.sh
 ```
 
 Python 通过 `.python-version` 和 `pyproject.toml` 固定为 3.12；具体 Python 包版本锁定在 `uv.lock`。

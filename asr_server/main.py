@@ -98,16 +98,22 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
     @asynccontextmanager
     async def lifespan(lifespan_app: FastAPI) -> AsyncIterator[None]:
         job_manager: JobManager = lifespan_app.state.job_manager
+        manager: ModelLifecycleManager = lifespan_app.state.manager
         await job_manager.start()
         try:
             yield
         finally:
             await job_manager.shutdown()
+            await manager.shutdown()
 
     app = FastAPI(title="WSL ASR Server", version=__version__, lifespan=lifespan)
     app.add_exception_handler(AsrError, cast(Any, asr_error_handler))
     app.add_exception_handler(RequestValidationError, cast(Any, validation_error_handler))
-    app.state.manager = ModelLifecycleManager(default_models(app_settings.default_model), adapter_factory)
+    app.state.manager = ModelLifecycleManager(
+        default_models(app_settings.default_model),
+        adapter_factory,
+        idle_unload_seconds=app_settings.idle_unload_seconds,
+    )
     app.state.settings = app_settings
     app.state.job_manager = JobManager(app.state.manager, app_settings)
 

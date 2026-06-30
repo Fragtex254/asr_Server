@@ -13,6 +13,7 @@ def test_load_settings_from_environment(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("ASR_DEFAULT_MODEL", "qwen3-asr-0.6b")
     monkeypatch.setenv("ASR_ADAPTER", "qwen")
     monkeypatch.setenv("ASR_QWEN_BATCH_SIZE", "2")
+    monkeypatch.setenv("ASR_IDLE_UNLOAD_SECONDS", "180")
     monkeypatch.setenv("ASR_MAX_QUEUED_JOBS", "3")
     monkeypatch.setenv("ASR_MAX_UPLOAD_MB", "4")
 
@@ -24,6 +25,7 @@ def test_load_settings_from_environment(monkeypatch: pytest.MonkeyPatch) -> None
     assert settings.default_model == "qwen3-asr-0.6b"
     assert settings.adapter == "qwen"
     assert settings.qwen_batch_size == 2
+    assert settings.idle_unload_seconds == 180
     assert settings.max_queued_jobs == 3
     assert settings.max_upload_mb == 4
 
@@ -46,6 +48,13 @@ def test_invalid_max_queued_jobs_is_rejected(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("ASR_MAX_QUEUED_JOBS", "0")
 
     with pytest.raises(ValueError, match="ASR_MAX_QUEUED_JOBS"):
+        load_settings()
+
+
+def test_invalid_idle_unload_seconds_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASR_IDLE_UNLOAD_SECONDS", "-1")
+
+    with pytest.raises(ValueError, match="ASR_IDLE_UNLOAD_SECONDS"):
         load_settings()
 
 

@@ -35,6 +35,7 @@ class ModelRuntime:
     vram_allocated_mb: int | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     request_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    idle_unload_task: asyncio.Task[None] | None = None
 
     def model_summary(self) -> dict[str, object]:
         return {
@@ -64,12 +65,14 @@ class ModelLifecycleManager:
         self,
         models: dict[str, ModelDefinition],
         adapter_factory: Callable[[str], AsrAdapter],
+        idle_unload_seconds: float = 180.0,
     ) -> None:
         self._runtimes = {
             model_id: ModelRuntime(definition=model, adapter=adapter_factory(model_id))
             for model_id, model in models.items()
         }
         self._default_model_id = next(model.id for model in models.values() if model.default)
+        self._idle_unload_seconds = idle_unload_seconds
 
     @property
     def default_model_id(self) -> str:
@@ -83,6 +86,10 @@ class ModelLifecycleManager:
             return self._runtimes[model_id]
         except KeyError as exc:
             raise AsrError(404, "model_not_found", f"unknown model: {model_id}") from exc
+
+    async def shutdown(self) -> None:
+        for runtime in self._runtimes.values():
+            self._cancel_idle_unload(runtime)
 
     def resolve_backend(self, runtime: ModelRuntime, backend: Backend) -> str:
         if backend == "auto":
@@ -111,6 +118,7 @@ class ModelLifecycleManager:
         resolved_backend = self.resolve_backend(runtime, backend)
         async with runtime.request_lock:
             async with runtime.lock:
+                self._cancel_idle_unload(runtime)
                 if runtime.status in ("unloading", "unloading_scheduled"):
                     raise AsrError(409, "model_unloading_scheduled", f"model is unloading: {model_id}")
                 runtime.status = "loading"
@@ -141,6 +149,7 @@ class ModelLifecycleManager:
     ) -> dict[str, object]:
         runtime = self.runtime_for(model_id)
         async with runtime.lock:
+            self._cancel_idle_unload(runtime)
             if runtime.active_requests > 0:
                 runtime.status = "unloading_scheduled"
                 runtime.rejecting_new_requests = True
@@ -347,6 +356,7 @@ class ModelLifecycleManager:
         resolved_backend = self.resolve_backend(runtime, backend)
         load_ms = 0.0
         async with runtime.lock:
+            self._cancel_idle_unload(runtime)
             if runtime.status == "unloading_scheduled" or runtime.rejecting_new_requests:
                 raise AsrError(
                     409,
@@ -398,8 +408,18 @@ class ModelLifecycleManager:
             should_unload = runtime.status == "unloading_scheduled" and runtime.active_requests == 0
             if should_unload:
                 await self._unload_now(runtime, cuda_empty_cache=True)
+            elif runtime.status == "loaded" and runtime.active_requests == 0:
+                self._schedule_idle_unload(runtime)
 
-    async def _unload_now(self, runtime: ModelRuntime, *, cuda_empty_cache: bool) -> None:
+    async def _unload_now(
+        self,
+        runtime: ModelRuntime,
+        *,
+        cuda_empty_cache: bool,
+        cancel_idle_task: bool = True,
+    ) -> None:
+        if cancel_idle_task:
+            self._cancel_idle_unload(runtime)
         runtime.status = "unloading"
         await _call_adapter(lambda: runtime.adapter.unload(cuda_empty_cache))
         runtime.status = "unloaded"
@@ -409,6 +429,38 @@ class ModelLifecycleManager:
         runtime.loaded_at = None
         runtime.vram_allocated_mb = None
 
+    def _schedule_idle_unload(self, runtime: ModelRuntime) -> None:
+        if self._idle_unload_seconds <= 0:
+            return
+        self._cancel_idle_unload(runtime)
+        runtime.idle_unload_task = asyncio.create_task(self._idle_unload_after_delay(runtime))
+        runtime.idle_unload_task.add_done_callback(_consume_task_exception)
+
+    def _cancel_idle_unload(self, runtime: ModelRuntime) -> None:
+        task = runtime.idle_unload_task
+        if task is None:
+            return
+        if task is not asyncio.current_task() and not task.done():
+            task.cancel()
+        runtime.idle_unload_task = None
+
+    async def _idle_unload_after_delay(self, runtime: ModelRuntime) -> None:
+        try:
+            await asyncio.sleep(self._idle_unload_seconds)
+            async with runtime.lock:
+                if runtime.status != "loaded" or runtime.active_requests > 0 or runtime.rejecting_new_requests:
+                    return
+                try:
+                    await self._unload_now(runtime, cuda_empty_cache=True, cancel_idle_task=False)
+                except Exception:
+                    runtime.status = "error"
+                    runtime.rejecting_new_requests = False
+                    raise
+                finally:
+                    runtime.idle_unload_task = None
+        except asyncio.CancelledError:
+            return
+
 
 def _chunked(items: list[bytes], batch_size: int) -> list[list[bytes]]:
     return [items[index : index + batch_size] for index in range(0, len(items), batch_size)]
@@ -416,3 +468,10 @@ def _chunked(items: list[bytes], batch_size: int) -> list[list[bytes]]:
 
 async def _call_adapter(factory: Callable[[], Coroutine[Any, Any, T]]) -> T:
     return await asyncio.to_thread(lambda: asyncio.run(factory()))
+
+
+def _consume_task_exception(task: asyncio.Task[None]) -> None:
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass

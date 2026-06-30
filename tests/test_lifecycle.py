@@ -48,6 +48,7 @@ class FailingLoadAdapter:
 class RecordingAdapter:
     def __init__(self) -> None:
         self.loads: list[int | None] = []
+        self.unloads = 0
         self.active_transcribes = 0
         self.max_parallel_transcribes = 0
         self.unload_while_transcribing = False
@@ -62,6 +63,7 @@ class RecordingAdapter:
 
     async def unload(self, cuda_empty_cache: bool) -> None:
         del cuda_empty_cache
+        self.unloads += 1
         if self.active_transcribes > 0:
             self.unload_while_transcribing = True
 
@@ -169,3 +171,57 @@ async def test_explicit_load_waits_for_active_transcription() -> None:
 
     assert adapter.load_while_transcribing is False
     assert adapter.loads == [512, 256]
+
+
+async def test_model_unloads_after_idle_timeout() -> None:
+    adapter = RecordingAdapter()
+    manager = ModelLifecycleManager(default_models(), lambda _model_id: adapter, idle_unload_seconds=0.01)
+
+    await manager.transcribe_chunks(
+        [b"audio"],
+        model_id="qwen3-asr-1.7b",
+        backend="transformers",
+        language="auto",
+        timestamps="none",
+        context="",
+        max_new_tokens=512,
+        batch_size=1,
+    )
+
+    assert manager.runtime_for("qwen3-asr-1.7b").status == "loaded"
+    await asyncio.sleep(0.05)
+
+    runtime = manager.runtime_for("qwen3-asr-1.7b")
+    assert runtime.status == "unloaded"
+    assert runtime.backend is None
+    assert adapter.unloads == 1
+
+
+async def test_new_transcription_resets_idle_unload_timer() -> None:
+    adapter = RecordingAdapter()
+    manager = ModelLifecycleManager(default_models(), lambda _model_id: adapter, idle_unload_seconds=0.05)
+
+    async def transcribe_once() -> None:
+        await manager.transcribe_chunks(
+            [b"audio"],
+            model_id="qwen3-asr-1.7b",
+            backend="transformers",
+            language="auto",
+            timestamps="none",
+            context="",
+            max_new_tokens=512,
+            batch_size=1,
+        )
+
+    await transcribe_once()
+    await asyncio.sleep(0.02)
+    await transcribe_once()
+    await asyncio.sleep(0.03)
+
+    assert manager.runtime_for("qwen3-asr-1.7b").status == "loaded"
+    assert adapter.unloads == 0
+
+    await asyncio.sleep(0.05)
+
+    assert manager.runtime_for("qwen3-asr-1.7b").status == "unloaded"
+    assert adapter.unloads == 1

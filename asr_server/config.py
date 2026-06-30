@@ -16,6 +16,7 @@ class Settings:
     adapter: AdapterMode = "mock"
     qwen_batch_size: int = 1
     job_result_ttl_seconds: int = 3600
+    idle_unload_seconds: float = 180.0
     max_queued_jobs: int = 20
     max_upload_mb: int = 512
 
@@ -31,6 +32,9 @@ def load_settings() -> Settings:
     job_result_ttl_seconds = int(os.getenv("ASR_JOB_RESULT_TTL_SECONDS", "3600"))
     if job_result_ttl_seconds < 1:
         raise ValueError("ASR_JOB_RESULT_TTL_SECONDS must be greater than or equal to 1")
+    idle_unload_seconds = float(os.getenv("ASR_IDLE_UNLOAD_SECONDS", "180"))
+    if idle_unload_seconds < 0:
+        raise ValueError("ASR_IDLE_UNLOAD_SECONDS must be greater than or equal to 0")
     max_queued_jobs = int(os.getenv("ASR_MAX_QUEUED_JOBS", "20"))
     if max_queued_jobs < 1:
         raise ValueError("ASR_MAX_QUEUED_JOBS must be greater than or equal to 1")
@@ -45,6 +49,7 @@ def load_settings() -> Settings:
         adapter=adapter_mode,
         qwen_batch_size=qwen_batch_size,
         job_result_ttl_seconds=job_result_ttl_seconds,
+        idle_unload_seconds=idle_unload_seconds,
         max_queued_jobs=max_queued_jobs,
         max_upload_mb=max_upload_mb,
     )

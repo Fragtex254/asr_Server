@@ -24,12 +24,16 @@ WSL 内项目目录：
 
 Mac 侧已经提前做好了这些不依赖 GPU 的工作：
 
-- FastAPI 服务骨架：`asr_server/main.py`
+- FastAPI 服务入口：`asr_server/main.py`
 - 模型注册表：只包含 `qwen3-asr-0.6b` 和 `qwen3-asr-1.7b`
 - 生命周期管理：加载、卸载、活跃请求计数、`unloading_scheduled`
+- 空闲卸载：转录结束后默认 180 秒无新请求自动卸载模型并释放 CUDA cache
+- 异步转录 job：内存 JobManager、单 worker FIFO 队列、轮询状态和 chunk 级进度
+- 临时文件清理：同步请求、异步 job、取消和失败路径均应清理上传与中间音频文件
 - mock ASR 适配器：用于无 GPU 环境测试
-- Qwen 真实适配器骨架：`asr_server/adapters/qwen.py`
+- Qwen 真实适配器：`asr_server/adapters/qwen.py`
 - HTTP smoke test：`tests/test_http_smoke.py`
+- WSL 一键部署脚本：`deploy/wsl-deploy.sh`
 - WSL 一键 smoke 脚本：`scripts/wsl_smoke.sh`
 - Qwen 后端最小验收脚本：`scripts/qwen_asr_backend_smoke.py`
 - WSL 部署文档：`docs/wsl-deployment.md`
@@ -126,9 +130,9 @@ uv run python scripts/qwen_asr_backend_smoke.py \
 10. 从 Mac mini 用 `curl --noproxy '*'` 验收局域网入口。
 11. 把结果填写到 `docs/validation-template.md` 对应格式里。
 
-## 下一阶段开发计划：异步转录 Job 与可轮询进度
+## 异步转录 Job 维护边界
 
-下一版只围绕 Qwen3-ASR `transformers` 后端增加异步任务和进度查询。不要做 vLLM、WebSocket streaming、MiMo、Web UI、公网访问、数据库队列或多机调度。
+异步任务和进度查询已经是当前服务行为。维护时继续只围绕 Qwen3-ASR `transformers` 后端保持稳定；不要做 vLLM、WebSocket streaming、MiMo、Web UI、公网访问、数据库队列或多机调度，除非 PRD 明确进入对应阶段。
 
 ### 从第一性原理理解这个任务
 
@@ -147,7 +151,7 @@ uv run python scripts/qwen_asr_backend_smoke.py \
 
 ### 并发与算力边界
 
-用户当前没有同时转录多个音频的需求。为了保护 RTX 5070 Ti 显存和模型状态，下一版采用最简单、可解释、可验收的串行模型：
+用户当前没有同时转录多个音频的需求。为了保护 RTX 5070 Ti 显存和模型状态，当前服务采用最简单、可解释、可验收的串行模型：
 
 - Mac mini 仍然只作为轻量客户端，不安装 CUDA、torch GPU 包、Qwen 模型包或模型缓存。
 - 真实 Qwen 推理只在 WSL Arch Linux 内执行。
@@ -158,7 +162,7 @@ uv run python scripts/qwen_asr_backend_smoke.py \
 
 ### API 目标
 
-新增三个接口，沿用 PRD 预留路径：
+当前已经实现三个异步 job 接口，沿用 PRD 路径：
 
 ```text
 POST /v1/audio/transcription-jobs
@@ -379,7 +383,7 @@ expired
 
 ### 同步接口与异步接口的关系
 
-不要删除现有同步接口。下一版推荐行为：
+不要删除现有同步接口。当前推荐行为：
 
 - 小于等于 10 分钟的音频：同步接口继续允许 `200 OK` 返回完整结果。
 - 超过 10 分钟的音频：同步接口不要长时间阻塞；建议创建 job 并返回 `202 Accepted`，响应里给出 `job_id` 和 `status_url`。
@@ -497,7 +501,7 @@ curl --noproxy '*' http://192.168.31.137:18080/v1/models
 - 文本前 200 字。
 - 如果失败，写清楚错误 code、阶段、chunk index、下一步判断。
 
-### 不进入下一版
+### 当前不进入范围
 
 - vLLM 后端。
 - WebSocket streaming。

@@ -115,8 +115,12 @@ class JobManager:
         self._condition = asyncio.Condition()
         self._worker: asyncio.Task[None] | None = None
         self._closed = False
+        self._stale_temp_dirs_cleaned = False
 
     async def start(self) -> None:
+        if not self._stale_temp_dirs_cleaned:
+            await asyncio.to_thread(self._cleanup_stale_temp_dirs)
+            self._stale_temp_dirs_cleaned = True
         if self._worker is None or self._worker.done():
             self._closed = False
             self._worker = asyncio.create_task(self._worker_loop())
@@ -408,6 +412,15 @@ class JobManager:
                     shutil.rmtree(path)
                 else:
                     path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _cleanup_stale_temp_dirs(self) -> None:
+        temp_dir = Path(tempfile.gettempdir())
+        for path in temp_dir.glob("asr_job_*"):
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
             except OSError:
                 pass
 

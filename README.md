@@ -5,6 +5,7 @@
 ## 目录结构
 
 - `docs/asr-server-prd.md`：产品需求和 API 合约。
+- `docs/docs-endpoint-capabilities.md`：`/docs` Swagger UI 使用的当前实现能力说明。
 - `prompts/server-agent.md`：给 WSL Arch Linux 服务端开发代理的实现提示词。
 - `prompts/wsl-project-brief.md`：给 WSL 侧代理开工前阅读的项目总览提示词。
 - `prompts/request-client-agent.md`：给 Mac 侧客户端项目的接入提示词。

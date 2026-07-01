@@ -5,6 +5,7 @@ import socket
 import importlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Any, cast
 
 from fastapi import Body, FastAPI, File, Form, UploadFile
@@ -46,6 +47,7 @@ class UnloadRequest(BaseModel):
 
 
 UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
+DOCS_DESCRIPTION_PATH = Path(__file__).resolve().parent.parent / "docs" / "docs-endpoint-capabilities.md"
 
 
 async def read_upload_limited(file: UploadFile, settings: Settings) -> bytes:
@@ -87,6 +89,16 @@ def gpu_health() -> dict[str, object]:
     }
 
 
+def docs_description() -> str:
+    try:
+        return DOCS_DESCRIPTION_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return (
+            "WSL ASR Server API. Runtime model capabilities must be discovered "
+            "from GET /v1/models."
+        )
+
+
 def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 0.0) -> FastAPI:
     app_settings = settings or load_settings()
 
@@ -106,7 +118,12 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             await job_manager.shutdown()
             await manager.shutdown()
 
-    app = FastAPI(title="WSL ASR Server", version=__version__, lifespan=lifespan)
+    app = FastAPI(
+        title="WSL ASR Server",
+        version=__version__,
+        description=docs_description(),
+        lifespan=lifespan,
+    )
     app.add_exception_handler(AsrError, cast(Any, asr_error_handler))
     app.add_exception_handler(RequestValidationError, cast(Any, validation_error_handler))
     app.state.manager = ModelLifecycleManager(

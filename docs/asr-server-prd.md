@@ -603,7 +603,7 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 
 - 单个请求总音频时长小于等于 10 分钟时，允许走同步 `POST /v1/audio/transcriptions`。
 - 单个请求总音频时长超过 10 分钟时，同步接口应返回 `202 accepted` 并创建异步 job，响应包含 `job_id` 和 `status_url`；如果暂未实现自动创建 job，必须返回明确错误并提示客户端使用 `POST /v1/audio/transcription-jobs`。
-- 单文件默认最大 2 小时。
+- 单文件默认最大 6 小时。
 - 单请求数组默认最多 50 个文件，总时长默认最多 6 小时。
 - 超过服务端限制返回 `413 audio_too_large` 或 `422 duration_limit_exceeded`。
 

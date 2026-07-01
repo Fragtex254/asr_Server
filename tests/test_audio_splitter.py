@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from asr_server.audio import splitter as splitter_module
+from asr_server.audio.metadata import AudioMetadata
 from asr_server.audio.preprocess import normalize_audio_to_wav
 from asr_server.audio.splitter import split_audio
 from asr_server.errors import AsrError
@@ -217,16 +218,27 @@ def test_overlap_must_be_smaller_than_chunk_length() -> None:
     assert exc_info.value.code == "bad_request"
 
 
-def test_duration_limit_is_enforced_before_sync_transcription() -> None:
+def test_duration_limit_is_enforced_before_sync_transcription(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        splitter_module,
+        "inspect_audio",
+        lambda audio: AudioMetadata(
+            duration_seconds=21_601.0,
+            format="raw",
+            byte_length=len(audio),
+        ),
+    )
+
     with pytest.raises(AsrError) as exc_info:
         split_audio(
-            b"a" * int(7201 * 16_000),
+            b"a",
             split_strategy="none",
             max_chunk_seconds=None,
             overlap_seconds=None,
         )
 
     assert exc_info.value.code == "duration_limit_exceeded"
+    assert exc_info.value.details["max_audio_seconds_per_file"] == 21_600.0
 
 
 def test_long_mp3_fixture_is_preprocessed_and_energy_split(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -79,6 +79,7 @@ Implemented form fields for `POST /v1/audio/transcriptions` and
 - `preserve_segments`: optional flag to return chunk-level details.
 
 Audio uploads are bounded by `ASR_MAX_UPLOAD_MB`, default `512`.
+Each uploaded audio file is bounded to `21600` seconds, or 6 hours.
 Synchronous requests over `600` seconds of detected audio duration are converted
 to asynchronous jobs and return `202` with `status_url`.
 

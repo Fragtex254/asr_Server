@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from asr_server.registry import Backend, ModelDefinition, ModelStatus
 ChunkProgressCallback = Callable[[int, int], Awaitable[None]]
 ChunkResultCallback = Callable[[int, int, TranscriptionResult], Awaitable[None]]
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
 
 def utc_now_iso() -> str:
@@ -90,6 +92,17 @@ class ModelLifecycleManager:
     async def shutdown(self) -> None:
         for runtime in self._runtimes.values():
             self._cancel_idle_unload(runtime)
+            async with runtime.lock:
+                if runtime.active_requests > 0:
+                    continue
+                if runtime.status == "unloaded" and runtime.backend is None:
+                    continue
+                try:
+                    await self._unload_now(runtime, cuda_empty_cache=True)
+                except Exception as exc:
+                    logger.warning("failed to unload model during shutdown: %s", exc)
+                    runtime.status = "error"
+                    runtime.rejecting_new_requests = False
 
     def resolve_backend(self, runtime: ModelRuntime, backend: Backend) -> str:
         if backend == "auto":

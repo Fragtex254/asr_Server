@@ -197,6 +197,22 @@ async def test_model_unloads_after_idle_timeout() -> None:
     assert adapter.unloads == 1
 
 
+async def test_shutdown_unloads_loaded_model() -> None:
+    adapter = RecordingAdapter()
+    manager = ModelLifecycleManager(default_models(), lambda _model_id: adapter, idle_unload_seconds=180)
+
+    await manager.load_model("qwen3-asr-1.7b", backend="transformers", max_new_tokens=512)
+
+    assert manager.runtime_for("qwen3-asr-1.7b").status == "loaded"
+
+    await manager.shutdown()
+
+    runtime = manager.runtime_for("qwen3-asr-1.7b")
+    assert runtime.status == "unloaded"
+    assert runtime.backend is None
+    assert adapter.unloads == 1
+
+
 async def test_new_transcription_resets_idle_unload_timer() -> None:
     adapter = RecordingAdapter()
     manager = ModelLifecycleManager(default_models(), lambda _model_id: adapter, idle_unload_seconds=0.05)

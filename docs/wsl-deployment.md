@@ -42,12 +42,12 @@ deploy/wsl-deploy.sh
 默认行为：
 
 - 同步当前项目到 `/home/fragt/services/asr-server`。
-- 安装 Arch 系统包 `uv`、`rsync`、`ffmpeg`、`libsndfile`。
+- 安装 Arch 系统包 `uv`、`rsync`、`git`、`ffmpeg`、`libsndfile`。
 - 创建 Python 3.12 uv 环境并执行 `uv sync --frozen`。
 - 运行 `pytest` 和 `mypy`。
-- 安装 `requirements/wsl-gpu-cu128.txt` 中固定的 CUDA 12.8 Qwen 运行时依赖。
-- 校验 `torch==2.11.0+cu128`、CUDA 可用和 `qwen_asr` 可导入。
-- 跑一次 `Qwen/Qwen3-ASR-0.6B` + `test-fixtures/audio/test_short.wav` 的 `transformers` 后端 smoke。
+- 安装 `requirements/wsl-gpu-cu128.txt` 中固定的 CUDA 12.8 torch 和 HF native Qwen 运行时依赖。
+- 校验 `torch==2.11.0+cu128`、CUDA 可用和 Transformers HF native Qwen 类可导入。
+- 跑一次 `Qwen/Qwen3-ASR-0.6B-hf` + `test-fixtures/audio/test_short.wav` 的 `transformers` 后端 smoke。
 - 安装并启动 `systemd --user` 服务 `asr-server.service`。
 - 常驻服务通过 `/home/fragt/services/asr-server/.venv/bin/uvicorn` 直接启动，避免 `uv run` 在 systemd 或 Windows 任务计划程序启动时联网同步依赖，导致服务没有监听 `18080`。
 - 常驻服务默认设置 `ASR_IDLE_UNLOAD_SECONDS=180`，转录完成后 3 分钟无新增同模型请求就自动卸载模型并释放 CUDA cache。
@@ -78,13 +78,17 @@ deploy/wsl-deploy.sh --mock
 
 ## GPU 运行时依赖
 
-WSL 侧真实 Qwen3-ASR 运行时统一使用这组 PyTorch CUDA 版本：
+WSL 侧真实 Qwen3-ASR 运行时统一使用这组 PyTorch CUDA 与 HF native 依赖：
 
 ```text
 torch==2.11.0+cu128
 torchvision==0.26.0+cu128
 torchaudio==2.11.0+cu128
-qwen-asr==0.0.6
+transformers
+accelerate
+safetensors
+soundfile
+librosa
 numba==0.65.1
 llvmlite==0.47.0
 ```
@@ -95,14 +99,14 @@ llvmlite==0.47.0
 uv pip install --torch-backend cu128 -r requirements/wsl-gpu-cu128.txt
 ```
 
-不要裸跑 `pip install torch`，也不要让 `qwen-asr` 安装过程把 torch 升级到另一组 CUDA wheel。安装后必须验收：
+不要裸跑 `pip install torch`，也不要让模型相关依赖把 torch 替换成 CPU wheel。安装后必须验收：
 
 ```bash
 uv run python - <<'PY'
 import torch
 import torchvision
 import torchaudio
-import qwen_asr
+import transformers
 
 print("torch:", torch.__version__)
 print("torch cuda:", torch.version.cuda)
@@ -114,7 +118,10 @@ print("device:", torch.cuda.get_device_name(0))
 print("capability:", torch.cuda.get_device_capability(0))
 print("torchvision:", torchvision.__version__)
 print("torchaudio:", torchaudio.__version__)
-print("qwen_asr import ok:", qwen_asr.Qwen3ASRModel)
+print("transformers:", transformers.__version__)
+assert hasattr(transformers, "AutoProcessor")
+assert hasattr(transformers, "AutoModelForMultimodalLM")
+print("HF native Qwen classes import ok")
 PY
 ```
 
@@ -239,10 +246,10 @@ docs/validation-2026-06-29-wsl.md
 开发或启用真实 adapter 前，先跑：
 
 ```bash
-uv run python scripts/qwen_asr_backend_smoke.py --backend transformers --model Qwen/Qwen3-ASR-0.6B --audio test-fixtures/audio/test_short.wav
+uv run python scripts/qwen_asr_backend_smoke.py --backend transformers --model Qwen/Qwen3-ASR-0.6B-hf --audio test-fixtures/audio/test_short.wav
 ```
 
-`transformers` 后端返回非空文本后，再接入或启用服务端真实 adapter。第一版不在 `/v1/models` 中声明 `vllm`。
+默认 `transformers` smoke 走 HF native `AutoProcessor` + `AutoModelForMultimodalLM`。返回非空文本后，再接入或启用服务端真实 adapter。第一版不在 `/v1/models` 中声明 `vllm`。
 
 ## HTTP smoke test
 

@@ -102,9 +102,10 @@ The job manager is in-memory and process-local:
 The service can run with two adapter modes:
 
 - `ASR_ADAPTER=mock` is the default local development mode and does not require
-  CUDA, torch, qwen-asr, or a model cache.
+  CUDA, torch, Transformers, or a model cache.
 - `ASR_ADAPTER=qwen` uses the lazy Qwen adapter and requires the WSL CUDA torch
-  environment and `qwen-asr` package to be installed and validated separately.
+  environment plus HF native Transformers dependencies to be installed and
+  validated separately.
 
 The public model list is the same shape in both modes. Successful real Qwen
 transcription requires the WSL GPU environment, not just the existence of
@@ -116,8 +117,8 @@ These items must not be described as available capabilities:
 
 - WebSocket streaming transcription. No
   `/v1/audio/transcriptions/stream` route is registered.
-- vLLM as a declared first-release backend. The adapter contains a future vLLM
-  branch, but the registry does not declare `vllm`; requests for it return
+- vLLM as a declared first-release backend. The registry does not declare
+  `vllm`; requests for it return
   `422 capability_not_supported`.
 - Timestamps. `timestamps=word` and `timestamps=char` return
   `422 capability_not_supported`.

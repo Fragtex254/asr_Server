@@ -12,7 +12,7 @@ QWEN_BATCH_SIZE="${ASR_QWEN_BATCH_SIZE:-1}"
 IDLE_UNLOAD_SECONDS="${ASR_IDLE_UNLOAD_SECONDS:-180}"
 HF_HUB_OFFLINE="${ASR_HF_HUB_OFFLINE:-1}"
 TRANSFORMERS_OFFLINE="${ASR_TRANSFORMERS_OFFLINE:-1}"
-SMOKE_MODEL_REPO="${ASR_SMOKE_MODEL_REPO:-Qwen/Qwen3-ASR-0.6B}"
+SMOKE_MODEL_REPO="${ASR_SMOKE_MODEL_REPO:-Qwen/Qwen3-ASR-0.6B-hf}"
 SMOKE_AUDIO="${ASR_SMOKE_AUDIO:-test-fixtures/audio/test_short.wav}"
 
 SYNC_SOURCE=1
@@ -34,10 +34,10 @@ Usage:
 
 Default behavior:
   - sync this repo to /home/fragt/services/asr-server
-  - install Arch packages: uv, rsync, ffmpeg, libsndfile
+  - install Arch packages: uv, rsync, git, ffmpeg, libsndfile
   - create Python 3.12 uv environment
   - run pytest and mypy
-  - install pinned CUDA 12.8 Qwen runtime dependencies
+  - install pinned CUDA 12.8 torch plus HF native Qwen runtime dependencies
   - assert torch is CUDA-enabled
   - run minimal Qwen3-ASR transformers backend smoke
   - install and start the systemd user service on 0.0.0.0:18080
@@ -58,7 +58,7 @@ Options:
   --skip-cuda-check             Do not run torch CUDA validation
   --install-silero              Install optional silero-vad package
   --skip-qwen-backend-smoke     Do not run scripts/qwen_asr_backend_smoke.py
-  --smoke-model REPO            Qwen smoke model repo. Default: Qwen/Qwen3-ASR-0.6B
+  --smoke-model REPO            Qwen smoke model repo. Default: Qwen/Qwen3-ASR-0.6B-hf
   --smoke-audio PATH            Qwen smoke audio path. Default: test-fixtures/audio/test_short.wav
   --online-service              Allow the systemd service to contact Hugging Face while loading models
   --no-enable-service           Do not install or enable systemd user service
@@ -201,13 +201,14 @@ install_system_packages() {
 
   if command -v pacman >/dev/null 2>&1; then
     log "installing Arch system packages"
-    sudo pacman -Syu --needed --noconfirm uv rsync ffmpeg libsndfile
+    sudo pacman -Syu --needed --noconfirm uv rsync git ffmpeg libsndfile
     return
   fi
 
   log "pacman not found; checking required commands"
   command -v uv >/dev/null 2>&1 || die "uv is required"
   command -v rsync >/dev/null 2>&1 || die "rsync is required when sync is enabled"
+  command -v git >/dev/null 2>&1 || die "git is required to install Transformers main"
   command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is required"
 }
 
@@ -281,7 +282,7 @@ install_gpu_runtime() {
     log "checking NVIDIA visibility"
     nvidia-smi
 
-    log "installing pinned CUDA 12.8 Qwen runtime dependencies"
+    log "installing pinned CUDA 12.8 torch and HF native Qwen runtime dependencies"
     uv pip install --torch-backend cu128 -r requirements/wsl-gpu-cu128.txt
   fi
 
@@ -303,7 +304,7 @@ run_cuda_check() {
 import torch
 import torchvision
 import torchaudio
-import qwen_asr
+import transformers
 
 print("torch:", torch.__version__)
 print("torch cuda:", torch.version.cuda)
@@ -315,7 +316,10 @@ print("device:", torch.cuda.get_device_name(0))
 print("capability:", torch.cuda.get_device_capability(0))
 print("torchvision:", torchvision.__version__)
 print("torchaudio:", torchaudio.__version__)
-print("qwen_asr import ok:", qwen_asr.Qwen3ASRModel)
+print("transformers:", transformers.__version__)
+assert hasattr(transformers, "AutoProcessor"), "transformers missing AutoProcessor"
+assert hasattr(transformers, "AutoModelForMultimodalLM"), "transformers missing AutoModelForMultimodalLM"
+print("HF native Qwen classes import ok")
 PY
 }
 

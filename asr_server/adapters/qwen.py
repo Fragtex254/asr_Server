@@ -4,9 +4,10 @@ import gc
 import importlib
 import logging
 import multiprocessing
-import os
+import signal
 import tempfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from pathlib import Path
 from time import perf_counter
@@ -17,13 +18,14 @@ from asr_server.errors import AsrError
 
 
 MODEL_REPOS = {
-    "qwen3-asr-0.6b": "Qwen/Qwen3-ASR-0.6B",
-    "qwen3-asr-1.7b": "Qwen/Qwen3-ASR-1.7B",
+    "qwen3-asr-0.6b": "Qwen/Qwen3-ASR-0.6B-hf",
+    "qwen3-asr-1.7b": "Qwen/Qwen3-ASR-1.7B-hf",
 }
 logger = logging.getLogger(__name__)
 
 
 def _qwen_worker_main(conn: Connection, model_id: str) -> None:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     backend = _QwenWorkerBackend(model_id)
     try:
         while True:
@@ -280,33 +282,25 @@ class _QwenWorkerBackend:
         self._model: Any | None = None
 
     async def load(self, backend: str, device: str, dtype: str, max_new_tokens: int | None = None) -> None:
-        del dtype
-        if device != "cuda":
-            raise AsrError(422, "capability_not_supported", "Qwen adapter requires device=cuda")
-        self._assert_cuda_torch()
-        qwen_asr = self._import_qwen_asr()
+        if device not in {"cuda", "cuda:0"}:
+            raise AsrError(422, "capability_not_supported", "Qwen HF native adapter requires device=cuda or cuda:0")
+        if backend != "transformers":
+            raise AsrError(422, "capability_not_supported", f"unsupported Qwen backend: {backend}")
+        torch = self._assert_cuda_torch()
+        torch_dtype = self._resolve_torch_dtype(torch, dtype)
+        processor_cls, model_cls = self._import_hf_native_transformers()
         repo_id = MODEL_REPOS[self.model_id]
+        if self._model is not None:
+            await self.unload(cuda_empty_cache=True)
         try:
-            if backend == "transformers":
-                load_kwargs: dict[str, Any] = {
-                    "device_map": "cuda:0",
-                    "max_inference_batch_size": 1,
-                }
-                if max_new_tokens is not None:
-                    load_kwargs["max_new_tokens"] = max_new_tokens
-                self._model = qwen_asr.Qwen3ASRModel.from_pretrained(repo_id, **load_kwargs)
-            elif backend == "vllm":
-                self._configure_vllm_environment()
-                llm_kwargs: dict[str, Any] = {
-                    "model": repo_id,
-                    "gpu_memory_utilization": float(os.getenv("ASR_QWEN_VLLM_GPU_MEMORY_UTILIZATION", "0.9")),
-                    "max_inference_batch_size": 1,
-                }
-                max_model_len = os.getenv("ASR_QWEN_VLLM_MAX_MODEL_LEN", "32768")
-                llm_kwargs["max_model_len"] = int(max_model_len)
-                self._model = qwen_asr.Qwen3ASRModel.LLM(**llm_kwargs)
-            else:
-                raise AsrError(422, "capability_not_supported", f"unsupported Qwen backend: {backend}")
+            processor = processor_cls.from_pretrained(repo_id)
+            model = model_cls.from_pretrained(repo_id, dtype=torch_dtype).to(device).eval()
+            self._model = _HfNativeQwenModel(
+                processor=processor,
+                model=model,
+                torch=torch,
+                max_new_tokens=max_new_tokens,
+            )
         except AsrError:
             raise
         except Exception as exc:
@@ -348,6 +342,8 @@ class _QwenWorkerBackend:
             transcribe_kwargs: dict[str, Any] = {"audio": str(audio_path), "language": qwen_language}
             if context:
                 transcribe_kwargs["context"] = context
+            if max_new_tokens is not None:
+                transcribe_kwargs["max_new_tokens"] = max_new_tokens
             try:
                 results = self._transcribe_model(model, transcribe_kwargs)
             except Exception as exc:
@@ -364,7 +360,7 @@ class _QwenWorkerBackend:
                 text=text,
                 duration=max(len(audio) / 16_000, 0.01),
                 language=detected_language,
-                warnings=[],
+                warnings=self._result_warnings(first),
                 timings=TranscriptionTimings(
                     inference_ms=inference_ms,
                     postprocess_ms=postprocess_ms,
@@ -394,15 +390,20 @@ class _QwenWorkerBackend:
                     audio_file.write(audio)
                     audio_paths.append(Path(audio_file.name))
             qwen_language = None if language == "auto" else language
-            transcribe_kwargs: dict[str, Any] = {
-                "audio": [str(audio_path) for audio_path in audio_paths],
-                "language": [qwen_language] * len(audio_paths),
-            }
-            if context:
-                transcribe_kwargs["context"] = [context] * len(audio_paths)
             inference_started = perf_counter()
             try:
-                results = self._transcribe_model(model, transcribe_kwargs)
+                results = [
+                    self._transcribe_model(
+                        model,
+                        {
+                            "audio": str(audio_path),
+                            "language": qwen_language,
+                            "context": context,
+                            "max_new_tokens": max_new_tokens,
+                        },
+                    )[0]
+                    for audio_path in audio_paths
+                ]
             except Exception as exc:
                 raise self._map_qwen_exception(exc, phase="inference", model_id=self.model_id) from exc
             inference_ms = (perf_counter() - inference_started) * 1000
@@ -419,7 +420,7 @@ class _QwenWorkerBackend:
                     text=self._non_empty_text(result),
                     duration=max(len(audio) / 16_000, 0.01),
                     language=self._result_language(result) or ("zh" if language == "auto" else language),
-                    warnings=[],
+                    warnings=self._result_warnings(result),
                     timings=TranscriptionTimings(
                         inference_ms=inference_ms / len(audio_chunks) if audio_chunks else 0.0,
                         postprocess_ms=0.0,
@@ -448,17 +449,36 @@ class _QwenWorkerBackend:
             for audio_path in audio_paths:
                 audio_path.unlink(missing_ok=True)
 
-    def _import_qwen_asr(self) -> Any:
+    def _import_hf_native_transformers(self) -> tuple[Any, Any]:
         try:
-            return importlib.import_module("qwen_asr")
+            transformers = importlib.import_module("transformers")
         except ModuleNotFoundError as exc:
             raise AsrError(
                 503,
                 "gpu_unavailable",
-                "qwen_asr is not installed; install qwen-asr in WSL after CUDA torch validation",
+                "transformers is not installed; install HF native dependencies in WSL after CUDA torch validation",
             ) from exc
+        processor_cls = getattr(transformers, "AutoProcessor", None)
+        model_cls = getattr(transformers, "AutoModelForMultimodalLM", None)
+        if processor_cls is None or model_cls is None:
+            raise AsrError(
+                503,
+                "model_dependency_unavailable",
+                "installed transformers does not provide Qwen3-ASR HF native classes; install a newer release or transformers main",
+                {
+                    "missing": [
+                        name
+                        for name, value in (
+                            ("AutoProcessor", processor_cls),
+                            ("AutoModelForMultimodalLM", model_cls),
+                        )
+                        if value is None
+                    ]
+                },
+            )
+        return processor_cls, model_cls
 
-    def _assert_cuda_torch(self) -> None:
+    def _assert_cuda_torch(self) -> Any:
         try:
             torch = importlib.import_module("torch")
         except ModuleNotFoundError as exc:
@@ -467,11 +487,20 @@ class _QwenWorkerBackend:
             raise AsrError(503, "gpu_unavailable", "installed torch is CPU-only")
         if not torch.cuda.is_available():
             raise AsrError(503, "gpu_unavailable", "torch cannot access CUDA")
+        return torch
 
-    def _configure_vllm_environment(self) -> None:
-        os.environ.setdefault("VLLM_HOST_IP", "127.0.0.1")
-        os.environ.setdefault("NCCL_SOCKET_IFNAME", "lo")
-        os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    def _resolve_torch_dtype(self, torch: Any, dtype: str) -> Any:
+        normalized = dtype.lower()
+        if normalized == "auto" or normalized in {"bfloat16", "bf16"}:
+            return torch.bfloat16
+        if normalized in {"float16", "fp16"}:
+            return torch.float16
+        raise AsrError(
+            422,
+            "capability_not_supported",
+            "Qwen HF native adapter supports dtype=auto, bfloat16/bf16, or float16/fp16",
+            {"dtype": dtype},
+        )
 
     def _transcribe_model(self, model: Any, transcribe_kwargs: dict[str, Any]) -> Any:
         try:
@@ -562,6 +591,12 @@ class _QwenWorkerBackend:
             return language
         return str(language)
 
+    def _result_warnings(self, result: Any) -> list[str]:
+        warnings = getattr(result, "warnings", [])
+        if not isinstance(warnings, list):
+            return [str(warnings)]
+        return [str(warning) for warning in warnings]
+
     def _first_result(self, results: Any) -> Any:
         try:
             first = results[0]
@@ -586,3 +621,56 @@ class _QwenWorkerBackend:
         ):
             return AsrError(503, "model_download_failed", "Qwen model download or resolution failed", details)
         return AsrError(503, "inference_failed", f"Qwen {phase} failed", details)
+
+
+@dataclass(frozen=True)
+class _QwenTranscriptionItem:
+    text: str
+    language: str
+    warnings: list[str]
+
+
+class _HfNativeQwenModel:
+    """Small adapter around the Qwen3-ASR Transformers native helper API."""
+
+    def __init__(self, *, processor: Any, model: Any, torch: Any, max_new_tokens: int | None) -> None:
+        self.processor = processor
+        self.model = model
+        self.torch = torch
+        self.max_new_tokens = max_new_tokens
+
+    def transcribe(self, **kwargs: object) -> list[_QwenTranscriptionItem]:
+        audio = kwargs.get("audio")
+        if not isinstance(audio, str):
+            raise TypeError("HF native Qwen transcription expects one audio path")
+        language_value = kwargs.get("language")
+        language = language_value if isinstance(language_value, str) else None
+        request_max_new_tokens = kwargs.get("max_new_tokens")
+        max_new_tokens = request_max_new_tokens if isinstance(request_max_new_tokens, int) else self.max_new_tokens
+        if max_new_tokens is None:
+            max_new_tokens = 512
+        context = kwargs.get("context")
+        warnings: list[str] = []
+        if isinstance(context, str) and context:
+            warnings.append("context is not applied by the HF native transcription helper")
+
+        apply_request = getattr(self.processor, "apply_transcription_request", None)
+        if not callable(apply_request):
+            raise RuntimeError("processor.apply_transcription_request is unavailable")
+        inputs = apply_request(audio=audio, language=language)
+        inputs = inputs.to(self.model.device, self.model.dtype)
+        output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        generated_ids = output_ids[:, inputs["input_ids"].shape[1] :]
+        parsed_items = self.processor.decode(generated_ids, return_format="parsed")
+        return [self._item_from_parsed(item, warnings=warnings) for item in parsed_items]
+
+    def _item_from_parsed(self, parsed: object, *, warnings: list[str]) -> _QwenTranscriptionItem:
+        if isinstance(parsed, dict):
+            text = parsed.get("transcription", parsed.get("text", ""))
+            language = parsed.get("language", "")
+            return _QwenTranscriptionItem(
+                text=text if isinstance(text, str) else str(text),
+                language=language if isinstance(language, str) else str(language),
+                warnings=warnings,
+            )
+        return _QwenTranscriptionItem(text=str(parsed), language="", warnings=warnings)

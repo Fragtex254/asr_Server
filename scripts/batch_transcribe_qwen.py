@@ -4,6 +4,7 @@ import argparse
 import importlib
 import sys
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -63,6 +64,41 @@ def result_time_stamps(result: object) -> Any:
     return getattr(result, "time_stamps", None)
 
 
+@dataclass(frozen=True)
+class HfNativeBatchResult:
+    text: str
+    language: str
+    time_stamps: None = None
+
+
+class HfNativeBatchModel:
+    def __init__(self, *, processor: Any, model: Any, torch: Any) -> None:
+        self.processor = processor
+        self.model = model
+        self.torch = torch
+
+    def transcribe(self, *, audio: str, language: str | None) -> list[HfNativeBatchResult]:
+        apply_request = getattr(self.processor, "apply_transcription_request", None)
+        if not callable(apply_request):
+            raise RuntimeError("processor.apply_transcription_request is unavailable")
+        inputs = apply_request(audio=audio, language=language).to(self.model.device, self.model.dtype)
+        with self.torch.inference_mode():
+            output_ids = self.model.generate(**inputs, max_new_tokens=4096, do_sample=False)
+        generated_ids = output_ids[:, inputs["input_ids"].shape[1] :]
+        parsed_items = self.processor.decode(generated_ids, return_format="parsed")
+        return [self._result_from_parsed(item) for item in parsed_items]
+
+    def _result_from_parsed(self, parsed: object) -> HfNativeBatchResult:
+        if isinstance(parsed, dict):
+            text = parsed.get("transcription", parsed.get("text", ""))
+            language = parsed.get("language", "")
+            return HfNativeBatchResult(
+                text=text if isinstance(text, str) else str(text),
+                language=language if isinstance(language, str) else str(language),
+            )
+        return HfNativeBatchResult(text=str(parsed), language="")
+
+
 def assert_cuda_runtime() -> None:
     torch = importlib.import_module("torch")
     print("torch:", torch.__version__)
@@ -81,16 +117,15 @@ def assert_cuda_runtime() -> None:
 def load_model(model_id: str) -> Any:
     print(f"loading model: {model_id}", flush=True)
     torch = importlib.import_module("torch")
-    qwen_asr: Any = importlib.import_module("qwen_asr")
-    model = qwen_asr.Qwen3ASRModel.from_pretrained(
-        model_id,
-        dtype=torch.bfloat16,
-        device_map="cuda:0",
-        max_inference_batch_size=1,
-        max_new_tokens=4096,
-    )
+    transformers = importlib.import_module("transformers")
+    processor_cls = getattr(transformers, "AutoProcessor", None)
+    model_cls = getattr(transformers, "AutoModelForMultimodalLM", None)
+    if processor_cls is None or model_cls is None:
+        raise RuntimeError("installed transformers does not provide Qwen3-ASR HF native classes")
+    processor = processor_cls.from_pretrained(model_id)
+    model = model_cls.from_pretrained(model_id, dtype=torch.bfloat16).to("cuda").eval()
     print("model loaded", flush=True)
-    return model
+    return HfNativeBatchModel(processor=processor, model=model, torch=torch)
 
 
 def output_prefix_for(audio_path: Path, output_suffix: str) -> Path:
@@ -196,7 +231,7 @@ def transcribe_audio_file(
     markdown_path.write_text(
         "\n".join(
             [
-                f"# {audio_path.name} Qwen3-ASR 1.7B Transformers Transcript",
+                f"# {audio_path.name} Qwen3-ASR 1.7B HF Native Transformers Transcript",
                 "",
                 *[f"- {key}: {value}" for key, value in metadata.items()],
                 "",
@@ -226,8 +261,8 @@ def transcribe_audio_file(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Batch transcribe audio files with Qwen3-ASR transformers.")
     parser.add_argument("directory", type=Path)
-    parser.add_argument("--model", default="Qwen/Qwen3-ASR-1.7B")
-    parser.add_argument("--output-suffix", default=".qwen3-asr-1_7b")
+    parser.add_argument("--model", default="Qwen/Qwen3-ASR-1.7B-hf")
+    parser.add_argument("--output-suffix", default=".qwen3-asr-1_7b-hf")
     parser.add_argument("--max-chunk-seconds", type=float, default=120.0)
     parser.add_argument("--overlap-seconds", type=float, default=2.0)
     return parser.parse_args()

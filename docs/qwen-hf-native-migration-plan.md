@@ -196,7 +196,7 @@ PY
 
 - 默认模型改为 `Qwen/Qwen3-ASR-0.6B-hf`。
 - 新增或改造 `--backend transformers` 路径为 HF native `AutoProcessor` + `AutoModelForMultimodalLM`。
-- 可以临时保留旧 `qwen-asr` 包路径，但必须通过参数显式启用，例如 `--loader qwen-asr`；默认不再走旧路径。
+- 不保留旧 `qwen-asr` 包加载入口；真实 smoke 只走 HF native。
 - 输出至少包含：
   - model repo ID
   - backend
@@ -294,7 +294,7 @@ uv run pytest -q
 2. 将 `transformers` 后端实现替换为 HF native 加载和生成路径。
 3. 保持 worker 子进程 IPC payload 不变。
 4. 保持 `TranscriptionResult` 对外字段不变。
-5. 如保留旧 qwen-asr 包路径，必须隐藏在显式实验配置后面，不作为默认路径。
+5. 删除旧 qwen-asr 包加载入口，不作为真实 adapter 或 smoke 的可选路径。
 
 ### Phase 3：测试
 

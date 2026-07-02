@@ -5,7 +5,7 @@ HOST="${ASR_HOST:-0.0.0.0}"
 PORT="${ASR_PORT:-18080}"
 BASE_URL="${ASR_BASE_URL:-http://127.0.0.1:${PORT}}"
 RUN_QWEN_BACKEND_SMOKE="${ASR_RUN_QWEN_BACKEND_SMOKE:-0}"
-MODEL_REPO="${ASR_SMOKE_MODEL_REPO:-Qwen/Qwen3-ASR-0.6B}"
+MODEL_REPO="${ASR_SMOKE_MODEL_REPO:-Qwen/Qwen3-ASR-0.6B-hf}"
 AUDIO="${ASR_SMOKE_AUDIO:-test-fixtures/audio/test_short.wav}"
 
 cleanup() {

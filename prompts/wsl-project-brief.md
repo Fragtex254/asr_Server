@@ -111,7 +111,7 @@ PY
 ```bash
 uv run python scripts/qwen_asr_backend_smoke.py \
   --backend transformers \
-  --model Qwen/Qwen3-ASR-0.6B \
+  --model Qwen/Qwen3-ASR-0.6B-hf \
   --audio test-fixtures/audio/test_short.wav \
   --language auto
 ```
@@ -129,7 +129,7 @@ uv run python scripts/qwen_asr_backend_smoke.py \
 3. `uv run pytest -q`
 4. `uv run mypy asr_server tests scripts`
 5. 验证 CUDA 版 torch。
-6. 安装并验收 `qwen-asr`。
+6. 安装并验收 HF native Transformers 依赖。
 7. 跑通 `scripts/qwen_asr_backend_smoke.py --backend transformers`。
 8. 启动真实服务：`ASR_ADAPTER=qwen uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080`
 9. 运行：`ASR_BASE_URL=http://127.0.0.1:18080 uv run pytest tests/test_http_smoke.py -q`

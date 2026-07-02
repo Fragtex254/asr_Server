@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from asr_server.adapters.qwen import QwenAsrAdapter, _QwenWorkerBackend
+from asr_server.adapters.qwen import MODEL_REPOS, QwenAsrAdapter, _QwenWorkerBackend
 from asr_server.errors import AsrError
 
 
@@ -86,6 +86,130 @@ class ModelWithInnerModule(CleanupModel):
 class FailingCleanupModel:
     def close(self) -> None:
         raise RuntimeError("close failed")
+
+
+class FakeHfInputs(dict[str, Any]):
+    def to(self, device: str, dtype: object) -> "FakeHfInputs":
+        self["device"] = device
+        self["dtype"] = dtype
+        return self
+
+
+def test_qwen_model_repos_use_hf_native_checkpoints() -> None:
+    assert MODEL_REPOS == {
+        "qwen3-asr-0.6b": "Qwen/Qwen3-ASR-0.6B-hf",
+        "qwen3-asr-1.7b": "Qwen/Qwen3-ASR-1.7B-hf",
+    }
+
+
+async def test_qwen_load_uses_hf_native_transformers_without_qwen_asr(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class FakeProcessor:
+        @classmethod
+        def from_pretrained(cls, repo_id: str) -> "FakeProcessor":
+            calls.append(("processor_repo", repo_id))
+            return cls()
+
+        def apply_transcription_request(self, *, audio: str, language: str | None) -> FakeHfInputs:
+            calls.append(("audio", audio))
+            calls.append(("language", language))
+            return FakeHfInputs(input_ids=SimpleNamespace(shape=[1, 2]))
+
+        def decode(self, generated_ids: object, return_format: str) -> list[dict[str, str]]:
+            del generated_ids
+            calls.append(("return_format", return_format))
+            return [{"language": "English", "transcription": "hello"}]
+
+    class FakeModel:
+        device = "cuda"
+        dtype = "bf16"
+
+        @classmethod
+        def from_pretrained(cls, repo_id: str, *, dtype: object) -> "FakeModel":
+            calls.append(("model_repo", repo_id))
+            calls.append(("dtype", dtype))
+            return cls()
+
+        def to(self, device: str) -> "FakeModel":
+            calls.append(("device", device))
+            return self
+
+        def eval(self) -> "FakeModel":
+            calls.append(("eval", True))
+            return self
+
+        def generate(self, **kwargs: object) -> object:
+            calls.append(("generate", kwargs["max_new_tokens"]))
+
+            class FakeOutput:
+                def __getitem__(self, key: object) -> str:
+                    calls.append(("slice", key))
+                    return "generated"
+
+            return FakeOutput()
+
+    fake_torch = SimpleNamespace(
+        bfloat16="bf16",
+        float16="fp16",
+        version=SimpleNamespace(cuda="12.8"),
+        cuda=SimpleNamespace(is_available=lambda: True),
+    )
+    fake_transformers = SimpleNamespace(AutoProcessor=FakeProcessor, AutoModelForMultimodalLM=FakeModel)
+
+    def fake_import_module(name: str) -> Any:
+        if name == "torch":
+            return fake_torch
+        if name == "transformers":
+            return fake_transformers
+        if name == "qwen_asr":
+            raise AssertionError("HF native load must not import qwen_asr")
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr("asr_server.adapters.qwen.importlib.import_module", fake_import_module)
+    adapter = _QwenWorkerBackend("qwen3-asr-0.6b")
+
+    await adapter.load("transformers", "cuda", "auto", max_new_tokens=123)
+    result = await adapter.transcribe(
+        b"audio",
+        model_id="qwen3-asr-0.6b",
+        backend="transformers",
+        language="auto",
+        context="domain terms",
+        max_new_tokens=77,
+    )
+
+    assert result.text == "hello"
+    assert result.language == "English"
+    assert result.warnings == ["context is not applied by the HF native transcription helper"]
+    assert ("processor_repo", "Qwen/Qwen3-ASR-0.6B-hf") in calls
+    assert ("model_repo", "Qwen/Qwen3-ASR-0.6B-hf") in calls
+    assert ("dtype", "bf16") in calls
+    assert ("device", "cuda") in calls
+    assert ("generate", 77) in calls
+
+
+async def test_qwen_load_rejects_unsupported_dtype(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_torch = SimpleNamespace(
+        bfloat16="bf16",
+        float16="fp16",
+        version=SimpleNamespace(cuda="12.8"),
+        cuda=SimpleNamespace(is_available=lambda: True),
+    )
+
+    def fake_import_module(name: str) -> Any:
+        if name == "torch":
+            return fake_torch
+        raise AssertionError(f"unexpected import after dtype rejection: {name}")
+
+    monkeypatch.setattr("asr_server.adapters.qwen.importlib.import_module", fake_import_module)
+    adapter = _QwenWorkerBackend("qwen3-asr-0.6b")
+
+    with pytest.raises(AsrError) as exc_info:
+        await adapter.load("transformers", "cuda", "float32")
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.code == "capability_not_supported"
 
 
 async def test_qwen_transcribe_maps_cuda_oom() -> None:

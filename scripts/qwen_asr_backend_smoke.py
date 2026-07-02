@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import argparse
 import importlib
-import os
 from pathlib import Path
 from typing import Any
 
 
-DEFAULT_MODEL = "Qwen/Qwen3-ASR-0.6B"
+DEFAULT_MODEL = "Qwen/Qwen3-ASR-0.6B-hf"
 DEFAULT_AUDIO = "test-fixtures/audio/test_short.wav"
 
 
@@ -29,76 +28,81 @@ def normalize_language(language: str) -> str | None:
     return None if language == "auto" else language
 
 
-def result_text(result: Any) -> str:
+def resolve_torch_dtype(torch: Any, dtype: str) -> Any:
+    normalized = dtype.lower()
+    if normalized == "auto" or normalized in {"bfloat16", "bf16"}:
+        return torch.bfloat16
+    if normalized in {"float16", "fp16"}:
+        return torch.float16
+    raise ValueError("dtype must be auto, bfloat16/bf16, or float16/fp16")
+
+
+def parsed_text(result: object) -> str:
+    if isinstance(result, dict):
+        text = result.get("transcription", result.get("text", ""))
+        return text if isinstance(text, str) else str(text)
     text = getattr(result, "text", "")
     if not isinstance(text, str):
         return str(text)
     return text
 
 
-def result_language(result: Any) -> str:
+def parsed_language(result: object) -> str:
+    if isinstance(result, dict):
+        language = result.get("language", "")
+        return language if isinstance(language, str) else str(language)
     language = getattr(result, "language", "")
     if not isinstance(language, str):
         return str(language)
     return language
 
 
-def run_transformers(args: argparse.Namespace) -> None:
+def print_result_summary(args: argparse.Namespace, *, language: str, text: str) -> None:
+    print("model:", args.model)
+    print("backend:", args.backend)
+    print("loader: hf-native")
+    print("output language:", language)
+    print("text first 200:", text[:200])
+    if not text.strip():
+        raise RuntimeError(f"hf-native {args.backend} 后端转录结果为空")
+
+
+def run_hf_native_transformers(args: argparse.Namespace) -> None:
     torch = require_cuda_torch()
-    qwen_asr = importlib.import_module("qwen_asr")
-    model_cls = qwen_asr.Qwen3ASRModel
-    model = model_cls.from_pretrained(
-        args.model,
-        dtype=torch.bfloat16,
-        device_map="cuda:0",
-        max_inference_batch_size=1,
-        max_new_tokens=args.max_new_tokens,
+    transformers = importlib.import_module("transformers")
+    print("transformers:", getattr(transformers, "__version__", "unknown"))
+    processor_cls = getattr(transformers, "AutoProcessor", None)
+    model_cls = getattr(transformers, "AutoModelForMultimodalLM", None)
+    if processor_cls is None or model_cls is None:
+        raise RuntimeError("当前 transformers 不包含 AutoProcessor/AutoModelForMultimodalLM；请升级 release 或安装 transformers main")
+    processor = processor_cls.from_pretrained(args.model)
+    model = model_cls.from_pretrained(args.model, dtype=resolve_torch_dtype(torch, args.dtype)).to(args.device).eval()
+    apply_request = getattr(processor, "apply_transcription_request", None)
+    if not callable(apply_request):
+        raise RuntimeError("processor.apply_transcription_request 不可用；停止，避免临时字符串 prompt 绕过")
+    inputs = apply_request(audio=str(args.audio), language=normalize_language(args.language)).to(model.device, model.dtype)
+    with torch.inference_mode():
+        output_ids = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False)
+    generated_ids = output_ids[:, inputs["input_ids"].shape[1] :]
+    parsed = processor.decode(generated_ids, return_format="parsed")[0]
+    print_result_summary(
+        args,
+        language=parsed_language(parsed),
+        text=parsed_text(parsed),
     )
-    results = model.transcribe(audio=str(args.audio), language=normalize_language(args.language))
-    first = results[0]
-    print("backend: transformers")
-    print("language:", result_language(first))
-    print("text:", result_text(first)[:500])
-    if not result_text(first).strip():
-        raise RuntimeError("transformers 后端转录结果为空")
-
-
-def run_vllm(args: argparse.Namespace) -> None:
-    require_cuda_torch()
-    os.environ.setdefault("VLLM_HOST_IP", "127.0.0.1")
-    os.environ.setdefault("NCCL_SOCKET_IFNAME", "lo")
-    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
-    qwen_asr = importlib.import_module("qwen_asr")
-    model_cls = qwen_asr.Qwen3ASRModel
-    llm_kwargs: dict[str, Any] = {
-        "model": args.model,
-        "gpu_memory_utilization": args.gpu_memory_utilization,
-        "max_inference_batch_size": 1,
-        "max_new_tokens": args.max_new_tokens,
-    }
-    if args.max_model_len is not None:
-        llm_kwargs["max_model_len"] = args.max_model_len
-    model = model_cls.LLM(**llm_kwargs)
-    results = model.transcribe(audio=str(args.audio), language=normalize_language(args.language))
-    first = results[0]
-    print("backend: vllm")
-    print("language:", result_language(first))
-    print("text:", result_text(first)[:500])
-    if not result_text(first).strip():
-        raise RuntimeError("vllm 后端转录结果为空")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="WSL 侧 Qwen3-ASR 最小后端验收脚本；先跑通它，再开发服务端 adapter。",
     )
-    parser.add_argument("--backend", required=True, choices=["transformers", "vllm"])
+    parser.add_argument("--backend", required=True, choices=["transformers"])
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--audio", type=Path, default=Path(DEFAULT_AUDIO))
     parser.add_argument("--language", default="auto")
+    parser.add_argument("--device", default="cuda", choices=["cuda", "cuda:0"])
+    parser.add_argument("--dtype", default="auto")
     parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--max-model-len", type=int, default=None)
     return parser.parse_args()
 
 
@@ -106,10 +110,7 @@ def main() -> None:
     args = parse_args()
     if not args.audio.exists():
         raise FileNotFoundError(args.audio)
-    if args.backend == "transformers":
-        run_transformers(args)
-        return
-    run_vllm(args)
+    run_hf_native_transformers(args)
 
 
 if __name__ == "__main__":

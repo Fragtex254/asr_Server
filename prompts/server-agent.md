@@ -62,7 +62,7 @@ cd /home/fragt/services/asr-server
 uv python install 3.12
 uv sync
 
-sudo pacman -Syu --needed ffmpeg libsndfile
+sudo pacman -Syu --needed git ffmpeg libsndfile
 
 nvidia-smi
 uv pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
@@ -79,16 +79,19 @@ print("capability:", torch.cuda.get_device_capability(0))
 PY
 ```
 
-只有上面的 CUDA 验收通过后，才能安装 Qwen3-ASR：
+只有上面的 CUDA 验收通过后，才能安装 HF native Qwen3-ASR 依赖：
 
 ```bash
-uv pip install -U qwen-asr
+uv pip install -U transformers accelerate safetensors soundfile librosa
 
 uv run python - <<'PY'
 import torch
+import transformers
 
-assert torch.version.cuda is not None, "qwen-asr 安装后 torch 变成 CPU 版"
-assert torch.cuda.is_available(), "qwen-asr 安装后 CUDA 不可用"
+assert torch.version.cuda is not None, "HF 依赖安装后 torch 变成 CPU 版"
+assert torch.cuda.is_available(), "HF 依赖安装后 CUDA 不可用"
+assert hasattr(transformers, "AutoProcessor")
+assert hasattr(transformers, "AutoModelForMultimodalLM")
 print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))
 PY
 ```
@@ -110,7 +113,7 @@ PY
 ```bash
 uv run python scripts/qwen_asr_backend_smoke.py \
   --backend transformers \
-  --model Qwen/Qwen3-ASR-0.6B \
+  --model Qwen/Qwen3-ASR-0.6B-hf \
   --audio test-fixtures/audio/test_short.wav \
   --language auto
 ```
@@ -193,7 +196,7 @@ README.md
 1. 阅读现有 Mac 侧实现和测试，保留 API 合约、错误信封、生命周期语义。
 2. 在 WSL Arch Linux 的 `/home/fragt/services/asr-server` 部署项目，不要放在 `/mnt/c`。
 3. 检查磁盘空间、CUDA、`nvidia-smi`、Python 3.12、uv。
-4. 先用 `scripts/qwen_asr_backend_smoke.py` 跑通 `transformers` 最小转录流程。
+4. 先用 `scripts/qwen_asr_backend_smoke.py` 跑通 HF native `transformers` 最小转录流程。
 5. 接入 Qwen3-ASR 适配器，真实跑通 `qwen3-asr-0.6b` 与 `qwen3-asr-1.7b`。
 6. 对 `/v1/models` 中声明的每个后端都做端到端转写验收；若某个后端不能跑通，不要声明它。
 7. 保持 mock 适配器测试可在无 GPU 环境通过。

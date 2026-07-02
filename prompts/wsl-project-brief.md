@@ -58,6 +58,12 @@ prompts/server-agent.md
 docs/validation-template.md
 ```
 
+如果任务是把 Qwen3-ASR 迁移到 Hugging Face Native Transformers 加载方式，还必须阅读：
+
+```text
+docs/qwen-hf-native-migration-plan.md
+```
+
 ## 初版范围
 
 初版只做 Qwen3-ASR 两个尺寸：
@@ -506,7 +512,7 @@ curl --noproxy '*' http://192.168.31.137:18080/v1/models
 - vLLM 后端。
 - WebSocket streaming。
 - ForcedAligner / word-char timestamps。
-- 原生 `*-hf` Transformers 加载路径。
+- 原生 `*-hf` Transformers 加载路径默认不进入常规维护范围；只有执行 `docs/qwen-hf-native-migration-plan.md` 时才进入范围。
 - MiMo。
 - Web UI。
 - Redis、Celery、数据库持久化队列。

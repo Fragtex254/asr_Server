@@ -26,6 +26,12 @@ docs/asr-server-prd.md
 prompts/wsl-project-brief.md
 ```
 
+如果当前任务是迁移 Qwen3-ASR 到 Hugging Face Native Transformers 加载方式，必须额外阅读并执行：
+
+```text
+docs/qwen-hf-native-migration-plan.md
+```
+
 技术约束：
 
 - 使用 Python 3.12。
@@ -193,7 +199,7 @@ README.md
 7. 保持 mock 适配器测试可在无 GPU 环境通过。
 8. 增加 systemd user service 或 Windows 启动任务，让服务可后台常驻。
 9. 从 Mac mini 验收局域网调用。
-10. 保持异步转录 job、FIFO 串行队列、轮询状态和 chunk 级真实进度稳定。不要做 vLLM、WebSocket streaming、MiMo、ForcedAligner、数据库队列、多 worker 并发推理或 `*-hf` 路径，除非 PRD 明确进入对应阶段。
+10. 保持异步转录 job、FIFO 串行队列、轮询状态和 chunk 级真实进度稳定。不要做 vLLM、WebSocket streaming、MiMo、ForcedAligner、数据库队列或多 worker 并发推理。`*-hf` 路径只在执行 `docs/qwen-hf-native-migration-plan.md` 时进入范围。
 
 测试命令：
 

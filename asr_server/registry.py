@@ -5,6 +5,7 @@ from typing import Literal
 
 Backend = Literal["auto", "transformers", "vllm"]
 ModelStatus = Literal["unloaded", "loading", "loaded", "unloading_scheduled", "unloading", "error"]
+MOSS_MODEL_ID = "moss-transcribe-diarize-0.9b"
 
 
 QWEN_LANGUAGES = [
@@ -76,6 +77,8 @@ class ModelCapabilities:
     languages: list[str]
     chinese_dialects: list[str]
     backends: list[str]
+    diarization: bool = False
+    segment_timestamps: bool = False
 
     def to_api(self) -> dict[str, object]:
         return {
@@ -86,6 +89,8 @@ class ModelCapabilities:
             "languages": self.languages,
             "chinese_dialects": self.chinese_dialects,
             "backends": self.backends,
+            "diarization": self.diarization,
+            "segment_timestamps": self.segment_timestamps,
         }
 
 
@@ -97,7 +102,11 @@ class ModelDefinition:
     capabilities: ModelCapabilities
 
 
-def default_models(default_model_id: str = "qwen3-asr-1.7b") -> dict[str, ModelDefinition]:
+def default_models(
+    default_model_id: str = "qwen3-asr-1.7b",
+    *,
+    enable_moss: bool = False,
+) -> dict[str, ModelDefinition]:
     if default_model_id not in {"qwen3-asr-1.7b", "qwen3-asr-0.6b"}:
         raise ValueError("ASR_DEFAULT_MODEL must be qwen3-asr-1.7b or qwen3-asr-0.6b")
     qwen_capabilities = ModelCapabilities(
@@ -109,7 +118,7 @@ def default_models(default_model_id: str = "qwen3-asr-1.7b") -> dict[str, ModelD
         chinese_dialects=QWEN_CHINESE_DIALECTS,
         backends=["transformers"],
     )
-    return {
+    models: dict[str, ModelDefinition] = {
         "qwen3-asr-1.7b": ModelDefinition(
             id="qwen3-asr-1.7b",
             provider="QwenLM",
@@ -123,3 +132,21 @@ def default_models(default_model_id: str = "qwen3-asr-1.7b") -> dict[str, ModelD
             capabilities=qwen_capabilities,
         ),
     }
+    if enable_moss:
+        models[MOSS_MODEL_ID] = ModelDefinition(
+            id=MOSS_MODEL_ID,
+            provider="OpenMOSS-Team",
+            default=False,
+            capabilities=ModelCapabilities(
+                transcription=True,
+                streaming=False,
+                timestamps=[],
+                forced_alignment=False,
+                languages=["auto", "zh", "en"],
+                chinese_dialects=[],
+                backends=["transformers"],
+                diarization=True,
+                segment_timestamps=True,
+            ),
+        )
+    return models

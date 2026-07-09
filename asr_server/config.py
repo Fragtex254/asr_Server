@@ -14,6 +14,7 @@ class Settings:
     public_base_url: str = "http://192.168.31.137:18080"
     default_model: str = "qwen3-asr-1.7b"
     adapter: AdapterMode = "mock"
+    enable_moss: bool = False
     qwen_batch_size: int = 1
     job_result_ttl_seconds: int = 3600
     idle_unload_seconds: float = 180.0
@@ -26,6 +27,7 @@ def load_settings() -> Settings:
     if adapter not in {"mock", "qwen"}:
         raise ValueError("ASR_ADAPTER must be 'mock' or 'qwen'")
     adapter_mode = cast(AdapterMode, adapter)
+    enable_moss = _env_bool("ASR_ENABLE_MOSS", default=False)
     qwen_batch_size = int(os.getenv("ASR_QWEN_BATCH_SIZE", "1"))
     if qwen_batch_size < 1:
         raise ValueError("ASR_QWEN_BATCH_SIZE must be greater than or equal to 1")
@@ -47,9 +49,22 @@ def load_settings() -> Settings:
         public_base_url=os.getenv("ASR_PUBLIC_BASE_URL", "http://192.168.31.137:18080"),
         default_model=os.getenv("ASR_DEFAULT_MODEL", "qwen3-asr-1.7b"),
         adapter=adapter_mode,
+        enable_moss=enable_moss,
         qwen_batch_size=qwen_batch_size,
         job_result_ttl_seconds=job_result_ttl_seconds,
         idle_unload_seconds=idle_unload_seconds,
         max_queued_jobs=max_queued_jobs,
         max_upload_mb=max_upload_mb,
     )
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    normalized = value.lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value")

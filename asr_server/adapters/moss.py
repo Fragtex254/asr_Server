@@ -15,18 +15,23 @@ from typing import Any
 
 from asr_server.adapters.base import TranscriptionResult, TranscriptionSegment, TranscriptionTimings
 from asr_server.errors import AsrError
+from asr_server.registry import MOSS_MODEL_ID
 
 
 MODEL_REPOS = {
-    "qwen3-asr-0.6b": "Qwen/Qwen3-ASR-0.6B-hf",
-    "qwen3-asr-1.7b": "Qwen/Qwen3-ASR-1.7B-hf",
+    MOSS_MODEL_ID: "OpenMOSS-Team/MOSS-Transcribe-Diarize",
 }
+DEFAULT_MOSS_PROMPT = (
+    "请将音频转写为文本，每一段需以起始时间戳和说话人编号"
+    "（[S01]、[S02]、[S03]…）开头，正文为对应的语音内容，"
+    "并在段末标注结束时间戳，以清晰标明该段语音范围。"
+)
 logger = logging.getLogger(__name__)
 
 
-def _qwen_worker_main(conn: Connection, model_id: str) -> None:
+def _moss_worker_main(conn: Connection, model_id: str) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    backend = _QwenWorkerBackend(model_id)
+    backend = _MossWorkerBackend(model_id)
     try:
         while True:
             request = conn.recv()
@@ -74,14 +79,14 @@ def _qwen_worker_main(conn: Connection, model_id: str) -> None:
                     _run_async(backend.unload(cuda_empty_cache=bool(request.get("cuda_empty_cache", True))))
                     conn.send({"id": request_id, "ok": True, "result": None})
                     return
-                raise AsrError(400, "bad_request", f"unknown Qwen worker operation: {op}")
+                raise AsrError(400, "bad_request", f"unknown MOSS worker operation: {op}")
             except AsrError as exc:
                 conn.send({"id": request_id, "ok": False, "error": _error_to_payload(exc)})
             except Exception as exc:
                 error = AsrError(
                     503,
                     "inference_failed",
-                    "Qwen worker operation failed",
+                    "MOSS worker operation failed",
                     {"operation": str(op), "error_type": type(exc).__name__, "message": str(exc)[-500:]},
                 )
                 conn.send({"id": request_id, "ok": False, "error": _error_to_payload(error)})
@@ -162,8 +167,8 @@ def _error_to_payload(error: AsrError) -> dict[str, object]:
     }
 
 
-class QwenAsrAdapter:
-    """Qwen3-ASR adapter with GPU work isolated in a child process."""
+class MossTranscribeDiarizeAdapter:
+    """MOSS-Transcribe-Diarize adapter with GPU work isolated in a child process."""
 
     def __init__(self, model_id: str) -> None:
         self.model_id = model_id
@@ -190,17 +195,17 @@ class QwenAsrAdapter:
             try:
                 self._request_on(conn, "shutdown", cuda_empty_cache=cuda_empty_cache)
             except AsrError as exc:
-                logger.warning("Qwen worker graceful shutdown failed: %s", exc.message)
+                logger.warning("MOSS worker graceful shutdown failed: %s", exc.message)
             except (BrokenPipeError, EOFError, OSError) as exc:
-                logger.warning("Qwen worker pipe closed during shutdown: %s", exc)
+                logger.warning("MOSS worker pipe closed during shutdown: %s", exc)
         if worker.is_alive():
             worker.join(timeout=10)
         if worker.is_alive():
-            logger.warning("Qwen worker did not exit after unload; terminating pid=%s", worker.pid)
+            logger.warning("MOSS worker did not exit after unload; terminating pid=%s", worker.pid)
             worker.terminate()
             worker.join(timeout=5)
         if worker.is_alive():
-            logger.warning("Qwen worker did not terminate cleanly; killing pid=%s", worker.pid)
+            logger.warning("MOSS worker did not terminate cleanly; killing pid=%s", worker.pid)
             worker.kill()
             worker.join(timeout=5)
         if conn is not None:
@@ -216,11 +221,11 @@ class QwenAsrAdapter:
         context: str,
         max_new_tokens: int | None,
     ) -> TranscriptionResult:
-        del model_id, backend
+        del model_id, backend, language
         payload = self._request(
             "transcribe",
             audio=audio,
-            language=language,
+            language="auto",
             context=context,
             max_new_tokens=max_new_tokens,
         )
@@ -236,11 +241,11 @@ class QwenAsrAdapter:
         context: str,
         max_new_tokens: int | None,
     ) -> list[TranscriptionResult]:
-        del model_id, backend
+        del model_id, backend, language
         payload = self._request(
             "transcribe_batch",
             audio_chunks=audio_chunks,
-            language=language,
+            language="auto",
             context=context,
             max_new_tokens=max_new_tokens,
         )
@@ -249,7 +254,7 @@ class QwenAsrAdapter:
     def _start_worker(self) -> None:
         parent_conn, child_conn = multiprocessing.get_context("spawn").Pipe()
         worker = multiprocessing.get_context("spawn").Process(
-            target=_qwen_worker_main,
+            target=_moss_worker_main,
             args=(child_conn, self.model_id),
             daemon=True,
         )
@@ -262,7 +267,7 @@ class QwenAsrAdapter:
         conn = self._conn
         worker = self._worker
         if conn is None or worker is None or not worker.is_alive():
-            raise AsrError(409, "model_loading", "Qwen worker is not running")
+            raise AsrError(409, "model_loading", "MOSS worker is not running")
         return self._request_on(conn, op, **payload)
 
     def _request_on(self, conn: Connection, op: str, **payload: object) -> Any:
@@ -271,55 +276,85 @@ class QwenAsrAdapter:
         conn.send({"id": request_id, "op": op, **payload})
         response = conn.recv()
         if response.get("id") != request_id:
-            raise AsrError(503, "inference_failed", "Qwen worker returned an unexpected response")
+            raise AsrError(503, "inference_failed", "MOSS worker returned an unexpected response")
         if response.get("ok"):
             return response.get("result")
         error = response.get("error", {})
         raise AsrError(
             int(error.get("status_code", 503)),
             str(error.get("code", "inference_failed")),
-            str(error.get("message", "Qwen worker failed")),
+            str(error.get("message", "MOSS worker failed")),
             dict(error.get("details", {})),
         )
 
 
-class _QwenWorkerBackend:
-    """In-process Qwen3-ASR backend used only inside the worker process."""
+@dataclass(frozen=True)
+class _MossHelpers:
+    default_prompt: str
+    build_transcription_messages: Any
+    generate_transcription: Any
+    parse_transcript: Any
+
+
+class _MossWorkerBackend:
+    """In-process MOSS backend used only inside the worker process."""
 
     def __init__(self, model_id: str) -> None:
         self.model_id = model_id
         self.loaded_backend: str | None = None
         self._model: Any | None = None
+        self._processor: Any | None = None
+        self._torch: Any | None = None
+        self._device: Any | None = None
+        self._dtype: Any | None = None
+        self._helpers: _MossHelpers | None = None
+        self._max_new_tokens: int | None = None
 
     async def load(self, backend: str, device: str, dtype: str, max_new_tokens: int | None = None) -> None:
+        if self.model_id not in MODEL_REPOS:
+            raise AsrError(404, "model_not_found", f"unknown MOSS model: {self.model_id}")
         if device not in {"cuda", "cuda:0"}:
-            raise AsrError(422, "capability_not_supported", "Qwen HF native adapter requires device=cuda or cuda:0")
+            raise AsrError(422, "capability_not_supported", "MOSS adapter requires device=cuda or cuda:0")
         if backend != "transformers":
-            raise AsrError(422, "capability_not_supported", f"unsupported Qwen backend: {backend}")
+            raise AsrError(422, "capability_not_supported", f"unsupported MOSS backend: {backend}")
         torch = self._assert_cuda_torch()
         torch_dtype = self._resolve_torch_dtype(torch, dtype)
-        processor_cls, model_cls = self._import_hf_native_transformers()
+        torch_device = torch.device(device)
+        processor_cls, model_cls = self._import_transformers()
+        helpers = self._import_moss_helpers()
         repo_id = MODEL_REPOS[self.model_id]
         if self._model is not None:
             await self.unload(cuda_empty_cache=True)
         try:
-            processor = processor_cls.from_pretrained(repo_id)
-            model = model_cls.from_pretrained(repo_id, dtype=torch_dtype).to(device).eval()
-            self._model = _HfNativeQwenModel(
-                processor=processor,
-                model=model,
-                torch=torch,
-                max_new_tokens=max_new_tokens,
+            model = (
+                model_cls.from_pretrained(repo_id, trust_remote_code=True, dtype="auto")
+                .to(dtype=torch_dtype)
+                .to(torch_device)
+                .eval()
             )
+            processor = processor_cls.from_pretrained(repo_id, trust_remote_code=True)
+            self._model = model
+            self._processor = processor
+            self._torch = torch
+            self._device = torch_device
+            self._dtype = torch_dtype
+            self._helpers = helpers
+            self._max_new_tokens = max_new_tokens
         except AsrError:
             raise
         except Exception as exc:
-            raise self._map_qwen_exception(exc, phase="load", model_id=repo_id) from exc
+            raise self._map_moss_exception(exc, phase="load", model_id=repo_id) from exc
         self.loaded_backend = backend
 
     async def unload(self, cuda_empty_cache: bool) -> None:
         model = self._model
         self._model = None
+        self._processor = None
+        self._torch = None
+        self._device = None
+        self._dtype = None
+        self._helpers = None
+        self._max_new_tokens = None
         self.loaded_backend = None
         if model is not None:
             self._move_model_to_cpu(model)
@@ -339,38 +374,46 @@ class _QwenWorkerBackend:
         context: str,
         max_new_tokens: int | None,
     ) -> TranscriptionResult:
-        del model_id, backend
+        del model_id, backend, language
         model = self._model
-        if model is None:
-            raise AsrError(409, "model_loading", "Qwen model is not loaded")
-        with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as audio_file:
+        processor = self._processor
+        helpers = self._helpers
+        if model is None or processor is None or helpers is None:
+            raise AsrError(409, "model_loading", "MOSS model is not loaded")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as audio_file:
             audio_file.write(audio)
             audio_path = Path(audio_file.name)
         try:
-            qwen_language = None if language == "auto" else language
             inference_started = perf_counter()
-            transcribe_kwargs: dict[str, Any] = {"audio": str(audio_path), "language": qwen_language}
-            if context:
-                transcribe_kwargs["context"] = context
-            if max_new_tokens is not None:
-                transcribe_kwargs["max_new_tokens"] = max_new_tokens
             try:
-                results = self._transcribe_model(model, transcribe_kwargs)
+                result = helpers.generate_transcription(
+                    model,
+                    processor,
+                    helpers.build_transcription_messages(
+                        str(audio_path),
+                        prompt=self._prompt_for_context(context, helpers.default_prompt),
+                    ),
+                    max_new_tokens=max_new_tokens or self._max_new_tokens or 2048,
+                    do_sample=False,
+                    device=self._device,
+                    dtype=self._dtype,
+                )
             except Exception as exc:
-                raise self._map_qwen_exception(exc, phase="inference", model_id=self.model_id) from exc
+                raise self._map_moss_exception(exc, phase="inference", model_id=self.model_id) from exc
             inference_ms = (perf_counter() - inference_started) * 1000
             postprocess_started = perf_counter()
-            first = self._first_result(results)
-            text = self._result_text(first)
-            if not text.strip():
-                raise AsrError(503, "inference_failed", "Qwen returned an empty transcription result")
-            detected_language = self._result_language(first) or ("zh" if language == "auto" else language)
+            raw_text = self._result_text(result)
+            if not raw_text.strip():
+                raise AsrError(503, "inference_failed", "MOSS returned an empty transcription result")
+            segments = self._parse_segments(raw_text, helpers)
+            text = "\n".join(segment.text for segment in segments) if segments else raw_text
             postprocess_ms = (perf_counter() - postprocess_started) * 1000
             return TranscriptionResult(
                 text=text,
                 duration=max(len(audio) / 16_000, 0.01),
-                language=detected_language,
-                warnings=self._result_warnings(first),
+                language="auto",
+                warnings=[],
+                segments=segments,
                 timings=TranscriptionTimings(
                     inference_ms=inference_ms,
                     postprocess_ms=postprocess_ms,
@@ -389,104 +432,19 @@ class _QwenWorkerBackend:
         context: str,
         max_new_tokens: int | None,
     ) -> list[TranscriptionResult]:
-        del model_id, backend
-        model = self._model
-        if model is None:
-            raise AsrError(409, "model_loading", "Qwen model is not loaded")
-        audio_paths: list[Path] = []
-        try:
-            for audio in audio_chunks:
-                with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as audio_file:
-                    audio_file.write(audio)
-                    audio_paths.append(Path(audio_file.name))
-            qwen_language = None if language == "auto" else language
-            inference_started = perf_counter()
-            try:
-                results = [
-                    self._transcribe_model(
-                        model,
-                        {
-                            "audio": str(audio_path),
-                            "language": qwen_language,
-                            "context": context,
-                            "max_new_tokens": max_new_tokens,
-                        },
-                    )[0]
-                    for audio_path in audio_paths
-                ]
-            except Exception as exc:
-                raise self._map_qwen_exception(exc, phase="inference", model_id=self.model_id) from exc
-            inference_ms = (perf_counter() - inference_started) * 1000
-            if len(results) != len(audio_chunks):
-                raise AsrError(
-                    503,
-                    "inference_failed",
-                    "Qwen batch transcription returned an unexpected result count",
-                    {"expected": len(audio_chunks), "actual": len(results)},
+        results = []
+        for audio in audio_chunks:
+            results.append(
+                await self.transcribe(
+                    audio,
+                    model_id=model_id,
+                    backend=backend,
+                    language=language,
+                    context=context,
+                    max_new_tokens=max_new_tokens,
                 )
-            postprocess_started = perf_counter()
-            transcriptions = [
-                TranscriptionResult(
-                    text=self._non_empty_text(result),
-                    duration=max(len(audio) / 16_000, 0.01),
-                    language=self._result_language(result) or ("zh" if language == "auto" else language),
-                    warnings=self._result_warnings(result),
-                    timings=TranscriptionTimings(
-                        inference_ms=inference_ms / len(audio_chunks) if audio_chunks else 0.0,
-                        postprocess_ms=0.0,
-                    ),
-                )
-                for audio, result in zip(audio_chunks, results, strict=True)
-            ]
-            postprocess_ms = (perf_counter() - postprocess_started) * 1000
-            if transcriptions:
-                per_chunk_postprocess_ms = postprocess_ms / len(transcriptions)
-                transcriptions = [
-                    TranscriptionResult(
-                        text=result.text,
-                        duration=result.duration,
-                        language=result.language,
-                        warnings=result.warnings,
-                        timings=TranscriptionTimings(
-                            inference_ms=result.timings.inference_ms,
-                            postprocess_ms=per_chunk_postprocess_ms,
-                        ),
-                    )
-                    for result in transcriptions
-                ]
-            return transcriptions
-        finally:
-            for audio_path in audio_paths:
-                audio_path.unlink(missing_ok=True)
-
-    def _import_hf_native_transformers(self) -> tuple[Any, Any]:
-        try:
-            transformers = importlib.import_module("transformers")
-        except ModuleNotFoundError as exc:
-            raise AsrError(
-                503,
-                "gpu_unavailable",
-                "transformers is not installed; install HF native dependencies in WSL after CUDA torch validation",
-            ) from exc
-        processor_cls = getattr(transformers, "AutoProcessor", None)
-        model_cls = getattr(transformers, "AutoModelForMultimodalLM", None)
-        if processor_cls is None or model_cls is None:
-            raise AsrError(
-                503,
-                "model_dependency_unavailable",
-                "installed transformers does not provide Qwen3-ASR HF native classes; install a newer release or transformers main",
-                {
-                    "missing": [
-                        name
-                        for name, value in (
-                            ("AutoProcessor", processor_cls),
-                            ("AutoModelForMultimodalLM", model_cls),
-                        )
-                        if value is None
-                    ]
-                },
             )
-        return processor_cls, model_cls
+        return results
 
     def _assert_cuda_torch(self) -> Any:
         try:
@@ -508,25 +466,115 @@ class _QwenWorkerBackend:
         raise AsrError(
             422,
             "capability_not_supported",
-            "Qwen HF native adapter supports dtype=auto, bfloat16/bf16, or float16/fp16",
+            "MOSS adapter supports dtype=auto, bfloat16/bf16, or float16/fp16",
             {"dtype": dtype},
         )
 
-    def _transcribe_model(self, model: Any, transcribe_kwargs: dict[str, Any]) -> Any:
+    def _import_transformers(self) -> tuple[Any, Any]:
         try:
-            torch = importlib.import_module("torch")
-        except ModuleNotFoundError:
-            return model.transcribe(**transcribe_kwargs)
-        inference_mode = getattr(torch, "inference_mode", None)
-        if not callable(inference_mode):
-            return model.transcribe(**transcribe_kwargs)
+            transformers = importlib.import_module("transformers")
+        except ModuleNotFoundError as exc:
+            raise AsrError(
+                503,
+                "model_dependency_unavailable",
+                "transformers is not installed; install MOSS dependencies in WSL after CUDA torch validation",
+            ) from exc
+        processor_cls = getattr(transformers, "AutoProcessor", None)
+        model_cls = getattr(transformers, "AutoModelForCausalLM", None)
+        if processor_cls is None or model_cls is None:
+            raise AsrError(
+                503,
+                "model_dependency_unavailable",
+                "installed transformers does not provide MOSS loading classes",
+                {
+                    "missing": [
+                        name
+                        for name, value in (
+                            ("AutoProcessor", processor_cls),
+                            ("AutoModelForCausalLM", model_cls),
+                        )
+                        if value is None
+                    ]
+                },
+            )
+        return processor_cls, model_cls
+
+    def _import_moss_helpers(self) -> _MossHelpers:
         try:
-            inference_context = inference_mode()
+            moss_package = importlib.import_module("moss_transcribe_diarize")
+            inference_utils = importlib.import_module("moss_transcribe_diarize.inference_utils")
+        except ModuleNotFoundError as exc:
+            raise AsrError(
+                503,
+                "model_dependency_unavailable",
+                "moss-transcribe-diarize is not installed in this WSL environment",
+            ) from exc
+        parse_transcript = getattr(moss_package, "parse_transcript", None)
+        build_messages = getattr(inference_utils, "build_transcription_messages", None)
+        generate_transcription = getattr(inference_utils, "generate_transcription", None)
+        if not callable(parse_transcript) or not callable(build_messages) or not callable(generate_transcription):
+            raise AsrError(
+                503,
+                "model_dependency_unavailable",
+                "installed moss-transcribe-diarize package is missing required inference helpers",
+                {
+                    "missing": [
+                        name
+                        for name, value in (
+                            ("parse_transcript", parse_transcript),
+                            ("build_transcription_messages", build_messages),
+                            ("generate_transcription", generate_transcription),
+                        )
+                        if not callable(value)
+                    ]
+                },
+            )
+        return _MossHelpers(
+            default_prompt=str(getattr(inference_utils, "DEFAULT_PROMPT", DEFAULT_MOSS_PROMPT)),
+            build_transcription_messages=build_messages,
+            generate_transcription=generate_transcription,
+            parse_transcript=parse_transcript,
+        )
+
+    def _prompt_for_context(self, context: str, default_prompt: str) -> str:
+        stripped = context.strip()
+        if not stripped:
+            return default_prompt
+        return f"{default_prompt}\n{stripped}"
+
+    def _result_text(self, result: object) -> str:
+        if isinstance(result, dict):
+            text = result.get("text", "")
+            return text if isinstance(text, str) else str(text)
+        text = getattr(result, "text", "")
+        return text if isinstance(text, str) else str(text)
+
+    def _parse_segments(self, text: str, helpers: _MossHelpers) -> list[TranscriptionSegment]:
+        try:
+            parsed = helpers.parse_transcript(text)
         except Exception as exc:
-            logger.warning("torch.inference_mode setup failed during Qwen transcribe: %s", exc)
-            return model.transcribe(**transcribe_kwargs)
-        with inference_context:
-            return model.transcribe(**transcribe_kwargs)
+            raise AsrError(
+                503,
+                "inference_failed",
+                "MOSS transcript parser failed",
+                {"error_type": type(exc).__name__, "message": str(exc)[-500:]},
+            ) from exc
+        return [self._segment_from_parsed(segment) for segment in parsed]
+
+    def _segment_from_parsed(self, segment: object) -> TranscriptionSegment:
+        if isinstance(segment, dict):
+            return TranscriptionSegment(
+                start=float(segment["start"]),
+                end=float(segment["end"]),
+                speaker=str(segment["speaker"]) if segment.get("speaker") is not None else None,
+                text=str(segment["text"]),
+            )
+        return TranscriptionSegment(
+            start=float(getattr(segment, "start")),
+            end=float(getattr(segment, "end")),
+            speaker=str(getattr(segment, "speaker")) if getattr(segment, "speaker", None) is not None else None,
+            text=str(getattr(segment, "text")),
+        )
 
     def _close_model(self, model: Any) -> None:
         for method_name in ("close", "shutdown", "destroy", "cleanup"):
@@ -535,26 +583,15 @@ class _QwenWorkerBackend:
                 try:
                     cleanup()
                 except Exception as exc:
-                    logger.warning("Qwen model cleanup method %s failed during unload: %s", method_name, exc)
+                    logger.warning("MOSS model cleanup method %s failed during unload: %s", method_name, exc)
 
     def _move_model_to_cpu(self, model: Any) -> None:
-        candidates = [
-            model,
-            getattr(model, "model", None),
-            getattr(model, "forced_aligner", None),
-            getattr(getattr(model, "forced_aligner", None), "model", None),
-        ]
-        seen: set[int] = set()
-        for candidate in candidates:
-            if candidate is None or id(candidate) in seen:
-                continue
-            seen.add(id(candidate))
-            to_device = getattr(candidate, "to", None)
-            if callable(to_device):
-                try:
-                    to_device("cpu")
-                except Exception as exc:
-                    logger.warning("moving Qwen model component to CPU failed during unload: %s", exc)
+        to_device = getattr(model, "to", None)
+        if callable(to_device):
+            try:
+                to_device("cpu")
+            except Exception as exc:
+                logger.warning("moving MOSS model to CPU failed during unload: %s", exc)
 
     def _release_cuda_cache(self) -> None:
         try:
@@ -574,47 +611,16 @@ class _QwenWorkerBackend:
         try:
             return bool(cuda.is_available())
         except Exception as exc:
-            logger.warning("torch.cuda.is_available failed during unload: %s", exc)
+            logger.warning("torch.cuda.is_available failed during MOSS unload: %s", exc)
             return False
 
     def _run_cuda_cleanup(self, name: str, cleanup: Callable[[], object]) -> None:
         try:
             cleanup()
         except Exception as exc:
-            logger.warning("torch.cuda.%s failed during unload: %s", name, exc)
+            logger.warning("torch.cuda.%s failed during MOSS unload: %s", name, exc)
 
-    def _result_text(self, result: Any) -> str:
-        text = getattr(result, "text", "")
-        if isinstance(text, str):
-            return text
-        return str(text)
-
-    def _non_empty_text(self, result: Any) -> str:
-        text = self._result_text(result)
-        if not text.strip():
-            raise AsrError(503, "inference_failed", "Qwen returned an empty transcription result")
-        return text
-
-    def _result_language(self, result: Any) -> str:
-        language = getattr(result, "language", "")
-        if isinstance(language, str):
-            return language
-        return str(language)
-
-    def _result_warnings(self, result: Any) -> list[str]:
-        warnings = getattr(result, "warnings", [])
-        if not isinstance(warnings, list):
-            return [str(warnings)]
-        return [str(warning) for warning in warnings]
-
-    def _first_result(self, results: Any) -> Any:
-        try:
-            first = results[0]
-        except (IndexError, KeyError, TypeError) as exc:
-            raise AsrError(503, "inference_failed", "Qwen returned no transcription results") from exc
-        return first
-
-    def _map_qwen_exception(self, exc: Exception, *, phase: str, model_id: str) -> AsrError:
+    def _map_moss_exception(self, exc: Exception, *, phase: str, model_id: str) -> AsrError:
         message = str(exc)
         lowered = message.lower()
         details = {
@@ -624,63 +630,10 @@ class _QwenWorkerBackend:
             "message": message[-500:],
         }
         if "out of memory" in lowered or "cuda oom" in lowered:
-            return AsrError(503, "gpu_unavailable", "CUDA out of memory during Qwen ASR", details)
+            return AsrError(503, "gpu_unavailable", "CUDA out of memory during MOSS ASR", details)
         if phase == "load" and any(
             marker in lowered
             for marker in ("download", "connection", "repository", "resolve", "not found", "401", "403", "404")
         ):
-            return AsrError(503, "model_download_failed", "Qwen model download or resolution failed", details)
-        return AsrError(503, "inference_failed", f"Qwen {phase} failed", details)
-
-
-@dataclass(frozen=True)
-class _QwenTranscriptionItem:
-    text: str
-    language: str
-    warnings: list[str]
-
-
-class _HfNativeQwenModel:
-    """Small adapter around the Qwen3-ASR Transformers native helper API."""
-
-    def __init__(self, *, processor: Any, model: Any, torch: Any, max_new_tokens: int | None) -> None:
-        self.processor = processor
-        self.model = model
-        self.torch = torch
-        self.max_new_tokens = max_new_tokens
-
-    def transcribe(self, **kwargs: object) -> list[_QwenTranscriptionItem]:
-        audio = kwargs.get("audio")
-        if not isinstance(audio, str):
-            raise TypeError("HF native Qwen transcription expects one audio path")
-        language_value = kwargs.get("language")
-        language = language_value if isinstance(language_value, str) else None
-        request_max_new_tokens = kwargs.get("max_new_tokens")
-        max_new_tokens = request_max_new_tokens if isinstance(request_max_new_tokens, int) else self.max_new_tokens
-        if max_new_tokens is None:
-            max_new_tokens = 512
-        context = kwargs.get("context")
-        warnings: list[str] = []
-        if isinstance(context, str) and context:
-            warnings.append("context is not applied by the HF native transcription helper")
-
-        apply_request = getattr(self.processor, "apply_transcription_request", None)
-        if not callable(apply_request):
-            raise RuntimeError("processor.apply_transcription_request is unavailable")
-        inputs = apply_request(audio=audio, language=language)
-        inputs = inputs.to(self.model.device, self.model.dtype)
-        output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-        generated_ids = output_ids[:, inputs["input_ids"].shape[1] :]
-        parsed_items = self.processor.decode(generated_ids, return_format="parsed")
-        return [self._item_from_parsed(item, warnings=warnings) for item in parsed_items]
-
-    def _item_from_parsed(self, parsed: object, *, warnings: list[str]) -> _QwenTranscriptionItem:
-        if isinstance(parsed, dict):
-            text = parsed.get("transcription", parsed.get("text", ""))
-            language = parsed.get("language", "")
-            return _QwenTranscriptionItem(
-                text=text if isinstance(text, str) else str(text),
-                language=language if isinstance(language, str) else str(language),
-                warnings=warnings,
-            )
-        return _QwenTranscriptionItem(text=str(parsed), language="", warnings=warnings)
+            return AsrError(503, "model_download_failed", "MOSS model download or resolution failed", details)
+        return AsrError(503, "inference_failed", f"MOSS {phase} failed", details)

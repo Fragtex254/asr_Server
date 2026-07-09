@@ -15,6 +15,7 @@ class MergedTranscription:
     warnings: list[str]
     timings: TranscriptionTimings
     chunks: list[dict[str, object]]
+    segments: list[dict[str, object]]
 
 
 def merge_transcription_results(
@@ -39,7 +40,10 @@ def merge_transcription_results(
         metadata={"source_duration": source_duration},
         timestamp_source="vad_chunk_window",
     )
+    segments = _merged_segments(chunks, results)
     warnings = _unique_warnings(results)
+    if len(chunks) > 1 and segments and "moss_speaker_labels_are_chunk_local" not in warnings:
+        warnings = [*warnings, "moss_speaker_labels_are_chunk_local"]
     language = next((result.language for result in results if result.language), "auto")
     return MergedTranscription(
         text=document.text,
@@ -48,6 +52,7 @@ def merge_transcription_results(
         warnings=warnings,
         timings=timings,
         chunks=_chunk_payload(chunks, results, document) if preserve_segments else [],
+        segments=segments,
     )
 
 
@@ -83,6 +88,30 @@ def _chunk_payload(
                 "deduped_prefix_chars": segment.deduped_prefix_chars,
                 "warnings": result.warnings,
                 "timings": result.timings.to_api(),
+                "segments": [
+                    {
+                        "start": chunk.start + item.start,
+                        "end": chunk.start + item.end,
+                        "speaker": item.speaker,
+                        "text": item.text,
+                    }
+                    for item in result.segments
+                ],
             }
         )
     return payload
+
+
+def _merged_segments(chunks: list[AudioChunk], results: list[TranscriptionResult]) -> list[dict[str, object]]:
+    segments: list[dict[str, object]] = []
+    for chunk, result in zip(chunks, results, strict=True):
+        for segment in result.segments:
+            segments.append(
+                {
+                    "start": chunk.start + segment.start,
+                    "end": chunk.start + segment.end,
+                    "speaker": segment.speaker,
+                    "text": segment.text,
+                }
+            )
+    return segments

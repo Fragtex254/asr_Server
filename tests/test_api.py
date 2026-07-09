@@ -68,6 +68,54 @@ async def test_models_lists_only_qwen_models(client: AsyncClient) -> None:
         assert model["capabilities"]["forced_alignment"] is False
 
 
+async def test_moss_model_is_registered_only_when_enabled() -> None:
+    app = create_app(settings=Settings(enable_moss=True))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.get("/v1/models")
+
+    assert response.status_code == 200
+    models = response.json()["models"]
+    moss = next(model for model in models if model["id"] == "moss-transcribe-diarize-0.9b")
+    assert moss["default"] is False
+    assert moss["capabilities"]["backends"] == ["transformers"]
+    assert moss["capabilities"]["streaming"] is False
+    assert moss["capabilities"]["timestamps"] == []
+    assert moss["capabilities"]["forced_alignment"] is False
+    assert moss["capabilities"]["diarization"] is True
+    assert moss["capabilities"]["segment_timestamps"] is True
+
+
+async def test_disabled_moss_model_returns_model_not_found(client: AsyncClient) -> None:
+    response = await client.get("/v1/models/moss-transcribe-diarize-0.9b/status")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "model_not_found"
+
+
+async def test_moss_load_status_and_unload_when_enabled() -> None:
+    app = create_app(settings=Settings(enable_moss=True))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        load_response = await client.post(
+            "/v1/models/moss-transcribe-diarize-0.9b/load",
+            json={"backend": "transformers", "device": "cuda", "dtype": "auto"},
+        )
+        status_response = await client.get("/v1/models/moss-transcribe-diarize-0.9b/status")
+        unload_response = await client.request(
+            "DELETE",
+            "/v1/models/moss-transcribe-diarize-0.9b",
+            json={"mode": "after_current_requests", "reject_new_requests": True, "cuda_empty_cache": True},
+        )
+
+    assert load_response.status_code == 200
+    assert load_response.json()["status"] == "loaded"
+    assert status_response.status_code == 200
+    assert status_response.json()["status"] == "loaded"
+    assert status_response.json()["backend"] == "transformers"
+    assert status_response.json()["max_new_tokens"] == 2048
+    assert unload_response.status_code == 200
+    assert unload_response.json()["status"] == "unloaded"
+
+
 async def test_unknown_model_uses_error_envelope(client: AsyncClient) -> None:
     response = await client.get("/v1/models/missing/status")
 
@@ -244,6 +292,111 @@ async def test_transcription_supports_each_declared_backend(client: AsyncClient)
         assert response.json()["model"] == model
         assert response.json()["backend"] == "transformers"
         assert response.json()["text"]
+
+
+async def test_moss_verbose_json_returns_segments_when_enabled() -> None:
+    app = create_app(settings=Settings(enable_moss=True))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", make_wav(0.1), "audio/wav")},
+            data={
+                "model": "moss-transcribe-diarize-0.9b",
+                "backend": "transformers",
+                "response_format": "verbose_json",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["model"] == "moss-transcribe-diarize-0.9b"
+    assert body["backend"] == "transformers"
+    assert "max_new_tokens_received:2048" in body["warnings"]
+    assert len(body["segments"]) == 1
+    assert body["segments"][0]["start"] == 0.0
+    assert body["segments"][0]["end"] > 0.0
+    assert body["segments"][0]["speaker"] == "S01"
+    assert body["segments"][0]["text"] == body["text"]
+
+
+async def test_moss_json_response_keeps_segments_empty_by_default() -> None:
+    app = create_app(settings=Settings(enable_moss=True))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", make_wav(0.1), "audio/wav")},
+            data={
+                "model": "moss-transcribe-diarize-0.9b",
+                "backend": "transformers",
+                "response_format": "json",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["segments"] == []
+
+
+async def test_moss_text_response_returns_plain_text_when_enabled() -> None:
+    app = create_app(settings=Settings(enable_moss=True))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", make_wav(0.1), "audio/wav")},
+            data={
+                "model": "moss-transcribe-diarize-0.9b",
+                "backend": "transformers",
+                "response_format": "text",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert response.text
+
+
+async def test_moss_split_transcription_warns_speaker_labels_are_chunk_local() -> None:
+    app = create_app(settings=Settings(enable_moss=True))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", make_wav(0.11), "audio/wav")},
+            data={
+                "model": "moss-transcribe-diarize-0.9b",
+                "backend": "transformers",
+                "response_format": "verbose_json",
+                "split_strategy": "fixed",
+                "max_chunk_seconds": "0.04",
+                "overlap_seconds": "0.01",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["split"]["chunk_count"] == 4
+    assert "moss_speaker_labels_are_chunk_local" in body["warnings"]
+    assert len(body["segments"]) == 4
+    assert body["segments"][0]["start"] == pytest.approx(0.0)
+    assert body["segments"][1]["start"] == pytest.approx(0.03)
+
+
+async def test_moss_rejects_undeclared_timestamps_and_vllm_backend() -> None:
+    app = create_app(settings=Settings(enable_moss=True))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        timestamps_response = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", make_wav(0.1), "audio/wav")},
+            data={"model": "moss-transcribe-diarize-0.9b", "timestamps": "word"},
+        )
+        vllm_response = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", make_wav(0.1), "audio/wav")},
+            data={"model": "moss-transcribe-diarize-0.9b", "backend": "vllm"},
+        )
+
+    assert timestamps_response.status_code == 422
+    assert timestamps_response.json()["error"]["code"] == "capability_not_supported"
+    assert vllm_response.status_code == 422
+    assert vllm_response.json()["error"]["code"] == "capability_not_supported"
 
 
 async def test_transcription_can_return_chunk_metadata(client: AsyncClient) -> None:

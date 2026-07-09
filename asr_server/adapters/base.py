@@ -23,11 +23,28 @@ class TranscriptionTimings:
 
 
 @dataclass(frozen=True)
+class TranscriptionSegment:
+    start: float
+    end: float
+    text: str
+    speaker: str | None = None
+
+    def to_api(self) -> dict[str, object]:
+        return {
+            "start": self.start,
+            "end": self.end,
+            "speaker": self.speaker,
+            "text": self.text,
+        }
+
+
+@dataclass(frozen=True)
 class TranscriptionResult:
     text: str
     duration: float
     language: str
     warnings: list[str]
+    segments: list[TranscriptionSegment] = field(default_factory=list)
     timings: TranscriptionTimings = field(default_factory=TranscriptionTimings)
 
 

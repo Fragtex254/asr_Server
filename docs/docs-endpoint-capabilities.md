@@ -23,7 +23,7 @@ The current FastAPI app registers these business endpoints:
 | Method | Path | Implemented behavior |
 | --- | --- | --- |
 | `GET` | `/health` | Returns service status, version, host name, and best-effort local CUDA GPU visibility. |
-| `GET` | `/v1/models` | Lists the two declared Qwen3-ASR models and their current runtime status and capabilities. |
+| `GET` | `/v1/models` | Lists declared models and their current runtime status and capabilities. By default this is the two Qwen3-ASR models; MOSS is listed only when explicitly enabled. |
 | `GET` | `/v1/models/{model_id}/status` | Returns one model's lifecycle state, active request count, backend, token limit, timestamps, and VRAM field. |
 | `POST` | `/v1/models/{model_id}/load` | Loads a declared model through the selected supported backend. |
 | `DELETE` | `/v1/models/{model_id}` | Unloads one model immediately or schedules unload after active requests finish. |
@@ -36,7 +36,7 @@ The current FastAPI app registers these business endpoints:
 
 ## Declared model capabilities
 
-`GET /v1/models` currently declares exactly these model IDs:
+`GET /v1/models` declares these model IDs by default:
 
 - `qwen3-asr-1.7b`
 - `qwen3-asr-0.6b`
@@ -48,11 +48,35 @@ For both models, the declared capability set is:
 - `streaming: false`
 - `timestamps: []`
 - `forced_alignment: false`
+- `diarization: false`
+- `segment_timestamps: false`
 - language values as returned by `/v1/models`
 - Chinese dialect values as returned by `/v1/models`
 
 The default model is controlled by `ASR_DEFAULT_MODEL` and defaults to
-`qwen3-asr-1.7b`.
+`qwen3-asr-1.7b`. MOSS cannot be selected as the default model in this
+release.
+
+When `ASR_ENABLE_MOSS=1` is set, `/v1/models` additionally declares:
+
+- `moss-transcribe-diarize-0.9b`
+
+Its first-release capability set is deliberately conservative:
+
+- `transcription: true`
+- `backends: ["transformers"]`
+- `streaming: false`
+- `timestamps: []`
+- `forced_alignment: false`
+- `diarization: true`
+- `segment_timestamps: true`
+- language values: `auto`, `zh`, `en`
+
+For MOSS, `response_format=verbose_json` returns parsed
+`segments[].start`, `segments[].end`, `segments[].speaker`, and
+`segments[].text` when the model output is parseable. The `timestamps`
+request parameter still does not support `word` or `char` timestamps, and MOSS
+segment timestamps are not treated as forced alignment.
 
 ## Transcription request behavior
 
@@ -69,6 +93,7 @@ Implemented form fields for `POST /v1/audio/transcriptions` and
   `auto` resolving to `transformers` and explicit `transformers` are supported
   by declared capabilities today.
 - `max_new_tokens`: optional; default is `512`, hard limit is `4096`.
+  MOSS uses a model-specific default of `2048` when the field is omitted.
 - `context`: optional adapter prompt context, combined with hotwords and limited
   to `4000` characters.
 - `hotwords`: optional JSON string array or comma-separated string, merged into
@@ -107,9 +132,19 @@ The service can run with two adapter modes:
   environment plus HF native Transformers dependencies to be installed and
   validated separately.
 
+MOSS is gated independently:
+
+- `ASR_ENABLE_MOSS=0` or unset keeps MOSS out of `/v1/models`.
+- `ASR_ENABLE_MOSS=1` adds `moss-transcribe-diarize-0.9b`.
+- With `ASR_ADAPTER=mock`, all declared models use mock inference for local API
+  tests.
+- With `ASR_ADAPTER=qwen ASR_ENABLE_MOSS=1`, Qwen model IDs dispatch to the
+  Qwen adapter and the MOSS model ID dispatches to the MOSS adapter.
+
 The public model list is the same shape in both modes. Successful real Qwen
 transcription requires the WSL GPU environment, not just the existence of
-Swagger UI.
+Swagger UI. Successful real MOSS transcription additionally requires the WSL
+MOSS smoke test and dependency validation.
 
 ## Explicitly not implemented or not declared
 
@@ -120,10 +155,15 @@ These items must not be described as available capabilities:
 - vLLM as a declared first-release backend. The registry does not declare
   `vllm`; requests for it return
   `422 capability_not_supported`.
+- SGLang Omni as a first-release serving path. It is not integrated into this
+  gateway and must not be exposed on a LAN port by this service.
 - Timestamps. `timestamps=word` and `timestamps=char` return
   `422 capability_not_supported`.
 - Forced alignment. `/v1/audio/alignments` always returns
   `422 capability_not_supported`.
+- Cross-chunk speaker identity stitching for MOSS. When audio is split into
+  chunks, MOSS speaker labels are chunk-local and the response warnings include
+  `moss_speaker_labels_are_chunk_local`.
 - Multiple-file transcription in one request. The implemented routes accept a
   single `file` upload.
 - Database, Redis, Celery, distributed workers, multi-worker inference, public

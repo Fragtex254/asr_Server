@@ -23,12 +23,12 @@ from asr_server.config import Settings, load_settings
 from asr_server.errors import AsrError, asr_error_handler, validation_error_handler
 from asr_server.jobs import JobManager
 from asr_server.lifecycle import ModelLifecycleManager
-from asr_server.registry import Backend, default_models
+from asr_server.registry import MOSS_MODEL_ID, Backend, default_models
 from asr_server.transcription import (
     SYNC_JOB_THRESHOLD_SECONDS,
     TranscriptionRequest,
     run_transcription,
-    validate_max_new_tokens,
+    validate_max_new_tokens_for_model,
     validate_transcription_request,
 )
 
@@ -103,9 +103,13 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
     app_settings = settings or load_settings()
 
     def adapter_factory(model_id: str) -> AsrAdapter:
-        if app_settings.adapter == "qwen":
-            return QwenAsrAdapter(model_id)
-        return MockAsrAdapter(delay_seconds=adapter_delay_seconds)
+        if app_settings.adapter == "mock":
+            return MockAsrAdapter(delay_seconds=adapter_delay_seconds)
+        if model_id == MOSS_MODEL_ID:
+            from asr_server.adapters.moss import MossTranscribeDiarizeAdapter
+
+            return MossTranscribeDiarizeAdapter(model_id)
+        return QwenAsrAdapter(model_id)
 
     @asynccontextmanager
     async def lifespan(lifespan_app: FastAPI) -> AsyncIterator[None]:
@@ -127,7 +131,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
     app.add_exception_handler(AsrError, cast(Any, asr_error_handler))
     app.add_exception_handler(RequestValidationError, cast(Any, validation_error_handler))
     app.state.manager = ModelLifecycleManager(
-        default_models(app_settings.default_model),
+        default_models(app_settings.default_model, enable_moss=app_settings.enable_moss),
         adapter_factory,
         idle_unload_seconds=app_settings.idle_unload_seconds,
     )
@@ -164,7 +168,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             backend=request.backend,
             device=request.device,
             dtype=request.dtype,
-            max_new_tokens=validate_max_new_tokens(request.max_new_tokens),
+            max_new_tokens=validate_max_new_tokens_for_model(model_id, request.max_new_tokens),
         )
 
     @app.delete("/v1/models/{model_id}")

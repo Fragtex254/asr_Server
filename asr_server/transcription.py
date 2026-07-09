@@ -12,11 +12,12 @@ from asr_server.audio.splitter import SplitResult, split_audio
 from asr_server.config import Settings
 from asr_server.errors import AsrError
 from asr_server.lifecycle import ModelLifecycleManager
-from asr_server.registry import Backend
+from asr_server.registry import MOSS_MODEL_ID, Backend
 
 
 MAX_CONTEXT_CHARS = 4000
 DEFAULT_MAX_NEW_TOKENS = 512
+MOSS_DEFAULT_MAX_NEW_TOKENS = 2048
 MAX_NEW_TOKENS = 4096
 SYNC_JOB_THRESHOLD_SECONDS = 600.0
 
@@ -71,7 +72,7 @@ def build_adapter_context(context: str, hotwords: str | None) -> str:
         parts.append(stripped_context)
     normalized_hotwords = parse_hotwords(hotwords)
     if normalized_hotwords:
-        parts.append("Hotwords: " + ", ".join(normalized_hotwords))
+        parts.append("热词提示：" + ", ".join(normalized_hotwords))
     adapter_context = "\n".join(parts)
     if len(adapter_context) > MAX_CONTEXT_CHARS:
         raise AsrError(
@@ -83,9 +84,13 @@ def build_adapter_context(context: str, hotwords: str | None) -> str:
     return adapter_context
 
 
-def validate_max_new_tokens(max_new_tokens: int | None) -> int | None:
+def validate_max_new_tokens(
+    max_new_tokens: int | None,
+    *,
+    default: int = DEFAULT_MAX_NEW_TOKENS,
+) -> int | None:
     if max_new_tokens is None:
-        return DEFAULT_MAX_NEW_TOKENS
+        return default
     if max_new_tokens > MAX_NEW_TOKENS:
         raise AsrError(
             400,
@@ -94,6 +99,17 @@ def validate_max_new_tokens(max_new_tokens: int | None) -> int | None:
             {"max_new_tokens": max_new_tokens, "max_new_tokens_limit": MAX_NEW_TOKENS},
         )
     return max_new_tokens
+
+
+def default_max_new_tokens_for_model(model_id: str) -> int:
+    return MOSS_DEFAULT_MAX_NEW_TOKENS if model_id == MOSS_MODEL_ID else DEFAULT_MAX_NEW_TOKENS
+
+
+def validate_max_new_tokens_for_model(model_id: str, max_new_tokens: int | None) -> int | None:
+    return validate_max_new_tokens(
+        max_new_tokens,
+        default=default_max_new_tokens_for_model(model_id),
+    )
 
 
 def validate_transcription_request(
@@ -118,7 +134,7 @@ def validate_transcription_request(
         selected_model=selected_model,
         resolved_backend=resolved_backend,
         adapter_context=build_adapter_context(request.context, request.hotwords),
-        max_new_tokens=validate_max_new_tokens(request.max_new_tokens),
+        max_new_tokens=validate_max_new_tokens_for_model(selected_model, request.max_new_tokens),
     )
 
 
@@ -195,6 +211,7 @@ async def run_transcription(
         language=result.language,
         duration=result.duration,
         chunks=result.chunks,
+        segments=result.segments if request.response_format == "verbose_json" else [],
         timings=result.timings.to_api(),
         warnings=warnings,
     )
@@ -210,6 +227,7 @@ def transcription_payload(
     language: str,
     duration: float,
     chunks: list[dict[str, object]],
+    segments: list[dict[str, object]],
     timings: dict[str, float],
     warnings: list[str],
 ) -> dict[str, object]:
@@ -221,7 +239,7 @@ def transcription_payload(
         "text": text,
         "duration": duration,
         "timestamps": [],
-        "segments": [],
+        "segments": segments,
         "split": split.summary(),
         "chunks": chunks,
         "usage": {"audio_seconds": duration},

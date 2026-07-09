@@ -4,7 +4,10 @@ import asyncio
 import hashlib
 from time import perf_counter
 
-from asr_server.adapters.base import TranscriptionResult, TranscriptionTimings
+from asr_server.adapters.base import TranscriptionResult, TranscriptionSegment, TranscriptionTimings
+
+
+MOSS_MOCK_MODEL_ID = "moss-transcribe-diarize-0.9b"
 
 
 class MockAsrAdapter:
@@ -89,7 +92,7 @@ class MockAsrAdapter:
         batch: bool,
         label: str,
     ) -> TranscriptionResult:
-        del model_id, backend
+        del backend
         text = f"{label}:{len(audio)}"
         warnings = ["mock_adapter"]
         if batch:
@@ -99,11 +102,23 @@ class MockAsrAdapter:
             warnings.append(f"context_received:{len(context)}:{context_hash}")
         if max_new_tokens is not None:
             warnings.append(f"max_new_tokens_received:{max_new_tokens}")
+        segments = []
+        duration = max(len(audio) / 16_000, 0.01)
+        if model_id == MOSS_MOCK_MODEL_ID:
+            segments = [
+                TranscriptionSegment(
+                    start=0.0,
+                    end=min(duration, 0.5),
+                    speaker="S01",
+                    text=f"{label}:{len(audio)}",
+                )
+            ]
         return TranscriptionResult(
             text=text,
-            duration=max(len(audio) / 16_000, 0.01),
+            duration=duration,
             language="zh" if language == "auto" else language,
             warnings=warnings,
+            segments=segments,
             timings=TranscriptionTimings(inference_ms=inference_ms),
         )
 

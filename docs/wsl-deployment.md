@@ -265,6 +265,38 @@ ASR_BASE_URL=http://127.0.0.1:18080 uv run pytest tests/test_http_smoke.py -q
 ASR_ADAPTER=qwen scripts/wsl_smoke.sh
 ```
 
+## 一键启动与停止
+
+正式部署完成后，日常启动和停止统一操作 `systemd --user` 服务，不直接手写 `uvicorn` 命令：
+
+```bash
+scripts/start_asr_server.sh
+scripts/shutdown_asr_server.sh
+```
+
+`scripts/start_asr_server.sh` 会：
+
+- 检查 `asr-server.service` 是否已安装。
+- 启动已部署的 `/home/fragt/services/asr-server/.venv/bin/uvicorn` 服务。
+- 等待 `http://127.0.0.1:18080/health` 返回成功。
+- 打印本机和局域网访问地址。
+
+`scripts/shutdown_asr_server.sh` 会：
+
+- 停止 `asr-server.service`。
+- 等待服务进入 inactive。
+- 确认 `http://127.0.0.1:18080/health` 不再响应。
+
+可用环境变量覆盖默认值：
+
+```bash
+ASR_SERVICE_NAME=asr-server.service
+ASR_PORT=18080
+ASR_BASE_URL=http://127.0.0.1:18080
+ASR_START_WAIT_SECONDS=90
+ASR_SHUTDOWN_WAIT_SECONDS=90
+```
+
 如果还要在同一个脚本里跑 Qwen `transformers` 后端预验收：
 
 ```bash

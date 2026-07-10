@@ -26,17 +26,19 @@ curl --noproxy '*' -v http://192.168.31.137:18080/v1/models
 
 2. 读取 `GET /v1/models` 返回值，不要硬编码模型能力。根据服务端声明选择模型。
 
-3. 默认优先使用：
+3. 默认优先使用服务端声明的默认模型。当前通常是：
 
 ```text
 qwen3-asr-1.7b
 ```
 
-如果请求失败且错误码不是音频或网络问题，再尝试服务端声明可用的另一个 Qwen 模型，例如：
+如果请求失败且错误码不是音频或网络问题，再尝试服务端声明可用的另一个普通转录模型，例如：
 
 ```text
 qwen3-asr-0.6b
 ```
+
+如果 `/v1/models` 声明了 `moss-transcribe-diarize-0.9b`，只有在产品明确需要段级说话人结果时才选择它，并优先请求 `response_format=verbose_json`。不要在服务端未声明 MOSS 时硬编码该模型。
 
 4. 实现一个最小同步请求函数，使用 `multipart/form-data` 调用：
 
@@ -66,7 +68,7 @@ job 规则：
 - 用 `GET /v1/jobs/{job_id}` 轮询状态，不要用前端假进度代替服务端状态。
 - 队列状态看 `status=queued` 和 `queue_position`。
 - 转录进度看 `progress.phase`、`total_chunks`、`completed_chunks`、`current_chunk` 和 `percent`。
-- 单个 Qwen chunk 内部没有真实百分比，前端只能显示“正在处理第 N 段”。
+- 单个模型 chunk 内部没有真实百分比，前端只能显示“正在处理第 N 段”。
 - `completed` 后读取 `result.text`。
 - `failed` 后读取 `error.code/message/details`。
 - 用户取消时调用 `DELETE /v1/jobs/{job_id}`；如果服务端正在推理当前 chunk，取消可能要等当前 chunk 完成后生效。
@@ -96,4 +98,4 @@ job 规则：
 - 如果实现 job，给出 job 创建响应、至少一次 transcribing 轮询响应、completed 响应摘要。
 - 如果失败，给出 HTTP 状态码、错误 JSON、是否经过代理、是否能 ping 通 `192.168.31.137`。
 
-不要硬编码 MiMo 或任何服务端未在 `/v1/models` 声明的模型。不要修改 ASR 服务端。不要把请求发往公网。不要通过代理访问 `192.168.31.137`。
+不要硬编码 MiMo、MOSS 或任何服务端未在 `/v1/models` 声明的模型。不要修改 ASR 服务端。不要把请求发往公网。不要通过代理访问 `192.168.31.137`。

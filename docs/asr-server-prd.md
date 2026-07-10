@@ -1,14 +1,16 @@
 # WSL ASR Server PRD
 
-更新时间：2026-06-30
+更新时间：2026-07-10
 
 ## 1. 背景
 
 当前 Windows 主机已通过 WSL2 Arch Linux 暴露局域网服务，Mac mini 已验证可以访问 WSL mirrored networking 下的局域网服务。目标是在 WSL 内常驻一个 ASR 服务，让 Mac mini 上的本地项目可以通过 HTTP API 调用 Windows/WSL 内的 GPU 模型完成音频转录。
 
-初版支持模型只包含 Qwen3-ASR 两个尺寸：
+基础默认模型包含 Qwen3-ASR 两个尺寸：
 
 - QwenLM/Qwen3-ASR：https://github.com/QwenLM/Qwen3-ASR
+
+当前实现还支持一个可选 gate 模型：`moss-transcribe-diarize-0.9b`。只有在 WSL 侧 MOSS smoke 验收通过并设置 `ASR_ENABLE_MOSS=1` 后，它才进入 `/v1/models`。默认模型仍是 `qwen3-asr-1.7b`。
 
 MiMo-V2.5-ASR 不进入初版交付范围，保留为后续扩展候选。
 
@@ -21,7 +23,7 @@ MiMo-V2.5-ASR 不进入初版交付范围，保留为后续扩展候选。
 
 ## 2. 目标
 
-构建一个常驻 WSL 后台的统一 ASR 网关，让 Mac mini 可以通过稳定、可探测、可管理的 API 调用 WSL Arch Linux 上的 Qwen3-ASR GPU 转录能力。
+构建一个常驻 WSL 后台的统一 ASR 网关，让 Mac mini 可以通过稳定、可探测、可管理的 API 调用 WSL Arch Linux 上已验收的 GPU ASR 转录能力。
 
 必须支持：
 
@@ -34,6 +36,7 @@ MiMo-V2.5-ASR 不进入初版交付范围，保留为后续扩展候选。
 - 创建异步转录任务，并通过轮询获取阶段状态和 chunk 级真实进度。
 - 跑通 `qwen3-asr-0.6b` 和 `qwen3-asr-1.7b` 的端到端转录流程。
 - 对每个 Qwen3-ASR 模型跑通所有在 `/v1/models` 中声明支持的推理后端；第一版只声明 `transformers` 后端，`vllm` 后端延后到后续版本。
+- 如果启用 MOSS，跑通 `moss-transcribe-diarize-0.9b` 的 `transformers` 后端，并只把段级 speaker/timestamp 作为 `verbose_json` 的 `segments` 返回。
 - `/v1/models` 只声明已经实现并通过验收的能力；时间戳、强制对齐、流式转写等高级能力不作为初版发布验收前提。
 
 暂不做：
@@ -52,7 +55,7 @@ MiMo-V2.5-ASR 不进入初版交付范围，保留为后续扩展候选。
 典型场景：
 
 1. Mac 项目启动时调用 `GET /v1/models`，发现服务端可用模型与能力。
-2. Mac 项目上传音频到 `POST /v1/audio/transcriptions`，指定 `model=qwen3-asr-1.7b` 或 `model=qwen3-asr-0.6b`。
+2. Mac 项目上传音频到 `POST /v1/audio/transcriptions`，指定服务端在 `/v1/models` 中声明的模型，例如 `model=qwen3-asr-1.7b` 或 `model=qwen3-asr-0.6b`。
 3. 长音频或批处理时，Mac 项目创建异步任务，再轮询任务状态。
 4. 长时间不用某个模型时，Mac 项目或运维脚本调用卸载接口释放显存。
 5. 如果服务端正在处理请求，卸载动作进入排队状态，当前请求结束后再释放模型。
@@ -67,7 +70,9 @@ flowchart LR
   Gateway --> Registry["Model Registry"]
   Gateway --> Manager["Model Lifecycle Manager"]
   Gateway --> Qwen["Qwen3-ASR Adapter"]
+  Gateway --> Moss["MOSS Adapter (optional gate)"]
   Qwen --> GPU["NVIDIA GPU in WSL"]
+  Moss --> GPU
 ```
 
 建议进程：
@@ -84,10 +89,11 @@ flowchart LR
 
 ## 5. 模型能力矩阵
 
-| 模型 | 模型 ID | 首选用途 | 初版验收能力 | 限制 |
+| 模型 | 模型 ID | 首选用途 | 当前验收能力 | 限制 |
 | --- | --- | --- | --- | --- |
 | Qwen3-ASR 0.6B | `qwen3-asr-0.6b` | 轻量转写、较低显存占用 | 离线转写、语言提示、`transformers` 后端转写 | 质量和复杂音频能力弱于 1.7B；高级能力后续按实测结果逐项打开 |
 | Qwen3-ASR 1.7B | `qwen3-asr-1.7b` | 默认主力模型 | 离线转写、语言提示、`transformers` 后端转写 | 流式、时间戳、强制对齐、vLLM 等高级能力不阻塞初版发布 |
+| MOSS-Transcribe-Diarize | `moss-transcribe-diarize-0.9b` | 可选说话人分离、段级时间段 | 离线转写、语言提示、`transformers` 后端转写、`verbose_json` segments | 只在 `ASR_ENABLE_MOSS=1` 时声明；speaker label 跨 chunk 不保证全局一致；不声明 word/char timestamps、forced alignment、streaming 或 vLLM |
 
 ## 6. API 设计
 
@@ -520,7 +526,7 @@ Content-Type: `multipart/form-data`
 
 - `queued` job 可以直接取消为 `cancelled`。
 - `preprocessing`、`splitting`、`merging` 阶段尽量在阶段边界取消。
-- `transcribing` 阶段不要强杀 Qwen 推理，不要卸载模型；设置 `cancel_requested`，等当前 chunk 完成后停止后续 chunk。
+- `transcribing` 阶段不要强杀模型推理，不要卸载模型；设置 `cancel_requested`，等当前 chunk 完成后停止后续 chunk。
 - 已结束 job 的 DELETE 返回当前状态，不应报 500。
 
 ### 6.10 流式转写
@@ -745,12 +751,14 @@ limits:
 
 - Mac mini 执行 `curl --noproxy '*' http://192.168.31.137:18080/health` 返回 `status=ok`。
 - Mac mini 执行 `curl --noproxy '*' http://192.168.31.137:18080/v1/models` 能看到 `qwen3-asr-0.6b` 与 `qwen3-asr-1.7b`。
+- 当 WSL 服务设置 `ASR_ENABLE_MOSS=1` 且 MOSS smoke 验收通过时，`/v1/models` 能看到 `moss-transcribe-diarize-0.9b`。
 - `/v1/models` 不展示未进入初版交付范围的 MiMo 模型，也不声明未验收通过的高级能力。
 
 转写：
 
 - Mac mini 通过局域网向 `POST /v1/audio/transcriptions` 上传一段 10 秒中文音频，`qwen3-asr-0.6b` + `transformers` 返回非空 `text`。
 - Mac mini 通过局域网向 `POST /v1/audio/transcriptions` 上传一段 10 秒中文音频，`qwen3-asr-1.7b` + `transformers` 返回非空 `text`。
+- 如果启用 MOSS，Mac mini 通过局域网上传短音频，`moss-transcribe-diarize-0.9b` + `transformers` + `response_format=verbose_json` 返回非空 `text` 和段级 `segments`。
 - 默认模型 `qwen3-asr-1.7b` 在不显式传 `backend` 时可以用 `backend=auto` 完成转录。
 - 前端 Mac 客户端只依赖 `GET /v1/models` 的模型与后端发现结果，不硬编码服务端未声明的能力。
 
@@ -777,7 +785,7 @@ limits:
 
 ## 12. 后续路线
 
-当前 WSL 服务端已经实现异步转录 job、FIFO 串行队列、可轮询状态和 chunk 级真实进度。后续阶段不做 vLLM、WebSocket streaming、MiMo、ForcedAligner、数据库队列、多 worker 并发推理或 `*-hf` 路径，除非 PRD 明确扩展范围。
+当前 WSL 服务端已经实现异步转录 job、FIFO 串行队列、可轮询状态和 chunk 级真实进度。后续阶段不做 vLLM、WebSocket streaming、MiMo、ForcedAligner、数据库队列、多 worker 并发推理或 MOSS 跨 chunk speaker identity stitching，除非 PRD 明确扩展范围。
 
 优先级 P0：
 
@@ -785,6 +793,7 @@ limits:
 - 模型注册表。
 - Qwen3-ASR 0.6B 与 1.7B 适配器最小可用转写。
 - Qwen3-ASR 两个尺寸在 `transformers` 后端上完成端到端转录验收。
+- MOSS gate、MOSS `transformers` 后端和 `verbose_json` segments 端到端验收。
 - 模型加载/卸载状态机。
 - Mac 局域网访问验收。
 
@@ -809,5 +818,7 @@ limits:
 ## 13. 参考资料
 
 - Qwen3-ASR GitHub：https://github.com/QwenLM/Qwen3-ASR
+- MOSS-Transcribe-Diarize GitHub：https://github.com/OpenMOSS/MOSS-Transcribe-Diarize
+- MOSS-Transcribe-Diarize Hugging Face：https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize
 - MiMo-V2.5-ASR GitHub：https://github.com/XiaomiMiMo/MiMo-V2.5-ASR
 - WSL mirrored networking 已在本机验证，正式 ASR 服务入口规划为 `192.168.31.137:18080`

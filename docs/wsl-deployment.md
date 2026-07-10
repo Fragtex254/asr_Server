@@ -45,13 +45,14 @@ deploy/wsl-deploy.sh
 - 安装 Arch 系统包 `uv`、`rsync`、`git`、`ffmpeg`、`libsndfile`。
 - 创建 Python 3.12 uv 环境并执行 `uv sync --frozen`。
 - 运行 `pytest` 和 `mypy`。
-- 安装 `requirements/wsl-gpu-cu128.txt` 中固定的 CUDA 12.8 torch 和 HF native Qwen 运行时依赖。
-- 校验 `torch==2.11.0+cu128`、CUDA 可用和 Transformers HF native Qwen 类可导入。
+- 安装 `requirements/wsl-gpu-cu128.txt` 中固定的 CUDA 12.8 torch、HF native Qwen 运行时依赖和 MOSS 可选运行时依赖。
+- 校验 `torch==2.11.0+cu128`、CUDA 可用和 Transformers HF native Qwen/MOSS loading 类可导入。
 - 跑一次 `Qwen/Qwen3-ASR-0.6B-hf` + `test-fixtures/audio/test_short.wav` 的 `transformers` 后端 smoke。
 - 安装并启动 `systemd --user` 服务 `asr-server.service`。
 - 常驻服务通过 `/home/fragt/services/asr-server/.venv/bin/uvicorn` 直接启动，避免 `uv run` 在 systemd 或 Windows 任务计划程序启动时联网同步依赖，导致服务没有监听 `18080`。
 - 常驻服务默认设置 `ASR_IDLE_UNLOAD_SECONDS=180`，转录完成后 3 分钟无新增同模型请求就自动卸载模型并释放 CUDA cache。
 - 常驻服务默认设置 `HF_HUB_OFFLINE=1` 和 `TRANSFORMERS_OFFLINE=1`，使用部署 smoke 已拉取并验收过的本地模型缓存，避免运行时被 Hugging Face HEAD 请求超时拖住。
+- MOSS 默认不进入 `/v1/models`；只有单独跑通 MOSS smoke 并设置 `ASR_ENABLE_MOSS=1` 后才注册 `moss-transcribe-diarize-0.9b`。
 - 对 `http://127.0.0.1:18080` 运行 HTTP smoke test。
 
 如果需要让常驻服务启动后仍可在线拉取 Hugging Face 模型文件：
@@ -78,7 +79,7 @@ deploy/wsl-deploy.sh --mock
 
 ## GPU 运行时依赖
 
-WSL 侧真实 Qwen3-ASR 运行时统一使用这组 PyTorch CUDA 与 HF native 依赖：
+WSL 侧真实运行时统一使用这组 PyTorch CUDA、HF native Qwen 和可选 MOSS 依赖：
 
 ```text
 torch==2.11.0+cu128
@@ -89,8 +90,11 @@ accelerate
 safetensors
 soundfile
 librosa
+av
+soxr
 numba==0.65.1
 llvmlite==0.47.0
+moss-transcribe-diarize
 ```
 
 安装命令：
@@ -121,7 +125,8 @@ print("torchaudio:", torchaudio.__version__)
 print("transformers:", transformers.__version__)
 assert hasattr(transformers, "AutoProcessor")
 assert hasattr(transformers, "AutoModelForMultimodalLM")
-print("HF native Qwen classes import ok")
+assert hasattr(transformers, "AutoModelForCausalLM")
+print("HF native Qwen and MOSS loading classes import ok")
 PY
 ```
 
@@ -142,6 +147,53 @@ TRANSFORMERS_OFFLINE=1 \
 /home/fragt/services/asr-server/.venv/bin/uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
 ```
 
+## 可选 MOSS 说话人分离
+
+`moss-transcribe-diarize-0.9b` 是可选模型。依赖可以随 `requirements/wsl-gpu-cu128.txt` 安装，但模型默认不注册，避免在未验收环境里让客户端看到不可用能力。
+
+启用前先在 WSL 侧跑独立 smoke：
+
+```bash
+uv run python scripts/moss_backend_smoke.py \
+  --model OpenMOSS-Team/MOSS-Transcribe-Diarize \
+  --audio test-fixtures/audio/test_short.wav \
+  --language auto
+```
+
+smoke 必须返回非空文本和可解析 `segments`，并确认安装 MOSS 依赖后 `torch.version.cuda is not None` 且 `torch.cuda.is_available()` 仍为 `True`。
+
+交互式启动 MOSS gate：
+
+```bash
+ASR_ADAPTER=qwen ASR_ENABLE_MOSS=1 \
+uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
+```
+
+常驻 systemd 服务启用 MOSS 时，使用 drop-in，不要直接手改部署脚本生成的 unit：
+
+```bash
+mkdir -p ~/.config/systemd/user/asr-server.service.d
+cat > ~/.config/systemd/user/asr-server.service.d/10-enable-moss.conf <<'EOF'
+[Service]
+Environment=ASR_ENABLE_MOSS=1
+EOF
+systemctl --user daemon-reload
+systemctl --user restart asr-server.service
+```
+
+启用后验证模型发现和一次转录：
+
+```bash
+curl --noproxy '*' -sS http://127.0.0.1:18080/v1/models
+curl --noproxy '*' -sS \
+  -F file=@test-fixtures/audio/test_short.wav \
+  -F model=moss-transcribe-diarize-0.9b \
+  -F response_format=verbose_json \
+  http://127.0.0.1:18080/v1/audio/transcriptions
+```
+
+MOSS 当前只声明 `transformers` 后端。`verbose_json` 会返回 `segments[].speaker`、`segments[].start` 和 `segments[].end`；这不是 PRD 里的 `word`/`char` timestamps，也不是 forced alignment。长音频被切分时，MOSS 的 speaker label 只保证 chunk 内相对一致，响应 `warnings` 会包含 `moss_speaker_labels_are_chunk_local`。
+
 ## 可选 Silero VAD
 
 长音频 `split_strategy=auto` 会优先尝试 Silero VAD；如果 WSL 环境没有安装 Silero 依赖，服务会明确 fallback 到 energy VAD，再失败才使用 fixed window。Mac/mock 环境不需要安装 Silero、CUDA torch 或模型缓存。
@@ -159,8 +211,8 @@ uv pip install silero-vad
 同步转录接口和异步 job 接口支持以下调优字段：
 
 - `context`：专有名词、领域背景或热词提示，服务端硬限制 4000 字符。
-- `hotwords`：逗号分隔字符串或 JSON 字符串数组，服务端会合并到 Qwen `context`，普通日志不记录完整内容。
-- `max_new_tokens`：可选生成长度上限，默认 512，服务端硬限制 4096；响应 `warnings` 会标记非默认值。
+- `hotwords`：逗号分隔字符串或 JSON 字符串数组，服务端会合并到本次模型提示，普通日志不记录完整内容。
+- `max_new_tokens`：可选生成长度上限，Qwen 默认 512，MOSS 默认 2048，服务端硬限制 4096；响应 `warnings` 会标记非默认值。
 - `split_strategy`：`auto`、`none`、`fixed`、`silero`、`energy`、`vad`；`vad` 是兼容别名，实际优先走 Silero。
 
 长音频默认按 WSL 实测后的稳定组合执行：
@@ -209,9 +261,9 @@ DELETE /v1/jobs/{job_id}
 设计边界：
 
 - 服务端使用内存 JobManager 和单 worker FIFO 队列。
-- 可以提交多个 job，但同一时间只运行一个真实 Qwen 转录；后续 job 显示 `queued` 和 `queue_position`。
+- 可以提交多个 job，但同一时间只运行一个真实模型转录；后续 job 显示 `queued` 和 `queue_position`。
 - 进度是服务端阶段和 chunk 级真实进度，包括 `total_chunks`、`completed_chunks`、`current_chunk`。
-- 不承诺单个 Qwen chunk 内部 token/帧级百分比。
+- 不承诺单个模型 chunk 内部 token/帧级百分比。
 - 进程重启后内存 job 可以丢失；客户端应重新提交。
 - job 完成、失败或取消后清理上传音频和中间临时文件；TTL 只保留内存中的 job 状态和结果，不保留音频文件。
 - job 结果默认保留 1 小时，可用 `ASR_JOB_RESULT_TTL_SECONDS` 调整。
@@ -235,21 +287,28 @@ curl --noproxy '*' -sS http://127.0.0.1:18080/v1/jobs/<job_id>
 
 Mac 侧局域网验收同样使用 `http://192.168.31.137:18080`，并且必须绕过本机代理。
 
-本轮 WSL 实测记录见：
+当前 WSL 实测记录见：
 
 ```text
-docs/validation-2026-06-29-wsl.md
+docs/validation-2026-07-02-wsl-hf-native.md
+docs/validation-2026-07-10-wsl-moss.md
 ```
 
 ## 后端预验收
 
-开发或启用真实 adapter 前，先跑：
+开发或启用真实 Qwen adapter 前，先跑：
 
 ```bash
 uv run python scripts/qwen_asr_backend_smoke.py --backend transformers --model Qwen/Qwen3-ASR-0.6B-hf --audio test-fixtures/audio/test_short.wav
 ```
 
-默认 `transformers` smoke 走 HF native `AutoProcessor` + `AutoModelForMultimodalLM`。返回非空文本后，再接入或启用服务端真实 adapter。第一版不在 `/v1/models` 中声明 `vllm`。
+默认 `transformers` smoke 走 HF native `AutoProcessor` + `AutoModelForMultimodalLM`。返回非空文本后，再接入或启用服务端真实 Qwen adapter。当前不在 `/v1/models` 中声明 `vllm`。
+
+启用 MOSS 前还必须跑：
+
+```bash
+uv run python scripts/moss_backend_smoke.py --model OpenMOSS-Team/MOSS-Transcribe-Diarize --audio test-fixtures/audio/test_short.wav
+```
 
 ## HTTP smoke test
 
@@ -302,6 +361,8 @@ ASR_SHUTDOWN_WAIT_SECONDS=90
 ```bash
 ASR_ADAPTER=qwen ASR_RUN_QWEN_BACKEND_SMOKE=1 scripts/wsl_smoke.sh
 ```
+
+如果要让该 smoke 脚本启动的服务暴露 MOSS，可额外设置 `ASR_ENABLE_MOSS=1`。这只影响服务注册，不替代独立的 `scripts/moss_backend_smoke.py`。
 
 ## systemd user service
 

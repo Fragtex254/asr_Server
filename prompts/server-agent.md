@@ -26,10 +26,11 @@ docs/asr-server-prd.md
 prompts/wsl-project-brief.md
 ```
 
-如果当前任务是迁移 Qwen3-ASR 到 Hugging Face Native Transformers 加载方式，必须额外阅读并执行：
+当前真实模型验收记录见：
 
 ```text
-docs/qwen-hf-native-migration-plan.md
+docs/validation-2026-07-02-wsl-hf-native.md
+docs/validation-2026-07-10-wsl-moss.md
 ```
 
 技术约束：
@@ -43,18 +44,20 @@ docs/qwen-hf-native-migration-plan.md
 - 模型包很重，安装前先检查磁盘空间、CUDA、`nvidia-smi`。
 - RTX 5070 Ti 较新，必须显式安装并验证 CUDA 版 torch，防止误装 CPU 版 torch。
 
-初版模型只包含：
+默认模型注册包含：
 
 - `qwen3-asr-1.7b`
 - `qwen3-asr-0.6b`
 
-MiMo-V2.5-ASR 不进入初版交付范围；不要把 MiMo 写进 `/v1/models`，也不要把 MiMo 转写作为初版验收项。
+`moss-transcribe-diarize-0.9b` 只有在 WSL 侧 MOSS smoke 通过并设置 `ASR_ENABLE_MOSS=1` 后才进入 `/v1/models`。默认模型仍是 `qwen3-asr-1.7b`。
 
-## RTX 5070 Ti / Qwen3-ASR 安装要求
+MiMo-V2.5-ASR 不进入当前交付范围；不要把 MiMo 写进 `/v1/models`，也不要把 MiMo 转写作为验收项。
 
-真实推理依赖只能在 WSL Arch Linux 内安装。Mac mini 只做客户端验证，不安装 CUDA、torch GPU 包、Qwen 模型包或模型缓存。
+## RTX 5070 Ti / 真实模型安装要求
 
-先验收 torch CUDA，再安装 Qwen3-ASR。`nvidia-smi` 只能证明 WSL 能看到驱动和显卡，不能证明 Python 环境里的 torch 是 CUDA 版。不要直接裸跑 `pip install torch`，必须使用 PyTorch 官方 CUDA wheel 源，例如 CUDA 12.8 的 `cu128`：
+真实推理依赖只能在 WSL Arch Linux 内安装。Mac mini 只做客户端验证，不安装 CUDA、torch GPU 包、Qwen/MOSS 模型包或模型缓存。
+
+先验收 torch CUDA，再安装 Qwen/MOSS 运行时依赖。`nvidia-smi` 只能证明 WSL 能看到驱动和显卡，不能证明 Python 环境里的 torch 是 CUDA 版。不要直接裸跑 `pip install torch`，必须使用 PyTorch 官方 CUDA wheel 源，例如 CUDA 12.8 的 `cu128`：
 
 ```bash
 cd /home/fragt/services/asr-server
@@ -65,34 +68,21 @@ uv sync
 sudo pacman -Syu --needed git ffmpeg libsndfile
 
 nvidia-smi
-uv pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
+uv pip install --torch-backend cu128 -r requirements/wsl-gpu-cu128.txt
 uv run python - <<'PY'
 import torch
+import transformers
 
 print("torch:", torch.__version__)
 print("torch cuda:", torch.version.cuda)
 print("cuda available:", torch.cuda.is_available())
 assert torch.version.cuda is not None, "装到 CPU 版 torch 了"
 assert torch.cuda.is_available(), "torch 看不到 CUDA"
-print("device:", torch.cuda.get_device_name(0))
-print("capability:", torch.cuda.get_device_capability(0))
-PY
-```
-
-只有上面的 CUDA 验收通过后，才能安装 HF native Qwen3-ASR 依赖：
-
-```bash
-uv pip install -U transformers accelerate safetensors soundfile librosa
-
-uv run python - <<'PY'
-import torch
-import transformers
-
-assert torch.version.cuda is not None, "HF 依赖安装后 torch 变成 CPU 版"
-assert torch.cuda.is_available(), "HF 依赖安装后 CUDA 不可用"
 assert hasattr(transformers, "AutoProcessor")
 assert hasattr(transformers, "AutoModelForMultimodalLM")
-print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))
+assert hasattr(transformers, "AutoModelForCausalLM")
+print("device:", torch.cuda.get_device_name(0))
+print("capability:", torch.cuda.get_device_capability(0))
 PY
 ```
 
@@ -100,7 +90,7 @@ PY
 
 如果 RTX 5070 Ti 报 `no kernel image is available`、架构不支持或 CUDA capability 不匹配，不要退回 CPU 版 torch；应改用支持该显卡的更新官方 CUDA wheel 或 PyTorch nightly，并重新跑 CUDA 验收脚本。
 
-`/v1/models` 中只能声明真实跑通过的后端。第一版只声明 `transformers`，`vllm` 延后。
+`/v1/models` 中只能声明真实跑通过的模型、后端和能力。当前只声明 `transformers` 后端，`vllm` 延后。
 
 ## 服务端开发前的后端预验收
 
@@ -118,7 +108,18 @@ uv run python scripts/qwen_asr_backend_smoke.py \
   --language auto
 ```
 
-`transformers` 命令必须返回非空文本。第一版不要在 `/v1/models` 中声明 `vllm`。
+`transformers` 命令必须返回非空文本。当前不要在 `/v1/models` 中声明 `vllm`。
+
+如果任务涉及启用 MOSS，还必须先跑：
+
+```bash
+uv run python scripts/moss_backend_smoke.py \
+  --model OpenMOSS-Team/MOSS-Transcribe-Diarize \
+  --audio test-fixtures/audio/test_short.wav \
+  --language auto
+```
+
+MOSS smoke 必须返回非空文本和可解析 segments。未通过前不要设置 `ASR_ENABLE_MOSS=1`。
 
 必须实现的 API：
 
@@ -141,10 +142,10 @@ DELETE /v1/jobs/{job_id}
 
 - `POST /v1/audio/transcription-jobs` 快速返回 `202 Accepted`、`job_id`、`status_url`，不要在这个 HTTP 请求内执行完整转录。
 - `GET /v1/jobs/{job_id}` 返回 job 状态、队列位置、阶段、chunk 级进度、错误或最终结果。
-- `DELETE /v1/jobs/{job_id}` 支持保守取消；正在 Qwen 推理的 chunk 不要强杀，等当前 chunk 完成后停止后续 chunk。
+- `DELETE /v1/jobs/{job_id}` 支持保守取消；正在模型推理的 chunk 不要强杀，等当前 chunk 完成后停止后续 chunk。
 - 只做内存 JobManager 和单 worker FIFO 队列；不要引入 Redis、Celery、数据库、多 worker 或多 GPU 调度。
 - 服务端可接收多个 job，但同一时间只运行一个转录 job；后来的 job 显示 `queued` 和 `queue_position`。
-- 进度只承诺阶段和 chunk 级真实进度；不要伪造单个 Qwen chunk 内部百分比。
+- 进度只承诺阶段和 chunk 级真实进度；不要伪造单个模型 chunk 内部百分比。
 
 模型状态枚举：
 
@@ -178,10 +179,12 @@ asr_server/
   errors.py
   registry.py
   lifecycle.py
+  jobs.py
   adapters/
     __init__.py
     base.py
     qwen.py
+    moss.py
 tests/
   test_health.py
   test_models.py
@@ -197,12 +200,13 @@ README.md
 2. 在 WSL Arch Linux 的 `/home/fragt/services/asr-server` 部署项目，不要放在 `/mnt/c`。
 3. 检查磁盘空间、CUDA、`nvidia-smi`、Python 3.12、uv。
 4. 先用 `scripts/qwen_asr_backend_smoke.py` 跑通 HF native `transformers` 最小转录流程。
-5. 接入 Qwen3-ASR 适配器，真实跑通 `qwen3-asr-0.6b` 与 `qwen3-asr-1.7b`。
-6. 对 `/v1/models` 中声明的每个后端都做端到端转写验收；若某个后端不能跑通，不要声明它。
-7. 保持 mock 适配器测试可在无 GPU 环境通过。
-8. 增加 systemd user service 或 Windows 启动任务，让服务可后台常驻。
-9. 从 Mac mini 验收局域网调用。
-10. 保持异步转录 job、FIFO 串行队列、轮询状态和 chunk 级真实进度稳定。不要做 vLLM、WebSocket streaming、MiMo、ForcedAligner、数据库队列或多 worker 并发推理。`*-hf` 路径只在执行 `docs/qwen-hf-native-migration-plan.md` 时进入范围。
+5. 维护 Qwen3-ASR 适配器，真实跑通 `qwen3-asr-0.6b` 与 `qwen3-asr-1.7b`。
+6. 如任务涉及 MOSS，先跑 `scripts/moss_backend_smoke.py`，再用 `ASR_ENABLE_MOSS=1` 验证 `moss-transcribe-diarize-0.9b`。
+7. 对 `/v1/models` 中声明的每个模型和后端都做端到端转写验收；若某个模型、后端或能力不能跑通，不要声明它。
+8. 保持 mock 适配器测试可在无 GPU 环境通过。
+9. 维护 systemd user service 或 Windows 启动任务，让服务可后台常驻。
+10. 从 Mac mini 验收局域网调用。
+11. 保持异步转录 job、FIFO 串行队列、轮询状态和 chunk 级真实进度稳定。不要做 vLLM、WebSocket streaming、MiMo、ForcedAligner、数据库队列或多 worker 并发推理。
 
 测试命令：
 
@@ -229,6 +233,7 @@ curl --noproxy '*' -v http://192.168.31.137:18080/v1/models
 - 给出 `scripts/qwen_asr_backend_smoke.py` 在 `transformers` 后端的最小转录验收结果。
 - 给出 `qwen3-asr-0.6b` 在所有声明后端上的真实音频转写验收结果。
 - 给出 `qwen3-asr-1.7b` 在所有声明后端上的真实音频转写验收结果。
+- 如果启用 MOSS，给出 `scripts/moss_backend_smoke.py` 和 `moss-transcribe-diarize-0.9b` 服务端 `verbose_json` segments 验收结果。
 - 给出 Mac 到 WSL 局域网 job 创建和轮询到 completed 的验收结果。
 
 不要做：

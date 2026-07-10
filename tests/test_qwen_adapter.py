@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
+from pathlib import Path
 
 import pytest
 
+from asr_server.adapters.base import AudioPath
 from asr_server.adapters.qwen import MODEL_REPOS, QwenAsrAdapter, _QwenWorkerBackend
 from asr_server.errors import AsrError
 
@@ -69,6 +71,16 @@ class FakeConnection:
         }
 
 
+class FakeTransport:
+    def __init__(self, conn: FakeConnection) -> None:
+        self.conn = conn
+
+    def request(self, op: str, *, timeout_seconds: float, **payload: object) -> object:
+        del timeout_seconds
+        self.conn.send({"id": len(self.conn.sent) + 1, "op": op, **payload})
+        return self.conn.recv()["result"]
+
+
 class CleanupModel:
     def __init__(self) -> None:
         self.closed = False
@@ -107,8 +119,9 @@ async def test_qwen_load_uses_hf_native_transformers_without_qwen_asr(monkeypatc
 
     class FakeProcessor:
         @classmethod
-        def from_pretrained(cls, repo_id: str) -> "FakeProcessor":
+        def from_pretrained(cls, repo_id: str, *, revision: str) -> "FakeProcessor":
             calls.append(("processor_repo", repo_id))
+            calls.append(("processor_revision", revision))
             return cls()
 
         def apply_transcription_request(self, *, audio: str, language: str | None) -> FakeHfInputs:
@@ -126,8 +139,9 @@ async def test_qwen_load_uses_hf_native_transformers_without_qwen_asr(monkeypatc
         dtype = "bf16"
 
         @classmethod
-        def from_pretrained(cls, repo_id: str, *, dtype: object) -> "FakeModel":
+        def from_pretrained(cls, repo_id: str, *, revision: str, dtype: object) -> "FakeModel":
             calls.append(("model_repo", repo_id))
+            calls.append(("model_revision", revision))
             calls.append(("dtype", dtype))
             return cls()
 
@@ -309,8 +323,7 @@ async def test_qwen_transcribe_falls_back_without_torch(monkeypatch: pytest.Monk
 async def test_qwen_adapter_transcribe_uses_worker_protocol() -> None:
     adapter = QwenAsrAdapter("qwen3-asr-0.6b")
     conn = FakeConnection()
-    adapter._worker = FakeWorker()
-    adapter._conn = conn  # type: ignore[assignment]
+    adapter._transport = FakeTransport(conn)  # type: ignore[assignment]
 
     result = await adapter.transcribe(
         b"audio",
@@ -333,6 +346,25 @@ async def test_qwen_adapter_transcribe_uses_worker_protocol() -> None:
             "max_new_tokens": 128,
         }
     ]
+
+
+async def test_qwen_worker_protocol_sends_path_descriptor_not_audio_bytes(tmp_path: Path) -> None:
+    audio_path = tmp_path / "normalized.wav"
+    audio_path.write_bytes(b"wav")
+    adapter = QwenAsrAdapter("qwen3-asr-0.6b")
+    conn = FakeConnection()
+    adapter._transport = FakeTransport(conn)  # type: ignore[assignment]
+
+    await adapter.transcribe(
+        AudioPath(audio_path, start=1.0, end=2.0),
+        model_id="qwen3-asr-0.6b",
+        backend="transformers",
+        language="auto",
+        context="",
+        max_new_tokens=128,
+    )
+
+    assert isinstance(conn.sent[0]["audio"], AudioPath)
 
 
 async def test_qwen_unload_releases_model_and_cuda_cache(monkeypatch: pytest.MonkeyPatch) -> None:

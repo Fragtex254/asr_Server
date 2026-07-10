@@ -3,23 +3,26 @@ from __future__ import annotations
 import gc
 import importlib
 import logging
-import multiprocessing
+import os
 import signal
-import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
-from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-from asr_server.adapters.base import TranscriptionResult, TranscriptionSegment, TranscriptionTimings
+from asr_server.adapters.base import AudioInput, TranscriptionResult, TranscriptionSegment, TranscriptionTimings
 from asr_server.errors import AsrError
 from asr_server.registry import MOSS_MODEL_ID
+from asr_server.workers.transport import ProcessRpcTransport
+from asr_server.workers.audio import audio_duration_seconds, materialized_audio_path
 
 
 MODEL_REPOS = {
     MOSS_MODEL_ID: "OpenMOSS-Team/MOSS-Transcribe-Diarize",
+}
+MODEL_REVISIONS = {
+    MOSS_MODEL_ID: "d7231bbae2587a4af278735eb765b318c4f64edd",
 }
 DEFAULT_MOSS_PROMPT = (
     "请将音频转写为文本，每一段需以起始时间戳和说话人编号"
@@ -38,6 +41,9 @@ def _moss_worker_main(conn: Connection, model_id: str) -> None:
             request_id = request.get("id")
             op = request.get("op")
             try:
+                if op == "ping":
+                    conn.send({"id": request_id, "ok": True, "result": {"pid": os.getpid()}})
+                    continue
                 if op == "load":
                     _run_async(
                         backend.load(
@@ -52,7 +58,7 @@ def _moss_worker_main(conn: Connection, model_id: str) -> None:
                 if op == "transcribe":
                     result = _run_async(
                         backend.transcribe(
-                            bytes(request["audio"]),
+                            request["audio"],
                             model_id=model_id,
                             backend=backend.loaded_backend or "transformers",
                             language=str(request["language"]),
@@ -170,50 +176,53 @@ def _error_to_payload(error: AsrError) -> dict[str, object]:
 class MossTranscribeDiarizeAdapter:
     """MOSS-Transcribe-Diarize adapter with GPU work isolated in a child process."""
 
-    def __init__(self, model_id: str) -> None:
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        startup_timeout_seconds: float = 30.0,
+        load_timeout_seconds: float = 900.0,
+        inference_timeout_seconds: float = 3600.0,
+        shutdown_timeout_seconds: float = 10.0,
+    ) -> None:
         self.model_id = model_id
         self.loaded_backend: str | None = None
-        self._worker: Any | None = None
-        self._conn: Connection | None = None
-        self._request_id = 0
+        self._load_timeout_seconds = load_timeout_seconds
+        self._inference_timeout_seconds = inference_timeout_seconds
+        self._shutdown_timeout_seconds = shutdown_timeout_seconds
+        self._transport = ProcessRpcTransport(
+            name=f"MOSS {model_id}",
+            target=_moss_worker_main,
+            target_args=(model_id,),
+            startup_timeout_seconds=startup_timeout_seconds,
+        )
 
     async def load(self, backend: str, device: str, dtype: str, max_new_tokens: int | None = None) -> None:
-        if self._worker is None or self._conn is None or not self._worker.is_alive():
-            self._start_worker()
-        self._request("load", backend=backend, device=device, dtype=dtype, max_new_tokens=max_new_tokens)
+        self._transport.start()
+        self._request(
+            "load",
+            timeout_seconds=self._load_timeout_seconds,
+            backend=backend,
+            device=device,
+            dtype=dtype,
+            max_new_tokens=max_new_tokens,
+        )
         self.loaded_backend = backend
 
     async def unload(self, cuda_empty_cache: bool) -> None:
         self.loaded_backend = None
-        worker = self._worker
-        conn = self._conn
-        self._worker = None
-        self._conn = None
-        if worker is None:
-            return
-        if conn is not None and worker.is_alive():
-            try:
-                self._request_on(conn, "shutdown", cuda_empty_cache=cuda_empty_cache)
-            except AsrError as exc:
-                logger.warning("MOSS worker graceful shutdown failed: %s", exc.message)
-            except (BrokenPipeError, EOFError, OSError) as exc:
-                logger.warning("MOSS worker pipe closed during shutdown: %s", exc)
-        if worker.is_alive():
-            worker.join(timeout=10)
-        if worker.is_alive():
-            logger.warning("MOSS worker did not exit after unload; terminating pid=%s", worker.pid)
-            worker.terminate()
-            worker.join(timeout=5)
-        if worker.is_alive():
-            logger.warning("MOSS worker did not terminate cleanly; killing pid=%s", worker.pid)
-            worker.kill()
-            worker.join(timeout=5)
-        if conn is not None:
-            conn.close()
+        self._transport.shutdown(
+            timeout_seconds=self._shutdown_timeout_seconds,
+            cuda_empty_cache=cuda_empty_cache,
+        )
+
+    async def abort(self) -> None:
+        self.loaded_backend = None
+        self._transport.close(force=True)
 
     async def transcribe(
         self,
-        audio: bytes,
+        audio: AudioInput,
         *,
         model_id: str,
         backend: str,
@@ -221,11 +230,12 @@ class MossTranscribeDiarizeAdapter:
         context: str,
         max_new_tokens: int | None,
     ) -> TranscriptionResult:
-        del model_id, backend, language
+        del model_id, backend
         payload = self._request(
             "transcribe",
+            timeout_seconds=self._inference_timeout_seconds,
             audio=audio,
-            language="auto",
+            language=language,
             context=context,
             max_new_tokens=max_new_tokens,
         )
@@ -233,7 +243,7 @@ class MossTranscribeDiarizeAdapter:
 
     async def transcribe_batch(
         self,
-        audio_chunks: list[bytes],
+        audio_chunks: list[AudioInput],
         *,
         model_id: str,
         backend: str,
@@ -241,51 +251,19 @@ class MossTranscribeDiarizeAdapter:
         context: str,
         max_new_tokens: int | None,
     ) -> list[TranscriptionResult]:
-        del model_id, backend, language
+        del model_id, backend
         payload = self._request(
             "transcribe_batch",
+            timeout_seconds=self._inference_timeout_seconds,
             audio_chunks=audio_chunks,
-            language="auto",
+            language=language,
             context=context,
             max_new_tokens=max_new_tokens,
         )
         return [_result_from_payload(item) for item in payload]
 
-    def _start_worker(self) -> None:
-        parent_conn, child_conn = multiprocessing.get_context("spawn").Pipe()
-        worker = multiprocessing.get_context("spawn").Process(
-            target=_moss_worker_main,
-            args=(child_conn, self.model_id),
-            daemon=True,
-        )
-        worker.start()
-        child_conn.close()
-        self._worker = worker
-        self._conn = parent_conn
-
-    def _request(self, op: str, **payload: object) -> Any:
-        conn = self._conn
-        worker = self._worker
-        if conn is None or worker is None or not worker.is_alive():
-            raise AsrError(409, "model_loading", "MOSS worker is not running")
-        return self._request_on(conn, op, **payload)
-
-    def _request_on(self, conn: Connection, op: str, **payload: object) -> Any:
-        self._request_id += 1
-        request_id = self._request_id
-        conn.send({"id": request_id, "op": op, **payload})
-        response = conn.recv()
-        if response.get("id") != request_id:
-            raise AsrError(503, "inference_failed", "MOSS worker returned an unexpected response")
-        if response.get("ok"):
-            return response.get("result")
-        error = response.get("error", {})
-        raise AsrError(
-            int(error.get("status_code", 503)),
-            str(error.get("code", "inference_failed")),
-            str(error.get("message", "MOSS worker failed")),
-            dict(error.get("details", {})),
-        )
+    def _request(self, op: str, *, timeout_seconds: float, **payload: object) -> Any:
+        return self._transport.request(op, timeout_seconds=timeout_seconds, **payload)
 
 
 @dataclass(frozen=True)
@@ -323,16 +301,17 @@ class _MossWorkerBackend:
         processor_cls, model_cls = self._import_transformers()
         helpers = self._import_moss_helpers()
         repo_id = MODEL_REPOS[self.model_id]
+        revision = MODEL_REVISIONS[self.model_id]
         if self._model is not None:
             await self.unload(cuda_empty_cache=True)
         try:
             model = (
-                model_cls.from_pretrained(repo_id, trust_remote_code=True, dtype="auto")
+                model_cls.from_pretrained(repo_id, revision=revision, trust_remote_code=True, dtype="auto")
                 .to(dtype=torch_dtype)
                 .to(torch_device)
                 .eval()
             )
-            processor = processor_cls.from_pretrained(repo_id, trust_remote_code=True)
+            processor = processor_cls.from_pretrained(repo_id, revision=revision, trust_remote_code=True)
             self._model = model
             self._processor = processor
             self._torch = torch
@@ -366,7 +345,7 @@ class _MossWorkerBackend:
 
     async def transcribe(
         self,
-        audio: bytes,
+        audio: AudioInput,
         *,
         model_id: str,
         backend: str,
@@ -374,16 +353,13 @@ class _MossWorkerBackend:
         context: str,
         max_new_tokens: int | None,
     ) -> TranscriptionResult:
-        del model_id, backend, language
+        del model_id, backend
         model = self._model
         processor = self._processor
         helpers = self._helpers
         if model is None or processor is None or helpers is None:
             raise AsrError(409, "model_loading", "MOSS model is not loaded")
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as audio_file:
-            audio_file.write(audio)
-            audio_path = Path(audio_file.name)
-        try:
+        with materialized_audio_path(audio, suffix=".wav") as audio_path:
             inference_started = perf_counter()
             try:
                 result = helpers.generate_transcription(
@@ -391,7 +367,7 @@ class _MossWorkerBackend:
                     processor,
                     helpers.build_transcription_messages(
                         str(audio_path),
-                        prompt=self._prompt_for_context(context, helpers.default_prompt),
+                        prompt=self._prompt_for_request(context, language, helpers.default_prompt),
                     ),
                     max_new_tokens=max_new_tokens or self._max_new_tokens or 2048,
                     do_sample=False,
@@ -405,26 +381,23 @@ class _MossWorkerBackend:
             raw_text = self._result_text(result)
             if not raw_text.strip():
                 raise AsrError(503, "inference_failed", "MOSS returned an empty transcription result")
-            segments = self._parse_segments(raw_text, helpers)
+            segments, parse_warnings = self._parse_segments(raw_text, helpers, audio_duration_seconds(audio))
             text = "\n".join(segment.text for segment in segments) if segments else raw_text
             postprocess_ms = (perf_counter() - postprocess_started) * 1000
             return TranscriptionResult(
                 text=text,
-                duration=max(len(audio) / 16_000, 0.01),
-                language="auto",
-                warnings=[],
+                duration=audio_duration_seconds(audio),
+                language=language,
+                warnings=parse_warnings,
                 segments=segments,
                 timings=TranscriptionTimings(
                     inference_ms=inference_ms,
                     postprocess_ms=postprocess_ms,
                 ),
             )
-        finally:
-            audio_path.unlink(missing_ok=True)
-
     async def transcribe_batch(
         self,
-        audio_chunks: list[bytes],
+        audio_chunks: list[AudioInput],
         *,
         model_id: str,
         backend: str,
@@ -536,11 +509,13 @@ class _MossWorkerBackend:
             parse_transcript=parse_transcript,
         )
 
-    def _prompt_for_context(self, context: str, default_prompt: str) -> str:
+    def _prompt_for_request(self, context: str, language: str, default_prompt: str) -> str:
+        language_instruction = {
+            "zh": "请仅使用中文转写。",
+            "en": "Transcribe in English only.",
+        }.get(language, "")
         stripped = context.strip()
-        if not stripped:
-            return default_prompt
-        return f"{default_prompt}\n{stripped}"
+        return "\n".join(part for part in (default_prompt, language_instruction, stripped) if part)
 
     def _result_text(self, result: object) -> str:
         if isinstance(result, dict):
@@ -549,17 +524,55 @@ class _MossWorkerBackend:
         text = getattr(result, "text", "")
         return text if isinstance(text, str) else str(text)
 
-    def _parse_segments(self, text: str, helpers: _MossHelpers) -> list[TranscriptionSegment]:
+    def _parse_segments(
+        self,
+        text: str,
+        helpers: _MossHelpers,
+        chunk_duration: float,
+    ) -> tuple[list[TranscriptionSegment], list[str]]:
         try:
             parsed = helpers.parse_transcript(text)
         except Exception as exc:
-            raise AsrError(
-                503,
-                "inference_failed",
-                "MOSS transcript parser failed",
-                {"error_type": type(exc).__name__, "message": str(exc)[-500:]},
-            ) from exc
-        return [self._segment_from_parsed(segment) for segment in parsed]
+            return [], [f"moss_segment_parser_failed:{type(exc).__name__}"]
+        if not isinstance(parsed, list | tuple):
+            return [], ["moss_segment_parser_invalid_structure"]
+        segments: list[TranscriptionSegment] = []
+        warnings: list[str] = []
+        for raw_segment in parsed:
+            try:
+                segment = self._segment_from_parsed(raw_segment)
+            except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+                warnings.append("moss_segment_invalid_structure")
+                continue
+            normalized, warning = self._normalize_segment(segment, chunk_duration)
+            if warning is not None:
+                warnings.append(warning)
+            if normalized is not None:
+                segments.append(normalized)
+        segments.sort(key=lambda item: (item.start, item.end))
+        return segments, list(dict.fromkeys(warnings))
+
+    def _normalize_segment(
+        self,
+        segment: TranscriptionSegment,
+        chunk_duration: float,
+    ) -> tuple[TranscriptionSegment | None, str | None]:
+        import math
+
+        if not math.isfinite(segment.start) or not math.isfinite(segment.end):
+            return None, "moss_segment_non_finite"
+        if segment.start < 0 or segment.end < segment.start:
+            return None, "moss_segment_invalid_range"
+        epsilon = 0.05
+        if segment.start > chunk_duration + epsilon or segment.end > chunk_duration + epsilon:
+            return None, "moss_segment_out_of_chunk_bounds"
+        start = min(max(segment.start, 0.0), chunk_duration)
+        end = min(max(segment.end, start), chunk_duration)
+        text = segment.text.strip()
+        if not text:
+            return None, "moss_segment_empty_text"
+        warning = "moss_segment_clamped_to_chunk" if (start, end) != (segment.start, segment.end) else None
+        return TranscriptionSegment(start=start, end=end, speaker=segment.speaker, text=text), warning
 
     def _segment_from_parsed(self, segment: object) -> TranscriptionSegment:
         if isinstance(segment, dict):

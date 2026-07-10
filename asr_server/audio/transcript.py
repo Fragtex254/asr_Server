@@ -102,12 +102,12 @@ def _overlap_prefix_length(previous_text: str, current_text: str) -> int:
     for length in range(max_length, 1, -1):
         prefix = current[:length]
         previous_tail = previous[-OVERLAP_SEARCH_CHARS:]
-        if previous.endswith(prefix) or prefix in previous_tail:
+        if previous.endswith(prefix):
             return length
         normalized_prefix = _normalize_overlap_text(prefix)
         normalized_tail = _normalize_overlap_text(previous_tail)
         if len(normalized_prefix) >= 2 and (
-            normalized_tail.endswith(normalized_prefix) or normalized_prefix in normalized_tail
+            normalized_tail.endswith(normalized_prefix)
         ):
             return length
     return _fuzzy_overlap_prefix_length(previous, current)

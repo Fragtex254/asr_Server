@@ -20,6 +20,17 @@ class Settings:
     idle_unload_seconds: float = 180.0
     max_queued_jobs: int = 20
     max_upload_mb: int = 512
+    ffprobe_timeout_seconds: float = 30.0
+    ffmpeg_timeout_seconds: float = 1800.0
+    worker_startup_timeout_seconds: float = 30.0
+    worker_load_timeout_seconds: float = 900.0
+    worker_inference_timeout_seconds: float = 3600.0
+    worker_shutdown_timeout_seconds: float = 10.0
+    job_shutdown_grace_seconds: float = 30.0
+    min_free_disk_mb: int = 5120
+    max_spool_mb: int = 12288
+    max_workspace_mb: int = 1280
+    max_workspace_files: int = 8
 
 
 def load_settings() -> Settings:
@@ -43,6 +54,19 @@ def load_settings() -> Settings:
     max_upload_mb = int(os.getenv("ASR_MAX_UPLOAD_MB", "512"))
     if max_upload_mb < 1:
         raise ValueError("ASR_MAX_UPLOAD_MB must be greater than or equal to 1")
+    ffprobe_timeout_seconds = _positive_float("ASR_FFPROBE_TIMEOUT_SECONDS", 30.0)
+    ffmpeg_timeout_seconds = _positive_float("ASR_FFMPEG_TIMEOUT_SECONDS", 1800.0)
+    worker_startup_timeout_seconds = _positive_float("ASR_WORKER_STARTUP_TIMEOUT_SECONDS", 30.0)
+    worker_load_timeout_seconds = _positive_float("ASR_WORKER_LOAD_TIMEOUT_SECONDS", 900.0)
+    worker_inference_timeout_seconds = _positive_float("ASR_WORKER_INFERENCE_TIMEOUT_SECONDS", 3600.0)
+    worker_shutdown_timeout_seconds = _positive_float("ASR_WORKER_SHUTDOWN_TIMEOUT_SECONDS", 10.0)
+    job_shutdown_grace_seconds = _positive_float("ASR_JOB_SHUTDOWN_GRACE_SECONDS", 30.0)
+    min_free_disk_mb = int(os.getenv("ASR_MIN_FREE_DISK_MB", "5120"))
+    max_spool_mb = int(os.getenv("ASR_MAX_SPOOL_MB", "12288"))
+    max_workspace_mb = int(os.getenv("ASR_MAX_WORKSPACE_MB", "1280"))
+    max_workspace_files = int(os.getenv("ASR_MAX_WORKSPACE_FILES", "8"))
+    if min_free_disk_mb < 0 or max_spool_mb < 1 or max_workspace_mb < 1 or max_workspace_files < 1:
+        raise ValueError("ASR disk and workspace limits must be non-negative/positive")
     return Settings(
         host=os.getenv("ASR_HOST", "0.0.0.0"),
         port=int(os.getenv("ASR_PORT", "18080")),
@@ -55,6 +79,17 @@ def load_settings() -> Settings:
         idle_unload_seconds=idle_unload_seconds,
         max_queued_jobs=max_queued_jobs,
         max_upload_mb=max_upload_mb,
+        ffprobe_timeout_seconds=ffprobe_timeout_seconds,
+        ffmpeg_timeout_seconds=ffmpeg_timeout_seconds,
+        worker_startup_timeout_seconds=worker_startup_timeout_seconds,
+        worker_load_timeout_seconds=worker_load_timeout_seconds,
+        worker_inference_timeout_seconds=worker_inference_timeout_seconds,
+        worker_shutdown_timeout_seconds=worker_shutdown_timeout_seconds,
+        job_shutdown_grace_seconds=job_shutdown_grace_seconds,
+        min_free_disk_mb=min_free_disk_mb,
+        max_spool_mb=max_spool_mb,
+        max_workspace_mb=max_workspace_mb,
+        max_workspace_files=max_workspace_files,
     )
 
 
@@ -68,3 +103,10 @@ def _env_bool(name: str, *, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be a boolean value")
+
+
+def _positive_float(name: str, default: float) -> float:
+    value = float(os.getenv(name, str(default)))
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than 0")
+    return value

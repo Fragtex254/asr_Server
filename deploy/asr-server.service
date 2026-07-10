@@ -11,11 +11,22 @@ Environment=ASR_PORT=18080
 Environment=ASR_ADAPTER=qwen
 Environment=ASR_QWEN_BATCH_SIZE=1
 Environment=ASR_IDLE_UNLOAD_SECONDS=180
+Environment=ASR_WORKER_STARTUP_TIMEOUT_SECONDS=30
+Environment=ASR_WORKER_LOAD_TIMEOUT_SECONDS=900
+Environment=ASR_WORKER_INFERENCE_TIMEOUT_SECONDS=3600
+Environment=ASR_WORKER_SHUTDOWN_TIMEOUT_SECONDS=10
+Environment=ASR_JOB_SHUTDOWN_GRACE_SECONDS=30
+Environment=ASR_MIN_FREE_DISK_MB=5120
+Environment=ASR_MAX_SPOOL_MB=12288
+Environment=ASR_MAX_WORKSPACE_MB=1280
+Environment=ASR_MAX_WORKSPACE_FILES=8
 Environment=HF_HUB_OFFLINE=1
 Environment=TRANSFORMERS_OFFLINE=1
 ExecStart=/home/fragt/services/asr-server/.venv/bin/uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=60
+KillMode=mixed
 
 [Install]
 WantedBy=default.target

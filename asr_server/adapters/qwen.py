@@ -3,23 +3,27 @@ from __future__ import annotations
 import gc
 import importlib
 import logging
-import multiprocessing
+import os
 import signal
-import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
-from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-from asr_server.adapters.base import TranscriptionResult, TranscriptionSegment, TranscriptionTimings
+from asr_server.adapters.base import AudioInput, TranscriptionResult, TranscriptionSegment, TranscriptionTimings
 from asr_server.errors import AsrError
+from asr_server.workers.audio import audio_duration_seconds, materialized_audio_path
+from asr_server.workers.transport import ProcessRpcTransport
 
 
 MODEL_REPOS = {
     "qwen3-asr-0.6b": "Qwen/Qwen3-ASR-0.6B-hf",
     "qwen3-asr-1.7b": "Qwen/Qwen3-ASR-1.7B-hf",
+}
+MODEL_REVISIONS = {
+    "qwen3-asr-0.6b": "6aa69c382e2b426eee1f5870d4c95859a74b6445",
+    "qwen3-asr-1.7b": "057a3b044fcd31c433e7971ab40d68d20e7eae6d",
 }
 logger = logging.getLogger(__name__)
 
@@ -33,6 +37,9 @@ def _qwen_worker_main(conn: Connection, model_id: str) -> None:
             request_id = request.get("id")
             op = request.get("op")
             try:
+                if op == "ping":
+                    conn.send({"id": request_id, "ok": True, "result": {"pid": os.getpid()}})
+                    continue
                 if op == "load":
                     _run_async(
                         backend.load(
@@ -47,7 +54,7 @@ def _qwen_worker_main(conn: Connection, model_id: str) -> None:
                 if op == "transcribe":
                     result = _run_async(
                         backend.transcribe(
-                            bytes(request["audio"]),
+                            request["audio"],
                             model_id=model_id,
                             backend=backend.loaded_backend or "transformers",
                             language=str(request["language"]),
@@ -165,50 +172,53 @@ def _error_to_payload(error: AsrError) -> dict[str, object]:
 class QwenAsrAdapter:
     """Qwen3-ASR adapter with GPU work isolated in a child process."""
 
-    def __init__(self, model_id: str) -> None:
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        startup_timeout_seconds: float = 30.0,
+        load_timeout_seconds: float = 900.0,
+        inference_timeout_seconds: float = 3600.0,
+        shutdown_timeout_seconds: float = 10.0,
+    ) -> None:
         self.model_id = model_id
         self.loaded_backend: str | None = None
-        self._worker: Any | None = None
-        self._conn: Connection | None = None
-        self._request_id = 0
+        self._load_timeout_seconds = load_timeout_seconds
+        self._inference_timeout_seconds = inference_timeout_seconds
+        self._shutdown_timeout_seconds = shutdown_timeout_seconds
+        self._transport = ProcessRpcTransport(
+            name=f"Qwen {model_id}",
+            target=_qwen_worker_main,
+            target_args=(model_id,),
+            startup_timeout_seconds=startup_timeout_seconds,
+        )
 
     async def load(self, backend: str, device: str, dtype: str, max_new_tokens: int | None = None) -> None:
-        if self._worker is None or self._conn is None or not self._worker.is_alive():
-            self._start_worker()
-        self._request("load", backend=backend, device=device, dtype=dtype, max_new_tokens=max_new_tokens)
+        self._transport.start()
+        self._request(
+            "load",
+            timeout_seconds=self._load_timeout_seconds,
+            backend=backend,
+            device=device,
+            dtype=dtype,
+            max_new_tokens=max_new_tokens,
+        )
         self.loaded_backend = backend
 
     async def unload(self, cuda_empty_cache: bool) -> None:
         self.loaded_backend = None
-        worker = self._worker
-        conn = self._conn
-        self._worker = None
-        self._conn = None
-        if worker is None:
-            return
-        if conn is not None and worker.is_alive():
-            try:
-                self._request_on(conn, "shutdown", cuda_empty_cache=cuda_empty_cache)
-            except AsrError as exc:
-                logger.warning("Qwen worker graceful shutdown failed: %s", exc.message)
-            except (BrokenPipeError, EOFError, OSError) as exc:
-                logger.warning("Qwen worker pipe closed during shutdown: %s", exc)
-        if worker.is_alive():
-            worker.join(timeout=10)
-        if worker.is_alive():
-            logger.warning("Qwen worker did not exit after unload; terminating pid=%s", worker.pid)
-            worker.terminate()
-            worker.join(timeout=5)
-        if worker.is_alive():
-            logger.warning("Qwen worker did not terminate cleanly; killing pid=%s", worker.pid)
-            worker.kill()
-            worker.join(timeout=5)
-        if conn is not None:
-            conn.close()
+        self._transport.shutdown(
+            timeout_seconds=self._shutdown_timeout_seconds,
+            cuda_empty_cache=cuda_empty_cache,
+        )
+
+    async def abort(self) -> None:
+        self.loaded_backend = None
+        self._transport.close(force=True)
 
     async def transcribe(
         self,
-        audio: bytes,
+        audio: AudioInput,
         *,
         model_id: str,
         backend: str,
@@ -219,6 +229,7 @@ class QwenAsrAdapter:
         del model_id, backend
         payload = self._request(
             "transcribe",
+            timeout_seconds=self._inference_timeout_seconds,
             audio=audio,
             language=language,
             context=context,
@@ -228,7 +239,7 @@ class QwenAsrAdapter:
 
     async def transcribe_batch(
         self,
-        audio_chunks: list[bytes],
+        audio_chunks: list[AudioInput],
         *,
         model_id: str,
         backend: str,
@@ -239,6 +250,7 @@ class QwenAsrAdapter:
         del model_id, backend
         payload = self._request(
             "transcribe_batch",
+            timeout_seconds=self._inference_timeout_seconds,
             audio_chunks=audio_chunks,
             language=language,
             context=context,
@@ -246,41 +258,8 @@ class QwenAsrAdapter:
         )
         return [_result_from_payload(item) for item in payload]
 
-    def _start_worker(self) -> None:
-        parent_conn, child_conn = multiprocessing.get_context("spawn").Pipe()
-        worker = multiprocessing.get_context("spawn").Process(
-            target=_qwen_worker_main,
-            args=(child_conn, self.model_id),
-            daemon=True,
-        )
-        worker.start()
-        child_conn.close()
-        self._worker = worker
-        self._conn = parent_conn
-
-    def _request(self, op: str, **payload: object) -> Any:
-        conn = self._conn
-        worker = self._worker
-        if conn is None or worker is None or not worker.is_alive():
-            raise AsrError(409, "model_loading", "Qwen worker is not running")
-        return self._request_on(conn, op, **payload)
-
-    def _request_on(self, conn: Connection, op: str, **payload: object) -> Any:
-        self._request_id += 1
-        request_id = self._request_id
-        conn.send({"id": request_id, "op": op, **payload})
-        response = conn.recv()
-        if response.get("id") != request_id:
-            raise AsrError(503, "inference_failed", "Qwen worker returned an unexpected response")
-        if response.get("ok"):
-            return response.get("result")
-        error = response.get("error", {})
-        raise AsrError(
-            int(error.get("status_code", 503)),
-            str(error.get("code", "inference_failed")),
-            str(error.get("message", "Qwen worker failed")),
-            dict(error.get("details", {})),
-        )
+    def _request(self, op: str, *, timeout_seconds: float, **payload: object) -> Any:
+        return self._transport.request(op, timeout_seconds=timeout_seconds, **payload)
 
 
 class _QwenWorkerBackend:
@@ -300,11 +279,12 @@ class _QwenWorkerBackend:
         torch_dtype = self._resolve_torch_dtype(torch, dtype)
         processor_cls, model_cls = self._import_hf_native_transformers()
         repo_id = MODEL_REPOS[self.model_id]
+        revision = MODEL_REVISIONS[self.model_id]
         if self._model is not None:
             await self.unload(cuda_empty_cache=True)
         try:
-            processor = processor_cls.from_pretrained(repo_id)
-            model = model_cls.from_pretrained(repo_id, dtype=torch_dtype).to(device).eval()
+            processor = processor_cls.from_pretrained(repo_id, revision=revision)
+            model = model_cls.from_pretrained(repo_id, revision=revision, dtype=torch_dtype).to(device).eval()
             self._model = _HfNativeQwenModel(
                 processor=processor,
                 model=model,
@@ -331,7 +311,7 @@ class _QwenWorkerBackend:
 
     async def transcribe(
         self,
-        audio: bytes,
+        audio: AudioInput,
         *,
         model_id: str,
         backend: str,
@@ -343,10 +323,7 @@ class _QwenWorkerBackend:
         model = self._model
         if model is None:
             raise AsrError(409, "model_loading", "Qwen model is not loaded")
-        with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as audio_file:
-            audio_file.write(audio)
-            audio_path = Path(audio_file.name)
-        try:
+        with materialized_audio_path(audio, suffix=".wav") as audio_path:
             qwen_language = None if language == "auto" else language
             inference_started = perf_counter()
             transcribe_kwargs: dict[str, Any] = {"audio": str(audio_path), "language": qwen_language}
@@ -368,7 +345,7 @@ class _QwenWorkerBackend:
             postprocess_ms = (perf_counter() - postprocess_started) * 1000
             return TranscriptionResult(
                 text=text,
-                duration=max(len(audio) / 16_000, 0.01),
+                duration=audio_duration_seconds(audio),
                 language=detected_language,
                 warnings=self._result_warnings(first),
                 timings=TranscriptionTimings(
@@ -376,12 +353,9 @@ class _QwenWorkerBackend:
                     postprocess_ms=postprocess_ms,
                 ),
             )
-        finally:
-            audio_path.unlink(missing_ok=True)
-
     async def transcribe_batch(
         self,
-        audio_chunks: list[bytes],
+        audio_chunks: list[AudioInput],
         *,
         model_id: str,
         backend: str,
@@ -393,42 +367,40 @@ class _QwenWorkerBackend:
         model = self._model
         if model is None:
             raise AsrError(409, "model_loading", "Qwen model is not loaded")
-        audio_paths: list[Path] = []
+        # The HF helper does not provide a proven GPU-safe batch path here.
+        # Process one descriptor at a time so only one bounded chunk is materialized.
+        results = []
+        inference_started = perf_counter()
         try:
             for audio in audio_chunks:
-                with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as audio_file:
-                    audio_file.write(audio)
-                    audio_paths.append(Path(audio_file.name))
-            qwen_language = None if language == "auto" else language
-            inference_started = perf_counter()
-            try:
-                results = [
-                    self._transcribe_model(
-                        model,
-                        {
-                            "audio": str(audio_path),
-                            "language": qwen_language,
-                            "context": context,
-                            "max_new_tokens": max_new_tokens,
-                        },
-                    )[0]
-                    for audio_path in audio_paths
-                ]
-            except Exception as exc:
-                raise self._map_qwen_exception(exc, phase="inference", model_id=self.model_id) from exc
-            inference_ms = (perf_counter() - inference_started) * 1000
-            if len(results) != len(audio_chunks):
-                raise AsrError(
-                    503,
-                    "inference_failed",
-                    "Qwen batch transcription returned an unexpected result count",
-                    {"expected": len(audio_chunks), "actual": len(results)},
-                )
-            postprocess_started = perf_counter()
-            transcriptions = [
+                with materialized_audio_path(audio, suffix=".wav") as audio_path:
+                    qwen_language = None if language == "auto" else language
+                    results.append(
+                        self._transcribe_model(
+                            model,
+                            {
+                                "audio": str(audio_path),
+                                "language": qwen_language,
+                                "context": context,
+                                "max_new_tokens": max_new_tokens,
+                            },
+                        )[0]
+                    )
+        except Exception as exc:
+            raise self._map_qwen_exception(exc, phase="inference", model_id=self.model_id) from exc
+        inference_ms = (perf_counter() - inference_started) * 1000
+        if len(results) != len(audio_chunks):
+            raise AsrError(
+                503,
+                "inference_failed",
+                "Qwen batch transcription returned an unexpected result count",
+                {"expected": len(audio_chunks), "actual": len(results)},
+            )
+        postprocess_started = perf_counter()
+        transcriptions = [
                 TranscriptionResult(
                     text=self._non_empty_text(result),
-                    duration=max(len(audio) / 16_000, 0.01),
+                    duration=audio_duration_seconds(audio),
                     language=self._result_language(result) or ("zh" if language == "auto" else language),
                     warnings=self._result_warnings(result),
                     timings=TranscriptionTimings(
@@ -437,11 +409,11 @@ class _QwenWorkerBackend:
                     ),
                 )
                 for audio, result in zip(audio_chunks, results, strict=True)
-            ]
-            postprocess_ms = (perf_counter() - postprocess_started) * 1000
-            if transcriptions:
-                per_chunk_postprocess_ms = postprocess_ms / len(transcriptions)
-                transcriptions = [
+        ]
+        postprocess_ms = (perf_counter() - postprocess_started) * 1000
+        if transcriptions:
+            per_chunk_postprocess_ms = postprocess_ms / len(transcriptions)
+            transcriptions = [
                     TranscriptionResult(
                         text=result.text,
                         duration=result.duration,
@@ -453,11 +425,8 @@ class _QwenWorkerBackend:
                         ),
                     )
                     for result in transcriptions
-                ]
-            return transcriptions
-        finally:
-            for audio_path in audio_paths:
-                audio_path.unlink(missing_ok=True)
+            ]
+        return transcriptions
 
     def _import_hf_native_transformers(self) -> tuple[Any, Any]:
         try:

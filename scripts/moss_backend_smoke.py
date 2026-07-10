@@ -9,6 +9,7 @@ from typing import Any
 
 DEFAULT_MODEL = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
 DEFAULT_AUDIO = "test-fixtures/audio/test_short.wav"
+DEFAULT_REVISION = "d7231bbae2587a4af278735eb765b318c4f64edd"
 
 
 def require_cuda_torch() -> Any:
@@ -73,13 +74,18 @@ def run_smoke(args: argparse.Namespace) -> None:
     dtype = resolve_torch_dtype(torch, args.dtype)
     device = torch.device(args.device)
     model = (
-        model_cls.from_pretrained(args.model, trust_remote_code=True, dtype="auto")
+        model_cls.from_pretrained(args.model, revision=args.revision, trust_remote_code=True, dtype="auto")
         .to(dtype=dtype)
         .to(device)
         .eval()
     )
-    processor = processor_cls.from_pretrained(args.model, trust_remote_code=True)
-    messages = inference_utils.build_transcription_messages(str(args.audio), prompt=args.prompt)
+    processor = processor_cls.from_pretrained(args.model, revision=args.revision, trust_remote_code=True)
+    language_instruction = {
+        "zh": "请仅使用中文转写。",
+        "en": "Transcribe in English only.",
+    }.get(args.language, "")
+    prompt = "\n".join(part for part in (args.prompt, language_instruction) if part)
+    messages = inference_utils.build_transcription_messages(str(args.audio), prompt=prompt)
     result = inference_utils.generate_transcription(
         model,
         processor,
@@ -94,6 +100,8 @@ def run_smoke(args: argparse.Namespace) -> None:
     segments = moss_package.parse_transcript(text)
 
     print("model:", args.model)
+    print("revision:", args.revision)
+    print("language request:", args.language)
     print("backend: transformers")
     print("loader: hf-remote-code")
     print("max_new_tokens:", args.max_new_tokens)
@@ -110,10 +118,12 @@ def parse_args() -> argparse.Namespace:
         description="WSL 侧 MOSS-Transcribe-Diarize 最小后端验收脚本；先跑通它，再开启 ASR_ENABLE_MOSS。",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--revision", default=DEFAULT_REVISION)
     parser.add_argument("--audio", type=Path, default=Path(DEFAULT_AUDIO))
     parser.add_argument("--device", default="cuda", choices=["cuda", "cuda:0"])
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument("--language", default="auto", choices=["auto", "zh", "en"])
     parser.add_argument(
         "--prompt",
         default=(

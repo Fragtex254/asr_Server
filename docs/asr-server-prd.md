@@ -93,7 +93,7 @@ flowchart LR
 | --- | --- | --- | --- | --- |
 | Qwen3-ASR 0.6B | `qwen3-asr-0.6b` | 轻量转写、较低显存占用 | 离线转写、语言提示、`transformers` 后端转写 | 质量和复杂音频能力弱于 1.7B；高级能力后续按实测结果逐项打开 |
 | Qwen3-ASR 1.7B | `qwen3-asr-1.7b` | 默认主力模型 | 离线转写、语言提示、`transformers` 后端转写 | 流式、时间戳、强制对齐、vLLM 等高级能力不阻塞初版发布 |
-| MOSS-Transcribe-Diarize | `moss-transcribe-diarize-0.9b` | 可选说话人分离、段级时间段 | 离线转写、语言提示、`transformers` 后端转写、`verbose_json` segments | 只在 `ASR_ENABLE_MOSS=1` 时声明；speaker label 跨 chunk 不保证全局一致；不声明 word/char timestamps、forced alignment、streaming 或 vLLM |
+| MOSS-Transcribe-Diarize | `moss-transcribe-diarize-0.9b` | 可选说话人分离、段级时间段 | 离线转写、`language=auto`、`transformers` 后端转写、`verbose_json` segments | 2026-07-10 对抗性 smoke 证明 `language=en` 不能可靠控制输出语言，因此当前只声明 `auto`；speaker label 仅在 chunk 内有效；不声明 word/char timestamps、forced alignment、streaming 或 vLLM |
 
 ## 6. API 设计
 
@@ -583,7 +583,7 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 输入字段扩展：
 
 - `files`：音频数组，可选；与单个 `file` 二选一。
-- `split_strategy`：`auto`、`none`、`fixed`、`silero`、`energy`、`vad`，默认 `auto`；`vad` 是兼容别名，当前默认语义指向 Silero VAD，Silero 不可用时 fallback 到 energy VAD。
+- `split_strategy`：`auto`、`none`、`fixed`、`silero`、`energy`、`vad`，默认 `auto`；`vad` 是兼容别名。生产 Path 管线当前优先使用 bounded streaming energy VAD；`silero` 在新的流式实现通过六小时 RSS 验收前会明确 fallback 到 energy 并返回 warning。
 - `max_chunk_seconds`：可选；用户给上限时不得超过服务端模型上限。
 - `overlap_seconds`：可选；默认由服务端决定。
 - `preserve_segments`：是否返回 chunk 级别结果，默认 `false`。
@@ -593,7 +593,7 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 1. 使用 FFmpeg 解码并规范化音频元数据，生成服务端临时 WAV/PCM。
 2. 统计总时长、采样率、声道数、文件大小。
 3. 如果音频短于当前模型的 `soft_chunk_seconds`，默认不切分。
-4. 如果音频较长，优先使用 Silero VAD 在人声边界切分；Silero 不可用时 fallback 到 energy VAD，再失败才固定窗口切分。
+4. 如果音频较长，使用 bounded streaming energy VAD 在人声边界切分，再失败才固定窗口切分。不得恢复旧的全量 Silero Python-float 路径；新的 bounded Silero 通过六小时 RSS 和边界正确性验收后才能重新成为首选。
 5. 每个 chunk 保留少量 overlap，降低切断词、切断句的概率。
 6. 合并时按原始时间线排序，去掉 overlap 中重复的文本或时间戳。
 7. 返回 `chunks` 调试信息，包括每段起止时间、模型、耗时、错误与警告。
@@ -662,6 +662,7 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 | HTTP | code | 场景 |
 | --- | --- | --- |
 | 400 | `bad_request` | 参数缺失、非法枚举值 |
+| 408 | `audio_probe_timeout` / `audio_preprocess_timeout` | ffprobe 或 FFmpeg 超过服务端 operation deadline |
 | 404 | `model_not_found` | 模型 ID 不存在 |
 | 404 | `job_not_found` | job ID 不存在、已过期或服务重启后丢失 |
 | 409 | `model_loading` | 模型正在加载，暂不能处理请求 |
@@ -673,6 +674,8 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 | 429 | `job_queue_full` | 异步转录队列达到服务端上限 |
 | 500 | `inference_failed` | 模型推理失败 |
 | 503 | `gpu_unavailable` | GPU 不可用或显存不足 |
+| 503 | `worker_unavailable` | 模型 Worker 超时、崩溃、Pipe 关闭或协议错误，旧进程已回收 |
+| 503 | `storage_unavailable` | 临时盘剩余空间、workspace bytes 或文件数量不足 |
 
 ## 8. 运行与部署
 

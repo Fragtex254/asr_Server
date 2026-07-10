@@ -3,14 +3,14 @@
 torch==2.11.0
 torchvision==0.26.0
 torchaudio==2.11.0
-transformers @ git+https://github.com/huggingface/transformers
-accelerate>=1.9.0
-safetensors>=0.5.0
-soundfile>=0.13.0
-librosa>=0.11.0
-av>=14.0
-soxr>=0.5
-numpy<2.5
+transformers @ git+https://github.com/huggingface/transformers@0bc355418bb265136a66c2dedc501066ffbc237d
+accelerate==1.12.0
+safetensors==0.8.0
+soundfile==0.14.0
+librosa==0.11.0
+av==17.1.0
+soxr==1.1.0
+numpy==2.4.6
 numba==0.65.1
 llvmlite==0.47.0
-moss-transcribe-diarize @ git+https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git
+moss-transcribe-diarize @ git+https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git@b5ad0f8386b155ddb89f9332ba3ca71891900357

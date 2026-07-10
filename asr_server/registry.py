@@ -100,6 +100,7 @@ class ModelDefinition:
     provider: str
     default: bool
     capabilities: ModelCapabilities
+    revision: str
 
 
 def default_models(
@@ -124,12 +125,14 @@ def default_models(
             provider="QwenLM",
             default=default_model_id == "qwen3-asr-1.7b",
             capabilities=qwen_capabilities,
+            revision="057a3b044fcd31c433e7971ab40d68d20e7eae6d",
         ),
         "qwen3-asr-0.6b": ModelDefinition(
             id="qwen3-asr-0.6b",
             provider="QwenLM",
             default=default_model_id == "qwen3-asr-0.6b",
             capabilities=qwen_capabilities,
+            revision="6aa69c382e2b426eee1f5870d4c95859a74b6445",
         ),
     }
     if enable_moss:
@@ -142,11 +145,12 @@ def default_models(
                 streaming=False,
                 timestamps=[],
                 forced_alignment=False,
-                languages=["auto", "zh", "en"],
+                languages=["auto"],
                 chinese_dialects=[],
                 backends=["transformers"],
                 diarization=True,
                 segment_timestamps=True,
             ),
+            revision="d7231bbae2587a4af278735eb765b318c4f64edd",
         )
     return models

@@ -8,6 +8,10 @@ from typing import Any
 
 DEFAULT_MODEL = "Qwen/Qwen3-ASR-0.6B-hf"
 DEFAULT_AUDIO = "test-fixtures/audio/test_short.wav"
+MODEL_REVISIONS = {
+    "Qwen/Qwen3-ASR-0.6B-hf": "6aa69c382e2b426eee1f5870d4c95859a74b6445",
+    "Qwen/Qwen3-ASR-1.7B-hf": "057a3b044fcd31c433e7971ab40d68d20e7eae6d",
+}
 
 
 def require_cuda_torch() -> Any:
@@ -75,8 +79,11 @@ def run_hf_native_transformers(args: argparse.Namespace) -> None:
     model_cls = getattr(transformers, "AutoModelForMultimodalLM", None)
     if processor_cls is None or model_cls is None:
         raise RuntimeError("当前 transformers 不包含 AutoProcessor/AutoModelForMultimodalLM；请升级 release 或安装 transformers main")
-    processor = processor_cls.from_pretrained(args.model)
-    model = model_cls.from_pretrained(args.model, dtype=resolve_torch_dtype(torch, args.dtype)).to(args.device).eval()
+    revision = args.revision or MODEL_REVISIONS.get(args.model)
+    if revision is None:
+        raise RuntimeError("unknown model requires an explicit --revision")
+    processor = processor_cls.from_pretrained(args.model, revision=revision)
+    model = model_cls.from_pretrained(args.model, revision=revision, dtype=resolve_torch_dtype(torch, args.dtype)).to(args.device).eval()
     apply_request = getattr(processor, "apply_transcription_request", None)
     if not callable(apply_request):
         raise RuntimeError("processor.apply_transcription_request 不可用；停止，避免临时字符串 prompt 绕过")
@@ -98,6 +105,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--backend", required=True, choices=["transformers"])
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--revision")
     parser.add_argument("--audio", type=Path, default=Path(DEFAULT_AUDIO))
     parser.add_argument("--language", default="auto")
     parser.add_argument("--device", default="cuda", choices=["cuda", "cuda:0"])

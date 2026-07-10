@@ -70,13 +70,17 @@ Its first-release capability set is deliberately conservative:
 - `forced_alignment: false`
 - `diarization: true`
 - `segment_timestamps: true`
-- language values: `auto`, `zh`, `en`
+- language values: `auto` only. A 2026-07-10 adversarial WSL smoke showed
+  `language=en` still returning Chinese for Chinese input, so `zh`/`en` are not
+  declared until the model exposes a verified language-control mechanism.
 
 For MOSS, `response_format=verbose_json` returns parsed
 `segments[].start`, `segments[].end`, `segments[].speaker`, and
 `segments[].text` when the model output is parseable. The `timestamps`
 request parameter still does not support `word` or `char` timestamps, and MOSS
 segment timestamps are not treated as forced alignment.
+Cross-chunk speaker labels are explicitly scoped as `chunk-NNNN:S01`; each
+segment also returns `speaker_label`, `speaker_scope=chunk`, and `chunk_index`.
 
 ## Transcription request behavior
 

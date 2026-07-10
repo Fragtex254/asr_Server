@@ -192,19 +192,19 @@ curl --noproxy '*' -sS \
   http://127.0.0.1:18080/v1/audio/transcriptions
 ```
 
-MOSS 当前只声明 `transformers` 后端。`verbose_json` 会返回 `segments[].speaker`、`segments[].start` 和 `segments[].end`；这不是 PRD 里的 `word`/`char` timestamps，也不是 forced alignment。长音频被切分时，MOSS 的 speaker label 只保证 chunk 内相对一致，响应 `warnings` 会包含 `moss_speaker_labels_are_chunk_local`。
+MOSS 当前只声明 `transformers` 后端和 `language=auto`。2026-07-10 使用固定 snapshot 的对抗性 smoke 中，`language=en` 对中文输入仍输出中文，因此不得声明 `zh/en` 已可靠生效。`verbose_json` 会返回 `segments[].speaker`、`segments[].start` 和 `segments[].end`；这不是 PRD 里的 `word`/`char` timestamps，也不是 forced alignment。长音频被切分时，speaker 使用 `chunk-NNNN:S01` 命名空间，并返回 `speaker_label`、`speaker_scope=chunk` 和 `chunk_index`；响应 `warnings` 会包含 `moss_speaker_labels_are_chunk_local`。
 
 ## 可选 Silero VAD
 
-长音频 `split_strategy=auto` 会优先尝试 Silero VAD；如果 WSL 环境没有安装 Silero 依赖，服务会明确 fallback 到 energy VAD，再失败才使用 fixed window。Mac/mock 环境不需要安装 Silero、CUDA torch 或模型缓存。
+生产 Path 管线的长音频 `split_strategy=auto` 当前使用有界内存的 streaming energy VAD，再失败时使用 fixed window。旧 Silero 实现会把整段音频展开为 Python float list，六小时音频理论峰值超过 13 GiB，因此 Path 模式会返回 `silero_streaming_not_validated_fallback_to_energy` warning。只有新的 bounded streaming Silero 实现通过 RSS 与边界正确性验收后，才能恢复优先 Silero。Mac/mock 环境不需要安装 Silero、CUDA torch 或模型缓存。
 
 Silero 依赖只在 WSL 真实环境中安装，并且应在 CUDA 版 torch 验收通过后安装：
 
 ```bash
-uv pip install silero-vad
+uv pip install silero-vad==6.2.1
 ```
 
-当前实现通过 `silero_vad` Python 包懒加载模型，不在基础 import 或普通 mock 测试阶段加载；响应中的 `split.vad_backend` 和 `split.warnings` 会记录实际使用的 VAD 后端与 fallback 原因。
+`silero_vad` 仍保留为后续 bounded streaming 验收依赖，不在基础 import 或普通 mock 测试阶段加载；响应中的 `split.vad_backend` 和 `split.warnings` 会记录实际使用的 VAD 后端与 fallback 原因。
 
 ## 转录调优参数
 

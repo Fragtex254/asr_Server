@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from asr_server.adapters.base import TranscriptionResult
+from asr_server.adapters.base import AudioInput, TranscriptionResult
 from asr_server.lifecycle import ModelLifecycleManager
 from asr_server.registry import default_models
 
@@ -18,9 +18,12 @@ class FailingLoadAdapter:
     async def unload(self, cuda_empty_cache: bool) -> None:
         del cuda_empty_cache
 
+    async def abort(self) -> None:
+        return
+
     async def transcribe(
         self,
-        audio: bytes,
+        audio: AudioInput,
         *,
         model_id: str,
         backend: str,
@@ -33,7 +36,7 @@ class FailingLoadAdapter:
 
     async def transcribe_batch(
         self,
-        audio_chunks: list[bytes],
+        audio_chunks: list[AudioInput],
         *,
         model_id: str,
         backend: str,
@@ -67,9 +70,12 @@ class RecordingAdapter:
         if self.active_transcribes > 0:
             self.unload_while_transcribing = True
 
+    async def abort(self) -> None:
+        return
+
     async def transcribe(
         self,
-        audio: bytes,
+        audio: AudioInput,
         *,
         model_id: str,
         backend: str,
@@ -87,7 +93,7 @@ class RecordingAdapter:
 
     async def transcribe_batch(
         self,
-        audio_chunks: list[bytes],
+        audio_chunks: list[AudioInput],
         *,
         model_id: str,
         backend: str,
@@ -108,7 +114,7 @@ async def test_load_failure_sets_model_error_state() -> None:
     assert manager.runtime_for("qwen3-asr-1.7b").status == "error"
 
 
-async def test_same_model_transcriptions_are_serialized_across_generation_reload() -> None:
+async def test_same_model_transcriptions_are_serialized_without_generation_reload() -> None:
     adapter = RecordingAdapter()
     manager = ModelLifecycleManager(default_models(), lambda _model_id: adapter)
 
@@ -140,7 +146,7 @@ async def test_same_model_transcriptions_are_serialized_across_generation_reload
 
     await asyncio.gather(first, second)
 
-    assert adapter.loads == [512, 256]
+    assert adapter.loads == [None]
     assert adapter.max_parallel_transcribes == 1
     assert adapter.unload_while_transcribing is False
 
@@ -164,13 +170,13 @@ async def test_explicit_load_waits_for_active_transcription() -> None:
     assert await asyncio.to_thread(adapter.transcribe_started.wait, 1.0)
 
     load = asyncio.create_task(
-        manager.load_model("qwen3-asr-1.7b", backend="transformers", max_new_tokens=256)
+        manager.load_model("qwen3-asr-1.7b", backend="transformers")
     )
 
     await asyncio.gather(transcription, load)
 
     assert adapter.load_while_transcribing is False
-    assert adapter.loads == [512, 256]
+    assert adapter.loads == [None]
 
 
 async def test_model_unloads_after_idle_timeout() -> None:
@@ -201,7 +207,7 @@ async def test_shutdown_unloads_loaded_model() -> None:
     adapter = RecordingAdapter()
     manager = ModelLifecycleManager(default_models(), lambda _model_id: adapter, idle_unload_seconds=180)
 
-    await manager.load_model("qwen3-asr-1.7b", backend="transformers", max_new_tokens=512)
+    await manager.load_model("qwen3-asr-1.7b", backend="transformers")
 
     assert manager.runtime_for("qwen3-asr-1.7b").status == "loaded"
 
@@ -241,3 +247,89 @@ async def test_new_transcription_resets_idle_unload_timer() -> None:
 
     assert manager.runtime_for("qwen3-asr-1.7b").status == "unloaded"
     assert adapter.unloads == 1
+
+
+async def test_different_models_share_one_global_gpu_operation() -> None:
+    monitor_lock = threading.Lock()
+    active = 0
+    maximum = 0
+
+    class MonitoredAdapter(RecordingAdapter):
+        async def load(self, backend: str, device: str, dtype: str, max_new_tokens: int | None = None) -> None:
+            nonlocal active, maximum
+            with monitor_lock:
+                active += 1
+                maximum = max(maximum, active)
+            await asyncio.sleep(0.01)
+            with monitor_lock:
+                active -= 1
+            await super().load(backend, device, dtype, max_new_tokens)
+
+        async def transcribe(
+            self,
+            audio: AudioInput,
+            *,
+            model_id: str,
+            backend: str,
+            language: str,
+            context: str,
+            max_new_tokens: int | None,
+        ) -> TranscriptionResult:
+            del audio, model_id, backend, language, context, max_new_tokens
+            nonlocal active, maximum
+            with monitor_lock:
+                active += 1
+                maximum = max(maximum, active)
+            try:
+                await asyncio.sleep(0.03)
+                return TranscriptionResult(text="ok", duration=1.0, language="auto", warnings=[])
+            finally:
+                with monitor_lock:
+                    active -= 1
+
+    manager = ModelLifecycleManager(default_models(), lambda _model_id: MonitoredAdapter())
+
+    async def transcribe(model_id: str) -> None:
+        await manager.transcribe_chunks(
+            [b"audio"],
+            model_id=model_id,
+            backend="transformers",
+            language="auto",
+            timestamps="none",
+            context="",
+            max_new_tokens=512,
+            batch_size=1,
+        )
+
+    await asyncio.gather(transcribe("qwen3-asr-0.6b"), transcribe("qwen3-asr-1.7b"))
+
+    assert maximum == 1
+    assert manager.runtime_for("qwen3-asr-0.6b").status == "unloaded"
+    assert manager.runtime_for("qwen3-asr-1.7b").status == "loaded"
+
+
+async def test_cancelled_request_keeps_active_ownership_until_adapter_finishes() -> None:
+    adapter = RecordingAdapter()
+    manager = ModelLifecycleManager(default_models(), lambda _model_id: adapter, idle_unload_seconds=60)
+    request = asyncio.create_task(
+        manager.transcribe_chunks(
+            [b"audio"],
+            model_id="qwen3-asr-1.7b",
+            backend="transformers",
+            language="auto",
+            timestamps="none",
+            context="",
+            max_new_tokens=512,
+            batch_size=1,
+        )
+    )
+    assert await asyncio.to_thread(adapter.transcribe_started.wait, 1.0)
+    request.cancel()
+    await asyncio.sleep(0.005)
+
+    assert manager.runtime_for("qwen3-asr-1.7b").active_requests == 1
+    assert not request.done()
+
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    assert manager.runtime_for("qwen3-asr-1.7b").active_requests == 0

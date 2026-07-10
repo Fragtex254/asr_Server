@@ -11,14 +11,14 @@ from typing import Annotated, Any, cast
 from fastapi import Body, FastAPI, File, Form, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
-from pydantic import BaseModel
 
 from asr_server import __version__
+from asr_server.api.schemas import LoadRequest, UnloadRequest
 from asr_server.adapters.base import AsrAdapter
 from asr_server.adapters.mock import MockAsrAdapter
 from asr_server.adapters.qwen import QwenAsrAdapter
-from asr_server.audio.metadata import inspect_audio
-from asr_server.audio.preprocess import normalize_audio_to_wav, probe_audio_duration_seconds
+from asr_server.audio.preprocess import probe_audio_duration_path_async
+from asr_server.audio.workspace import WorkspaceManager
 from asr_server.config import Settings, load_settings
 from asr_server.errors import AsrError, asr_error_handler, validation_error_handler
 from asr_server.jobs import JobManager
@@ -27,51 +27,12 @@ from asr_server.registry import MOSS_MODEL_ID, Backend, default_models
 from asr_server.transcription import (
     SYNC_JOB_THRESHOLD_SECONDS,
     TranscriptionRequest,
-    run_transcription,
-    validate_max_new_tokens_for_model,
+    run_transcription_path,
     validate_transcription_request,
 )
 
 
-class LoadRequest(BaseModel):
-    backend: Backend = "auto"
-    device: str = "cuda"
-    dtype: str = "auto"
-    max_new_tokens: int | None = None
-
-
-class UnloadRequest(BaseModel):
-    mode: str = "after_current_requests"
-    reject_new_requests: bool = True
-    cuda_empty_cache: bool = True
-
-
-UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 DOCS_DESCRIPTION_PATH = Path(__file__).resolve().parent.parent / "docs" / "docs-endpoint-capabilities.md"
-
-
-async def read_upload_limited(file: UploadFile, settings: Settings) -> bytes:
-    max_upload_bytes = settings.max_upload_mb * 1024 * 1024
-    chunks = []
-    total_bytes = 0
-    while True:
-        chunk = await file.read(UPLOAD_READ_CHUNK_BYTES)
-        if not chunk:
-            break
-        total_bytes += len(chunk)
-        if total_bytes > max_upload_bytes:
-            raise AsrError(
-                413,
-                "audio_too_large",
-                "audio upload exceeds the server size limit",
-                {
-                    "size_bytes": total_bytes,
-                    "max_upload_bytes": max_upload_bytes,
-                    "max_upload_mb": settings.max_upload_mb,
-                },
-            )
-        chunks.append(chunk)
-    return b"".join(chunks)
 
 
 def gpu_health() -> dict[str, object]:
@@ -108,8 +69,20 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         if model_id == MOSS_MODEL_ID:
             from asr_server.adapters.moss import MossTranscribeDiarizeAdapter
 
-            return MossTranscribeDiarizeAdapter(model_id)
-        return QwenAsrAdapter(model_id)
+            return MossTranscribeDiarizeAdapter(
+                model_id,
+                startup_timeout_seconds=app_settings.worker_startup_timeout_seconds,
+                load_timeout_seconds=app_settings.worker_load_timeout_seconds,
+                inference_timeout_seconds=app_settings.worker_inference_timeout_seconds,
+                shutdown_timeout_seconds=app_settings.worker_shutdown_timeout_seconds,
+            )
+        return QwenAsrAdapter(
+            model_id,
+            startup_timeout_seconds=app_settings.worker_startup_timeout_seconds,
+            load_timeout_seconds=app_settings.worker_load_timeout_seconds,
+            inference_timeout_seconds=app_settings.worker_inference_timeout_seconds,
+            shutdown_timeout_seconds=app_settings.worker_shutdown_timeout_seconds,
+        )
 
     @asynccontextmanager
     async def lifespan(lifespan_app: FastAPI) -> AsyncIterator[None]:
@@ -136,6 +109,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         idle_unload_seconds=app_settings.idle_unload_seconds,
     )
     app.state.settings = app_settings
+    app.state.workspace_manager = WorkspaceManager(app_settings)
     app.state.job_manager = JobManager(app.state.manager, app_settings)
 
     @app.get("/health")
@@ -168,7 +142,6 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             backend=request.backend,
             device=request.device,
             dtype=request.dtype,
-            max_new_tokens=validate_max_new_tokens_for_model(model_id, request.max_new_tokens),
         )
 
     @app.delete("/v1/models/{model_id}")
@@ -220,28 +193,38 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             preserve_segments=preserve_segments,
         )
         validated = validate_transcription_request(manager, request)
-        audio = await read_upload_limited(file, app_settings)
-        duration_seconds = await asyncio.to_thread(probe_audio_duration_seconds, audio)
-        if duration_seconds is None:
-            normalized = await asyncio.to_thread(normalize_audio_to_wav, audio)
-            metadata = await asyncio.to_thread(inspect_audio, normalized.audio)
-            duration_seconds = metadata.duration_seconds
-        if duration_seconds > SYNC_JOB_THRESHOLD_SECONDS:
-            job_manager: JobManager = app.state.job_manager
-            payload = await job_manager.create_job(
-                audio=audio,
-                filename=file.filename,
-                content_type=file.content_type,
-                request=request,
+        workspace = await app.state.workspace_manager.store_upload(file)
+        transferred = False
+        try:
+            duration_seconds = await probe_audio_duration_path_async(
+                workspace.upload_path,
+                timeout_seconds=app_settings.ffprobe_timeout_seconds,
             )
-            return JSONResponse(status_code=202, content=payload)
-        result = await run_transcription(
-            audio,
-            manager=manager,
-            settings=app_settings,
-            request=request,
-            validated=validated,
-        )
+            if duration_seconds is None:
+                # Let the path preprocessing stage produce the canonical decode
+                # error rather than decoding the entire upload twice.
+                duration_seconds = 0.0
+            if duration_seconds > SYNC_JOB_THRESHOLD_SECONDS:
+                job_manager: JobManager = app.state.job_manager
+                payload = await job_manager.create_job(
+                    workspace=workspace,
+                    filename=file.filename,
+                    content_type=file.content_type,
+                    request=request,
+                )
+                transferred = True
+                return JSONResponse(status_code=202, content=payload)
+            result = await run_transcription_path(
+                workspace.upload_path,
+                workspace=workspace.root,
+                manager=manager,
+                settings=app_settings,
+                request=request,
+                validated=validated,
+            )
+        finally:
+            if not transferred:
+                await workspace.cleanup()
         if response_format == "text":
             return PlainTextResponse(cast(str, result["text"]))
         return result
@@ -278,14 +261,20 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             overlap_seconds=overlap_seconds,
             preserve_segments=preserve_segments,
         )
-        audio = await read_upload_limited(file, app_settings)
+        manager: ModelLifecycleManager = app.state.manager
+        validate_transcription_request(manager, request)
+        workspace = await app.state.workspace_manager.store_upload(file)
         job_manager: JobManager = app.state.job_manager
-        return await job_manager.create_job(
-            audio=audio,
-            filename=file.filename,
-            content_type=file.content_type,
-            request=request,
-        )
+        try:
+            return await job_manager.create_job(
+                workspace=workspace,
+                filename=file.filename,
+                content_type=file.content_type,
+                request=request,
+            )
+        except Exception:
+            await workspace.cleanup()
+            raise
 
     @app.get("/v1/jobs/{job_id}")
     async def get_transcription_job(job_id: str) -> dict[str, object]:

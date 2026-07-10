@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any, TypeVar
 
-from asr_server.adapters.base import AsrAdapter, TranscriptionResult, TranscriptionTimings
+from asr_server.adapters.base import AudioInput, AsrAdapter, TranscriptionResult, TranscriptionTimings
 from asr_server.errors import AsrError
 from asr_server.registry import Backend, ModelDefinition, ModelStatus
 
@@ -23,6 +23,15 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+@dataclass(frozen=True)
+class LoadConfig:
+    model_id: str
+    backend: str
+    device: str
+    dtype: str
+    revision: str
+
+
 @dataclass
 class ModelRuntime:
     definition: ModelDefinition
@@ -31,7 +40,9 @@ class ModelRuntime:
     active_requests: int = 0
     rejecting_new_requests: bool = False
     backend: str | None = None
-    max_new_tokens: int | None = None
+    device: str | None = None
+    dtype: str | None = None
+    load_config: LoadConfig | None = None
     loaded_at: str | None = None
     last_used_at: str | None = None
     vram_allocated_mb: int | None = None
@@ -55,7 +66,17 @@ class ModelRuntime:
             "active_requests": self.active_requests,
             "rejecting_new_requests": self.rejecting_new_requests,
             "backend": self.backend,
-            "max_new_tokens": self.max_new_tokens,
+            "device": self.device,
+            "dtype": self.dtype,
+            "load_config": None
+            if self.load_config is None
+            else {
+                "model_id": self.load_config.model_id,
+                "backend": self.load_config.backend,
+                "device": self.load_config.device,
+                "dtype": self.load_config.dtype,
+                "revision": self.load_config.revision,
+            },
             "loaded_at": self.loaded_at,
             "last_used_at": self.last_used_at,
             "vram_allocated_mb": self.vram_allocated_mb,
@@ -75,6 +96,10 @@ class ModelLifecycleManager:
         }
         self._default_model_id = next(model.id for model in models.values() if model.default)
         self._idle_unload_seconds = idle_unload_seconds
+        # This is intentionally global rather than per ModelRuntime. The target
+        # deployment has one GPU and must never load or run two model workers at
+        # the same time without an explicitly validated memory policy.
+        self._gpu_operation_lock = asyncio.Lock()
 
     @property
     def default_model_id(self) -> str:
@@ -90,19 +115,36 @@ class ModelLifecycleManager:
             raise AsrError(404, "model_not_found", f"unknown model: {model_id}") from exc
 
     async def shutdown(self) -> None:
+        async with self._gpu_operation_lock:
+            for runtime in self._runtimes.values():
+                self._cancel_idle_unload(runtime)
+                async with runtime.lock:
+                    if runtime.active_requests > 0:
+                        continue
+                    if runtime.status == "unloaded" and runtime.backend is None:
+                        continue
+                    try:
+                        await self._unload_now(runtime, cuda_empty_cache=True)
+                    except Exception as exc:
+                        logger.warning("failed to unload model during shutdown: %s", exc)
+                        runtime.status = "error"
+                        runtime.rejecting_new_requests = False
+
+    async def abort_all_workers(self) -> None:
+        """Force-stop model workers after the service shutdown grace expires."""
         for runtime in self._runtimes.values():
-            self._cancel_idle_unload(runtime)
+            try:
+                await _call_adapter(runtime.adapter.abort)
+            except Exception as exc:
+                logger.warning("failed to abort model worker %s: %s", runtime.definition.id, exc)
             async with runtime.lock:
-                if runtime.active_requests > 0:
-                    continue
-                if runtime.status == "unloaded" and runtime.backend is None:
-                    continue
-                try:
-                    await self._unload_now(runtime, cuda_empty_cache=True)
-                except Exception as exc:
-                    logger.warning("failed to unload model during shutdown: %s", exc)
-                    runtime.status = "error"
-                    runtime.rejecting_new_requests = False
+                runtime.status = "error"
+                runtime.backend = None
+                runtime.device = None
+                runtime.dtype = None
+                runtime.load_config = None
+                runtime.loaded_at = None
+                runtime.rejecting_new_requests = True
 
     def resolve_backend(self, runtime: ModelRuntime, backend: Backend) -> str:
         if backend == "auto":
@@ -125,34 +167,40 @@ class ModelLifecycleManager:
         backend: Backend = "auto",
         device: str = "cuda",
         dtype: str = "auto",
-        max_new_tokens: int | None = None,
     ) -> dict[str, object]:
         runtime = self.runtime_for(model_id)
         resolved_backend = self.resolve_backend(runtime, backend)
-        async with runtime.request_lock:
-            async with runtime.lock:
-                self._cancel_idle_unload(runtime)
-                if runtime.status in ("unloading", "unloading_scheduled"):
-                    raise AsrError(409, "model_unloading_scheduled", f"model is unloading: {model_id}")
-                runtime.status = "loading"
-                try:
-                    await _call_adapter(
-                        lambda: runtime.adapter.load(resolved_backend, device, dtype, max_new_tokens=max_new_tokens)
-                    )
-                except Exception:
-                    runtime.status = "error"
+        requested_config = LoadConfig(model_id, resolved_backend, device, dtype, runtime.definition.revision)
+        async with self._gpu_operation_lock:
+            await self._unload_other_runtimes(runtime)
+            async with runtime.request_lock:
+                async with runtime.lock:
+                    self._cancel_idle_unload(runtime)
+                    if runtime.status in ("unloading", "unloading_scheduled"):
+                        raise AsrError(409, "model_unloading_scheduled", f"model is unloading: {model_id}")
+                    if (
+                        runtime.status == "loaded"
+                        and runtime.backend == resolved_backend
+                        and runtime.load_config == requested_config
+                    ):
+                        return {"id": model_id, "status": runtime.status, "message": "model already loaded"}
+                    if runtime.status == "loaded":
+                        await self._unload_now(runtime, cuda_empty_cache=True)
+                    runtime.status = "loading"
+                    try:
+                        await _call_adapter(lambda: runtime.adapter.load(resolved_backend, device, dtype))
+                    except Exception:
+                        runtime.status = "error"
+                        runtime.rejecting_new_requests = False
+                        raise
+                    runtime.status = "loaded"
                     runtime.rejecting_new_requests = False
-                    raise
-                runtime.status = "loaded"
-                runtime.rejecting_new_requests = False
-                runtime.backend = resolved_backend
-                runtime.max_new_tokens = max_new_tokens
-                runtime.loaded_at = utc_now_iso()
-                return {
-                    "id": model_id,
-                    "status": runtime.status,
-                    "message": "model loaded",
-                }
+                    runtime.backend = resolved_backend
+                    runtime.device = device
+                    runtime.dtype = dtype
+                    runtime.load_config = requested_config
+                    runtime.loaded_at = utc_now_iso()
+                    return {"id": model_id, "status": runtime.status, "message": "model loaded"}
 
     async def unload_model(
         self,
@@ -172,7 +220,18 @@ class ModelLifecycleManager:
                     "active_requests": runtime.active_requests,
                     "rejecting_new_requests": runtime.rejecting_new_requests,
                 }
-            await self._unload_now(runtime, cuda_empty_cache=cuda_empty_cache)
+        async with self._gpu_operation_lock:
+            async with runtime.lock:
+                if runtime.active_requests > 0:
+                    runtime.status = "unloading_scheduled"
+                    runtime.rejecting_new_requests = True
+                    return {
+                        "id": model_id,
+                        "status": runtime.status,
+                        "active_requests": runtime.active_requests,
+                        "rejecting_new_requests": runtime.rejecting_new_requests,
+                    }
+                await self._unload_now(runtime, cuda_empty_cache=cuda_empty_cache)
             return {
                 "id": model_id,
                 "status": runtime.status,
@@ -212,7 +271,7 @@ class ModelLifecycleManager:
 
     async def transcribe_chunks(
         self,
-        audio_chunks: list[bytes],
+        audio_chunks: list[AudioInput],
         *,
         model_id: str | None,
         backend: Backend,
@@ -243,41 +302,49 @@ class ModelLifecycleManager:
                     "model_unloading_scheduled",
                     f"model is scheduled for unloading: {runtime.definition.id}",
                 )
-        async with runtime.request_lock:
-            resolved_backend, load_ms = await self._begin_request(
-                runtime,
-                backend=backend,
-                max_new_tokens=max_new_tokens,
-            )
-            try:
-                results = await self._transcribe_chunk_results(
-                    runtime,
-                    audio_chunks,
-                    model_id=selected_model_id,
-                    backend=resolved_backend,
-                    language=language,
-                    context=context,
-                    max_new_tokens=max_new_tokens,
-                    batch_size=batch_size,
-                    before_chunk=before_chunk,
-                    after_chunk=after_chunk,
-                )
-                runtime.last_used_at = utc_now_iso()
-                timings = TranscriptionTimings(
-                    total_ms=(perf_counter() - request_started) * 1000,
-                    load_ms=load_ms,
-                    decode_ms=sum(result.timings.decode_ms for result in results),
-                    inference_ms=sum(result.timings.inference_ms for result in results),
-                    postprocess_ms=sum(result.timings.postprocess_ms for result in results),
-                )
-                return resolved_backend, results, timings
-            finally:
-                await self._finish_request(runtime)
+        async with self._gpu_operation_lock:
+            await self._unload_other_runtimes(runtime)
+            async with runtime.request_lock:
+                resolved_backend, load_ms = await self._begin_request(runtime, backend=backend)
+                try:
+                    results = await self._transcribe_chunk_results(
+                        runtime,
+                        audio_chunks,
+                        model_id=selected_model_id,
+                        backend=resolved_backend,
+                        language=language,
+                        context=context,
+                        max_new_tokens=max_new_tokens,
+                        batch_size=batch_size,
+                        before_chunk=before_chunk,
+                        after_chunk=after_chunk,
+                    )
+                    runtime.last_used_at = utc_now_iso()
+                    timings = TranscriptionTimings(
+                        total_ms=(perf_counter() - request_started) * 1000,
+                        load_ms=load_ms,
+                        decode_ms=sum(result.timings.decode_ms for result in results),
+                        inference_ms=sum(result.timings.inference_ms for result in results),
+                        postprocess_ms=sum(result.timings.postprocess_ms for result in results),
+                    )
+                    return resolved_backend, results, timings
+                except AsrError as exc:
+                    if exc.details.get("worker_fatal"):
+                        async with runtime.lock:
+                            runtime.status = "error"
+                            runtime.backend = None
+                            runtime.device = None
+                            runtime.dtype = None
+                            runtime.load_config = None
+                            runtime.loaded_at = None
+                    raise
+                finally:
+                    await self._finish_request(runtime)
 
     async def _transcribe_chunk_results(
         self,
         runtime: ModelRuntime,
-        audio_chunks: list[bytes],
+        audio_chunks: list[AudioInput],
         *,
         model_id: str,
         backend: str,
@@ -364,7 +431,6 @@ class ModelLifecycleManager:
         runtime: ModelRuntime,
         *,
         backend: Backend,
-        max_new_tokens: int | None,
     ) -> tuple[str, float]:
         resolved_backend = self.resolve_backend(runtime, backend)
         load_ms = 0.0
@@ -384,23 +450,12 @@ class ModelLifecycleManager:
                     "model_unloading_scheduled",
                     f"model is unloading: {runtime.definition.id}",
                 )
-            needs_reload_for_generation = (
-                runtime.status == "loaded"
-                and runtime.backend == resolved_backend
-                and runtime.max_new_tokens != max_new_tokens
-            )
-            if needs_reload_for_generation:
-                await _call_adapter(lambda: runtime.adapter.unload(cuda_empty_cache=True))
-                runtime.status = "unloaded"
-                runtime.backend = None
-                runtime.max_new_tokens = None
-                runtime.loaded_at = None
             if runtime.status in ("unloaded", "error") or runtime.backend != resolved_backend:
                 runtime.status = "loading"
                 load_started = perf_counter()
                 try:
                     await _call_adapter(
-                        lambda: runtime.adapter.load(resolved_backend, "cuda", "auto", max_new_tokens=max_new_tokens)
+                        lambda: runtime.adapter.load(resolved_backend, "cuda", "auto")
                     )
                 except Exception:
                     runtime.status = "error"
@@ -409,7 +464,15 @@ class ModelLifecycleManager:
                 load_ms = (perf_counter() - load_started) * 1000
                 runtime.status = "loaded"
                 runtime.backend = resolved_backend
-                runtime.max_new_tokens = max_new_tokens
+                runtime.device = "cuda"
+                runtime.dtype = "auto"
+                runtime.load_config = LoadConfig(
+                    runtime.definition.id,
+                    resolved_backend,
+                    "cuda",
+                    "auto",
+                    runtime.definition.revision,
+                )
                 runtime.loaded_at = utc_now_iso()
                 runtime.rejecting_new_requests = False
             runtime.active_requests += 1
@@ -438,7 +501,9 @@ class ModelLifecycleManager:
         runtime.status = "unloaded"
         runtime.rejecting_new_requests = False
         runtime.backend = None
-        runtime.max_new_tokens = None
+        runtime.device = None
+        runtime.dtype = None
+        runtime.load_config = None
         runtime.loaded_at = None
         runtime.vram_allocated_mb = None
 
@@ -460,27 +525,71 @@ class ModelLifecycleManager:
     async def _idle_unload_after_delay(self, runtime: ModelRuntime) -> None:
         try:
             await asyncio.sleep(self._idle_unload_seconds)
+            async with self._gpu_operation_lock:
+                async with runtime.lock:
+                    if runtime.status != "loaded" or runtime.active_requests > 0 or runtime.rejecting_new_requests:
+                        return
+                    try:
+                        await self._unload_now(runtime, cuda_empty_cache=True, cancel_idle_task=False)
+                    except Exception:
+                        runtime.status = "error"
+                        runtime.rejecting_new_requests = False
+                        raise
+                    finally:
+                        runtime.idle_unload_task = None
+        except asyncio.CancelledError:
+            return
+
+    async def _unload_other_runtimes(self, target: ModelRuntime) -> None:
+        """Unload an idle GPU owner before another model may load or infer.
+
+        The caller must hold ``_gpu_operation_lock``. This keeps model switching
+        serial while retaining the PRD behaviour where an unload request can
+        mark an active model as ``unloading_scheduled`` without waiting.
+        """
+        for runtime in self._runtimes.values():
+            if runtime is target:
+                continue
             async with runtime.lock:
-                if runtime.status != "loaded" or runtime.active_requests > 0 or runtime.rejecting_new_requests:
-                    return
+                self._cancel_idle_unload(runtime)
+                if runtime.active_requests > 0:
+                    raise AsrError(
+                        503,
+                        "gpu_unavailable",
+                        f"GPU is still in use by model: {runtime.definition.id}",
+                        {"model": runtime.definition.id},
+                    )
+                if runtime.status == "unloaded" and runtime.backend is None:
+                    continue
+                logger.info(
+                    "switching GPU owner from model=%s to model=%s",
+                    runtime.definition.id,
+                    target.definition.id,
+                )
                 try:
-                    await self._unload_now(runtime, cuda_empty_cache=True, cancel_idle_task=False)
+                    await self._unload_now(runtime, cuda_empty_cache=True)
                 except Exception:
                     runtime.status = "error"
                     runtime.rejecting_new_requests = False
                     raise
-                finally:
-                    runtime.idle_unload_task = None
-        except asyncio.CancelledError:
-            return
 
 
-def _chunked(items: list[bytes], batch_size: int) -> list[list[bytes]]:
+def _chunked(items: list[AudioInput], batch_size: int) -> list[list[AudioInput]]:
     return [items[index : index + batch_size] for index in range(0, len(items), batch_size)]
 
 
 async def _call_adapter(factory: Callable[[], Coroutine[Any, Any, T]]) -> T:
-    return await asyncio.to_thread(lambda: asyncio.run(factory()))
+    operation = asyncio.create_task(asyncio.to_thread(lambda: asyncio.run(factory())))
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        # Cancelling asyncio.to_thread does not stop the underlying thread. Keep
+        # ownership of the GPU request until the adapter operation really ends;
+        # a transport deadline is responsible for terminating a hung worker.
+        try:
+            await operation
+        finally:
+            raise
 
 
 def _consume_task_exception(task: asyncio.Task[None]) -> None:

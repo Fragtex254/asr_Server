@@ -288,7 +288,7 @@ install_gpu_runtime() {
 
   if [[ "${INSTALL_SILERO}" == "1" ]]; then
     log "installing optional silero-vad"
-    uv pip install silero-vad
+    uv pip install silero-vad==6.2.1
   fi
 }
 
@@ -374,11 +374,22 @@ Environment=ASR_PORT=${PORT}
 Environment=ASR_ADAPTER=${ADAPTER}
 Environment=ASR_QWEN_BATCH_SIZE=${QWEN_BATCH_SIZE}
 Environment=ASR_IDLE_UNLOAD_SECONDS=${IDLE_UNLOAD_SECONDS}
+Environment=ASR_WORKER_STARTUP_TIMEOUT_SECONDS=30
+Environment=ASR_WORKER_LOAD_TIMEOUT_SECONDS=900
+Environment=ASR_WORKER_INFERENCE_TIMEOUT_SECONDS=3600
+Environment=ASR_WORKER_SHUTDOWN_TIMEOUT_SECONDS=10
+Environment=ASR_JOB_SHUTDOWN_GRACE_SECONDS=30
+Environment=ASR_MIN_FREE_DISK_MB=5120
+Environment=ASR_MAX_SPOOL_MB=12288
+Environment=ASR_MAX_WORKSPACE_MB=1280
+Environment=ASR_MAX_WORKSPACE_FILES=8
 Environment=HF_HUB_OFFLINE=${HF_HUB_OFFLINE}
 Environment=TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE}
 ExecStart=${DEPLOY_DIR}/.venv/bin/uvicorn asr_server.main:app --host ${HOST} --port ${PORT}
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=60
+KillMode=mixed
 
 [Install]
 WantedBy=default.target

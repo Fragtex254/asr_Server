@@ -83,6 +83,7 @@ async def test_moss_model_is_registered_only_when_enabled() -> None:
     assert moss["capabilities"]["forced_alignment"] is False
     assert moss["capabilities"]["diarization"] is True
     assert moss["capabilities"]["segment_timestamps"] is True
+    assert moss["capabilities"]["languages"] == ["auto"]
 
 
 async def test_disabled_moss_model_returns_model_not_found(client: AsyncClient) -> None:
@@ -111,7 +112,8 @@ async def test_moss_load_status_and_unload_when_enabled() -> None:
     assert status_response.status_code == 200
     assert status_response.json()["status"] == "loaded"
     assert status_response.json()["backend"] == "transformers"
-    assert status_response.json()["max_new_tokens"] == 2048
+    assert status_response.json()["device"] == "cuda"
+    assert status_response.json()["dtype"] == "auto"
     assert unload_response.status_code == 200
     assert unload_response.json()["status"] == "unloaded"
 
@@ -134,7 +136,8 @@ async def test_load_and_unload_model(client: AsyncClient) -> None:
     status_response = await client.get("/v1/models/qwen3-asr-1.7b/status")
     assert status_response.json()["status"] == "loaded"
     assert status_response.json()["backend"] == "transformers"
-    assert status_response.json()["max_new_tokens"] == 512
+    assert status_response.json()["device"] == "cuda"
+    assert status_response.json()["dtype"] == "auto"
 
     unload_response = await client.request(
         "DELETE",
@@ -315,7 +318,9 @@ async def test_moss_verbose_json_returns_segments_when_enabled() -> None:
     assert len(body["segments"]) == 1
     assert body["segments"][0]["start"] == 0.0
     assert body["segments"][0]["end"] > 0.0
-    assert body["segments"][0]["speaker"] == "S01"
+    assert body["segments"][0]["speaker"] == "chunk-0000:S01"
+    assert body["segments"][0]["speaker_label"] == "S01"
+    assert body["segments"][0]["speaker_scope"] == "chunk"
     assert body["segments"][0]["text"] == body["text"]
 
 
@@ -392,11 +397,18 @@ async def test_moss_rejects_undeclared_timestamps_and_vllm_backend() -> None:
             files={"file": ("sample.wav", make_wav(0.1), "audio/wav")},
             data={"model": "moss-transcribe-diarize-0.9b", "backend": "vllm"},
         )
+        language_response = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", make_wav(0.1), "audio/wav")},
+            data={"model": "moss-transcribe-diarize-0.9b", "language": "en"},
+        )
 
     assert timestamps_response.status_code == 422
     assert timestamps_response.json()["error"]["code"] == "capability_not_supported"
     assert vllm_response.status_code == 422
     assert vllm_response.json()["error"]["code"] == "capability_not_supported"
+    assert language_response.status_code == 422
+    assert language_response.json()["error"]["code"] == "capability_not_supported"
 
 
 async def test_transcription_can_return_chunk_metadata(client: AsyncClient) -> None:
@@ -504,7 +516,7 @@ async def test_transcription_uses_energy_fallback_when_silero_is_unavailable(
     assert body["split"]["requested_strategy"] == "auto"
     assert body["split"]["vad_backend"] == "energy"
     assert body["split"]["chunk_count"] == 2
-    assert any(warning.startswith("silero_vad_unavailable") for warning in body["warnings"])
+    assert "silero_streaming_not_validated_fallback_to_energy" in body["warnings"]
     assert len(body["chunks"]) == 2
     assert body["duration"] == pytest.approx(1.5)
 
@@ -581,7 +593,7 @@ async def test_unsupported_capability_is_rejected_before_audio_decode(
         called = True
         raise AssertionError("decode should not run for unsupported capabilities")
 
-    monkeypatch.setattr(main_module, "normalize_audio_to_wav", fail_decode)
+    monkeypatch.setattr(main_module, "run_transcription_path", fail_decode)
 
     response = await client.post(
         "/v1/audio/transcriptions",

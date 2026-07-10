@@ -63,6 +63,19 @@ def test_fuzzy_dedupes_overlap_with_minor_asr_variation() -> None:
     assert document.segments[1].deduped_prefix_chars == len("耳际内的柔软羽毛，轻轻飘落在你的")
 
 
+def test_does_not_delete_phrase_repeated_away_from_previous_tail() -> None:
+    document = build_transcript_document(
+        [
+            {"start": 0.0, "end": 10.0, "text": "请确认订单。随后讨论交付日期。", "language": "zh"},
+            {"start": 8.0, "end": 18.0, "text": "确认订单。然后继续下一项。", "language": "zh"},
+        ],
+        metadata={},
+    )
+
+    assert document.segments[1].text == "确认订单。然后继续下一项。"
+    assert document.segments[1].deduped_prefix_chars == 0
+
+
 def test_writes_json_txt_and_srt_artifacts(tmp_path: Path) -> None:
     document = build_transcript_document(
         [

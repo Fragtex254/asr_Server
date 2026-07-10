@@ -4,7 +4,8 @@ import asyncio
 import hashlib
 from time import perf_counter
 
-from asr_server.adapters.base import TranscriptionResult, TranscriptionSegment, TranscriptionTimings
+from asr_server.adapters.base import AudioInput, AudioPath, TranscriptionResult, TranscriptionSegment, TranscriptionTimings
+from asr_server.workers.audio import audio_duration_seconds
 
 
 MOSS_MOCK_MODEL_ID = "moss-transcribe-diarize-0.9b"
@@ -23,9 +24,12 @@ class MockAsrAdapter:
         del cuda_empty_cache
         self.loaded_backend = None
 
+    async def abort(self) -> None:
+        self.loaded_backend = None
+
     async def transcribe(
         self,
-        audio: bytes,
+        audio: AudioInput,
         *,
         model_id: str,
         backend: str,
@@ -51,7 +55,7 @@ class MockAsrAdapter:
 
     async def transcribe_batch(
         self,
-        audio_chunks: list[bytes],
+        audio_chunks: list[AudioInput],
         *,
         model_id: str,
         backend: str,
@@ -81,7 +85,7 @@ class MockAsrAdapter:
 
     def _result(
         self,
-        audio: bytes,
+        audio: AudioInput,
         *,
         model_id: str,
         backend: str,
@@ -93,7 +97,8 @@ class MockAsrAdapter:
         label: str,
     ) -> TranscriptionResult:
         del backend
-        text = f"{label}:{len(audio)}"
+        audio_size = audio.path.stat().st_size if isinstance(audio, AudioPath) else len(audio)
+        text = f"{label}:{audio_size}"
         warnings = ["mock_adapter"]
         if batch:
             warnings.append("mock_batch_adapter")
@@ -103,14 +108,14 @@ class MockAsrAdapter:
         if max_new_tokens is not None:
             warnings.append(f"max_new_tokens_received:{max_new_tokens}")
         segments = []
-        duration = max(len(audio) / 16_000, 0.01)
+        duration = audio_duration_seconds(audio)
         if model_id == MOSS_MOCK_MODEL_ID:
             segments = [
                 TranscriptionSegment(
                     start=0.0,
                     end=min(duration, 0.5),
                     speaker="S01",
-                    text=f"{label}:{len(audio)}",
+                    text=f"{label}:{audio_size}",
                 )
             ]
         return TranscriptionResult(
@@ -123,5 +128,7 @@ class MockAsrAdapter:
         )
 
 
-def _audio_label(audio: bytes) -> str:
+def _audio_label(audio: AudioInput) -> str:
+    if isinstance(audio, AudioPath):
+        return hashlib.sha256(f"{audio.path}:{audio.start}:{audio.end}".encode()).hexdigest()[:12]
     return hashlib.sha256(audio).hexdigest()[:12]

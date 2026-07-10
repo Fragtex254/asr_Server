@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import wave
+import struct
+import threading
 from array import array
 from pathlib import Path
 
@@ -10,7 +12,7 @@ import pytest
 from asr_server.audio import splitter as splitter_module
 from asr_server.audio.metadata import AudioMetadata
 from asr_server.audio.preprocess import normalize_audio_to_wav
-from asr_server.audio.splitter import split_audio
+from asr_server.audio.splitter import SplitCancelled, split_audio, split_audio_path
 from asr_server.errors import AsrError
 
 
@@ -264,3 +266,92 @@ def test_long_mp3_fixture_is_preprocessed_and_energy_split(monkeypatch: pytest.M
     assert len(result.chunks) > 1
     assert all(chunk.duration <= 180.0 for chunk in result.chunks)
     assert all(chunk.start < chunk.end for chunk in result.chunks)
+
+
+def test_none_strategy_rejects_audio_above_hard_model_window() -> None:
+    audio = b"x" * (16_000 * 301)
+
+    with pytest.raises(AsrError) as exc_info:
+        split_audio(audio, split_strategy="none", max_chunk_seconds=None, overlap_seconds=None)
+
+    assert exc_info.value.code == "duration_limit_exceeded"
+
+
+def test_split_rejects_adversarial_chunk_count_before_materialization() -> None:
+    audio = b"x" * (16_000 * 60)
+
+    with pytest.raises(AsrError) as exc_info:
+        split_audio(audio, split_strategy="fixed", max_chunk_seconds=0.01, overlap_seconds=0.0)
+
+    assert exc_info.value.details["max_chunks_per_file"] == 4096
+
+
+def test_path_splitter_returns_descriptors_without_audio_bytes(tmp_path: Path) -> None:
+    audio_path = tmp_path / "normalized.wav"
+    audio_path.write_bytes(
+        make_segmented_wav([(0.2, 0), (0.4, 10_000), (0.5, 0), (0.4, 10_000)])
+    )
+
+    result = split_audio_path(
+        audio_path,
+        split_strategy="auto",
+        max_chunk_seconds=0.8,
+        overlap_seconds=0.03,
+    )
+
+    assert result.strategy == "energy"
+    assert result.chunks
+    assert all(chunk.audio_path == audio_path for chunk in result.chunks)
+    assert all(not hasattr(chunk, "audio") for chunk in result.chunks)
+
+
+def test_six_hour_sparse_wav_creates_only_bounded_descriptors(tmp_path: Path) -> None:
+    sample_rate = 16_000
+    data_size = 21_600 * sample_rate * 2
+    audio_path = tmp_path / "six-hours.wav"
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + data_size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        1,
+        sample_rate,
+        sample_rate * 2,
+        2,
+        16,
+        b"data",
+        data_size,
+    )
+    with audio_path.open("wb") as output:
+        output.write(header)
+        output.truncate(44 + data_size)
+
+    result = split_audio_path(
+        audio_path,
+        split_strategy="fixed",
+        max_chunk_seconds=120,
+        overlap_seconds=2,
+    )
+
+    assert result.metadata.duration_seconds == 21_600
+    assert len(result.chunks) == 184
+    assert result.chunks[-1].end == 21_600
+
+
+def test_path_vad_honors_cancellation_event(tmp_path: Path) -> None:
+    audio_path = tmp_path / "normalized.wav"
+    audio_path.write_bytes(make_segmented_wav([(1.0, 10_000)]))
+    cancelled = threading.Event()
+    cancelled.set()
+
+    with pytest.raises(SplitCancelled):
+        split_audio_path(
+            audio_path,
+            split_strategy="energy",
+            max_chunk_seconds=0.5,
+            overlap_seconds=0.01,
+            cancel_event=cancelled,
+        )

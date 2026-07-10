@@ -4,12 +4,21 @@ import io
 import importlib
 import math
 import wave
+import warnings
+import threading
 from array import array
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal, cast
 
-from asr_server.audio.metadata import AudioMetadata, inspect_audio
+from asr_server.adapters.base import AudioPath
+from asr_server.audio.metadata import AudioMetadata, inspect_audio, inspect_audio_path
 from asr_server.errors import AsrError
+
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)
+    import audioop
 
 
 SplitStrategy = Literal["auto", "none", "fixed", "silero", "energy"]
@@ -18,11 +27,16 @@ DEFAULT_SOFT_CHUNK_SECONDS = 120.0
 DEFAULT_HARD_CHUNK_SECONDS = 300.0
 DEFAULT_OVERLAP_SECONDS = 2.0
 MAX_AUDIO_SECONDS_PER_FILE = 21_600.0
+MAX_CHUNKS_PER_FILE = 4096
 VAD_FRAME_SECONDS = 0.03
 VAD_MIN_SPEECH_SECONDS = 0.15
 VAD_MIN_SILENCE_SECONDS = 0.3
 VAD_RELATIVE_THRESHOLD = 0.10
 VAD_ABSOLUTE_THRESHOLD = 300.0
+
+
+class SplitCancelled(Exception):
+    pass
 
 
 @dataclass(frozen=True)
@@ -42,6 +56,46 @@ class SplitResult:
     strategy: str
     requested_strategy: str
     chunks: list[AudioChunk]
+    metadata: AudioMetadata
+    soft_chunk_seconds: float
+    hard_chunk_seconds: float
+    overlap_seconds: float
+    vad_backend: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "strategy": self.strategy,
+            "requested_strategy": self.requested_strategy,
+            "vad_backend": self.vad_backend,
+            "chunk_count": len(self.chunks),
+            "soft_chunk_seconds": self.soft_chunk_seconds,
+            "hard_chunk_seconds": self.hard_chunk_seconds,
+            "overlap_seconds": self.overlap_seconds,
+            "warnings": self.warnings,
+        }
+
+
+@dataclass(frozen=True)
+class ChunkDescriptor:
+    index: int
+    start: float
+    end: float
+    audio_path: Path
+
+    @property
+    def duration(self) -> float:
+        return max(self.end - self.start, 0.0)
+
+    def as_audio_input(self) -> AudioPath:
+        return AudioPath(path=self.audio_path, start=self.start, end=self.end)
+
+
+@dataclass(frozen=True)
+class PathSplitResult:
+    strategy: str
+    requested_strategy: str
+    chunks: list[ChunkDescriptor]
     metadata: AudioMetadata
     soft_chunk_seconds: float
     hard_chunk_seconds: float
@@ -85,6 +139,13 @@ def split_audio(
     _validate_chunk_options(chunk_seconds, overlap)
 
     if strategy == "none":
+        if metadata.duration_seconds > DEFAULT_HARD_CHUNK_SECONDS:
+            raise AsrError(
+                422,
+                "duration_limit_exceeded",
+                "split_strategy=none exceeds the model hard chunk limit",
+                {"duration_seconds": metadata.duration_seconds, "hard_chunk_seconds": DEFAULT_HARD_CHUNK_SECONDS},
+            )
         return _single_chunk(audio, metadata, requested_strategy=requested_strategy, overlap_seconds=overlap)
 
     if strategy == "auto" and metadata.duration_seconds <= chunk_seconds:
@@ -162,6 +223,76 @@ def _parse_strategy(value: str) -> SplitStrategy:
     )
 
 
+def split_audio_path(
+    audio_path: Path,
+    *,
+    split_strategy: str,
+    max_chunk_seconds: float | None,
+    overlap_seconds: float | None,
+    cancel_event: threading.Event | None = None,
+) -> PathSplitResult:
+    requested_strategy = split_strategy
+    strategy = _parse_strategy(split_strategy)
+    metadata = inspect_audio_path(audio_path)
+    if metadata.duration_seconds > MAX_AUDIO_SECONDS_PER_FILE:
+        raise AsrError(
+            422,
+            "duration_limit_exceeded",
+            "audio is longer than the server file duration limit",
+            {"duration_seconds": metadata.duration_seconds, "max_audio_seconds_per_file": MAX_AUDIO_SECONDS_PER_FILE},
+        )
+    chunk_seconds = max_chunk_seconds or DEFAULT_SOFT_CHUNK_SECONDS
+    overlap = min(DEFAULT_OVERLAP_SECONDS, chunk_seconds / 10) if overlap_seconds is None else overlap_seconds
+    _validate_chunk_options(chunk_seconds, overlap)
+    warnings: list[str] = []
+    vad_backend: str | None = None
+    if strategy == "none":
+        if metadata.duration_seconds > DEFAULT_HARD_CHUNK_SECONDS:
+            raise AsrError(
+                422,
+                "duration_limit_exceeded",
+                "split_strategy=none exceeds the model hard chunk limit",
+                {"duration_seconds": metadata.duration_seconds, "hard_chunk_seconds": DEFAULT_HARD_CHUNK_SECONDS},
+            )
+        windows = [(0.0, metadata.duration_seconds)]
+        resolved_strategy = "none"
+    elif strategy == "auto" and metadata.duration_seconds <= chunk_seconds:
+        windows = [(0.0, metadata.duration_seconds)]
+        resolved_strategy = "none"
+    else:
+        intervals: list[tuple[float, float]] = []
+        if strategy in {"auto", "silero", "energy"}:
+            if strategy in {"auto", "silero"}:
+                warnings.append("silero_streaming_not_validated_fallback_to_energy")
+            intervals = _energy_intervals_path(
+                audio_path,
+                metadata,
+                padding_seconds=overlap,
+                cancel_event=cancel_event,
+            )
+        if intervals:
+            windows = _pack_vad_intervals(intervals, chunk_seconds, overlap)
+            resolved_strategy = "energy"
+            vad_backend = "energy"
+        else:
+            if strategy in {"auto", "silero", "energy"}:
+                warnings.append("energy_vad_no_speech_fallback")
+            windows = _chunk_windows(metadata.duration_seconds, chunk_seconds, overlap)
+            resolved_strategy = "fixed"
+    _validate_window_count(windows)
+    return PathSplitResult(
+        strategy=resolved_strategy,
+        requested_strategy=requested_strategy,
+        chunks=[ChunkDescriptor(index=i, start=start, end=end, audio_path=audio_path) for i, (start, end) in enumerate(windows)],
+        metadata=metadata,
+        soft_chunk_seconds=DEFAULT_SOFT_CHUNK_SECONDS,
+        hard_chunk_seconds=DEFAULT_HARD_CHUNK_SECONDS,
+        overlap_seconds=overlap,
+        vad_backend=vad_backend,
+        warnings=warnings,
+    )
+
+
 def _validate_chunk_options(max_chunk_seconds: float, overlap_seconds: float) -> None:
     if max_chunk_seconds <= 0:
         raise AsrError(400, "bad_request", "max_chunk_seconds must be greater than 0")
@@ -214,7 +345,19 @@ def _chunk_windows(duration_seconds: float, chunk_seconds: float, overlap_second
         if end >= duration_seconds:
             break
         start = end - overlap_seconds
+        if len(windows) > MAX_CHUNKS_PER_FILE:
+            _validate_window_count(windows)
     return windows
+
+
+def _validate_window_count(windows: list[tuple[float, float]]) -> None:
+    if len(windows) > MAX_CHUNKS_PER_FILE:
+        raise AsrError(
+            422,
+            "duration_limit_exceeded",
+            "audio split would create too many chunks",
+            {"chunk_count": len(windows), "max_chunks_per_file": MAX_CHUNKS_PER_FILE},
+        )
 
 
 def _interval_windows(
@@ -383,6 +526,52 @@ def _energy_intervals(
     return padded
 
 
+def _energy_intervals_path(
+    audio_path: Path,
+    metadata: AudioMetadata,
+    *,
+    padding_seconds: float,
+    cancel_event: threading.Event | None = None,
+) -> list[tuple[float, float]]:
+    if metadata.format != "wav":
+        return []
+    try:
+        with wave.open(str(audio_path), "rb") as source:
+            if source.getsampwidth() != 2 or source.getnchannels() != 1:
+                return []
+            frame_rate = source.getframerate()
+            frame_samples = max(int(frame_rate * VAD_FRAME_SECONDS), 1)
+            rms_values: list[float] = []
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise SplitCancelled()
+                pcm = source.readframes(frame_samples)
+                if not pcm:
+                    break
+                rms_values.append(float(audioop.rms(pcm, 2)))
+    except (EOFError, wave.Error):
+        return []
+    if not rms_values:
+        return []
+    threshold = max(VAD_ABSOLUTE_THRESHOLD, max(rms_values) * VAD_RELATIVE_THRESHOLD)
+    raw_intervals: list[tuple[float, float]] = []
+    start_frame: int | None = None
+    for index, rms in enumerate(rms_values):
+        is_speech = rms >= threshold
+        if is_speech and start_frame is None:
+            start_frame = index
+        elif not is_speech and start_frame is not None:
+            raw_intervals.append((start_frame * VAD_FRAME_SECONDS, index * VAD_FRAME_SECONDS))
+            start_frame = None
+    if start_frame is not None:
+        raw_intervals.append((start_frame * VAD_FRAME_SECONDS, len(rms_values) * VAD_FRAME_SECONDS))
+    padded = []
+    for start, end in _merge_vad_intervals(raw_intervals):
+        if end - start >= VAD_MIN_SPEECH_SECONDS:
+            padded.append((max(start - padding_seconds, 0.0), min(end + padding_seconds, metadata.duration_seconds)))
+    return padded
+
+
 def _merge_vad_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
     merged: list[tuple[float, float]] = []
     for start, end in intervals:
@@ -422,6 +611,7 @@ def _pack_vad_intervals(
         current_end = interval_end
     if current_start is not None and current_end is not None:
         windows.append((current_start, current_end))
+    _validate_window_count(windows)
     return windows
 
 

@@ -6,6 +6,7 @@ import wave
 from array import array
 from collections.abc import AsyncIterator
 from pathlib import Path
+from datetime import timedelta
 from typing import Any, cast
 
 import pytest
@@ -17,6 +18,7 @@ from asr_server.adapters.mock import MockAsrAdapter
 from asr_server.config import Settings
 from asr_server.errors import AsrError
 from asr_server.main import create_app
+from asr_server.jobs import utc_now
 
 
 def make_wav(duration_seconds: float, amplitude: int = 10_000, sample_rate: int = 16_000) -> bytes:
@@ -74,7 +76,7 @@ def patch_job_tempdir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         path.mkdir()
         return str(path)
 
-    monkeypatch.setattr("asr_server.jobs.tempfile.mkdtemp", mkdtemp)
+    monkeypatch.setattr("asr_server.audio.workspace.tempfile.mkdtemp", mkdtemp)
 
 
 async def test_create_job_returns_accepted_and_status_url(client: AsyncClient) -> None:
@@ -326,13 +328,16 @@ async def test_sync_transcription_over_duration_threshold_returns_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(main_module, "SYNC_JOB_THRESHOLD_SECONDS", 0.01)
-    monkeypatch.setattr(main_module, "probe_audio_duration_seconds", lambda _audio: 0.1)
+    async def probe_duration(_path: Path, **_kwargs: object) -> float:
+        return 0.1
+
+    monkeypatch.setattr(main_module, "probe_audio_duration_path_async", probe_duration)
 
     def fail_decode(audio: bytes) -> object:
         del audio
         raise AssertionError("sync duration threshold should not require full decode before returning 202")
 
-    monkeypatch.setattr(main_module, "normalize_audio_to_wav", fail_decode)
+    monkeypatch.setattr(main_module, "run_transcription_path", fail_decode)
 
     response = await client.post(
         "/v1/audio/transcriptions",
@@ -343,3 +348,33 @@ async def test_sync_transcription_over_duration_threshold_returns_job(
     body = response.json()
     assert body["status"] == "queued"
     assert body["status_url"] == f"/v1/jobs/{body['id']}"
+    await wait_for_status(client, str(body["id"]), {"completed"})
+
+
+async def test_expired_job_is_removed_and_returns_not_found() -> None:
+    app = create_app(settings=Settings(job_result_ttl_seconds=1))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        created = await create_job(client)
+        await wait_for_status(client, str(created["id"]), {"completed"})
+        job = app.state.job_manager._jobs[str(created["id"])]
+        job.expires_at = utc_now() - timedelta(seconds=1)
+
+        response = await client.get(f"/v1/jobs/{created['id']}")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "job_not_found"
+    assert str(created["id"]) not in app.state.job_manager._jobs
+
+
+async def test_shutdown_cancels_queued_jobs_instead_of_draining_queue() -> None:
+    app = create_app(settings=Settings(job_shutdown_grace_seconds=1), adapter_delay_seconds=0.1)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        first = await create_job(client)
+        await wait_for_status(client, str(first["id"]), {"preprocessing", "splitting", "loading_model", "transcribing"})
+        second = await create_job(client)
+
+        await app.state.job_manager.shutdown()
+
+        second_job = app.state.job_manager._jobs[str(second["id"])]
+        assert second_job.status == "cancelled"
+        assert not second_job.work_dir.exists()

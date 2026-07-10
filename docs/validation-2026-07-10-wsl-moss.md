@@ -159,3 +159,14 @@ timings:
 - `backend=vllm`：HTTP 422，`capability_not_supported`。
 - `DELETE /v1/models/moss-transcribe-diarize-0.9b`：HTTP 200，状态回到 `unloaded`。
 - 卸载后 `nvidia-smi` 无 MOSS 推理进程，显存回到约 `1879MiB / 16303MiB`。
+
+## 2026-07-10 对抗性语言复验补充
+
+使用固定 model snapshot `d7231bbae2587a4af278735eb765b318c4f64edd`、固定 MOSS package commit
+`b5ad0f8386b155ddb89f9332ba3ca71891900357` 和同一中文测试音频分别请求：
+
+- `language=zh`：输出中文、2 个可解析 segments。
+- `language=en`：仍输出中文、2 个可解析 segments。
+
+结论：prompt 中加入英文语言指令不能证明 MOSS 具备可靠的输出语言控制。服务能力已收缩为
+`languages=["auto"]`；在新的官方控制接口和中英文独立 fixture 验收通过前，不声明 `zh/en`。

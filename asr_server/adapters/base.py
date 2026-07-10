@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol
 
 
@@ -55,9 +56,13 @@ class AsrAdapter(Protocol):
     async def unload(self, cuda_empty_cache: bool) -> None:
         ...
 
+    async def abort(self) -> None:
+        """Force-stop an unresponsive worker during bounded service shutdown."""
+        ...
+
     async def transcribe(
         self,
-        audio: bytes,
+        audio: AudioInput,
         *,
         model_id: str,
         backend: str,
@@ -69,7 +74,7 @@ class AsrAdapter(Protocol):
 
     async def transcribe_batch(
         self,
-        audio_chunks: list[bytes],
+        audio_chunks: list[AudioInput],
         *,
         model_id: str,
         backend: str,
@@ -78,3 +83,19 @@ class AsrAdapter(Protocol):
         max_new_tokens: int | None,
     ) -> list[TranscriptionResult]:
         ...
+@dataclass(frozen=True)
+class AudioPath:
+    """A bounded view into a normalized audio file shared with model workers."""
+
+    path: Path
+    start: float = 0.0
+    end: float | None = None
+
+    @property
+    def duration(self) -> float | None:
+        if self.end is None:
+            return None
+        return max(self.end - self.start, 0.0)
+
+
+AudioInput = bytes | AudioPath

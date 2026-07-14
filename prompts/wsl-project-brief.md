@@ -71,6 +71,7 @@ docs/validation-template.md
 ```text
 docs/validation-2026-07-02-wsl-hf-native.md
 docs/validation-2026-07-10-wsl-moss.md
+docs/validation-2026-07-15-wsl-moss-long-form.md
 ```
 
 ## 当前模型范围
@@ -145,6 +146,8 @@ uv run python scripts/moss_backend_smoke.py \
 ```
 
 MOSS smoke 必须返回非空文本和可解析 segments；未通过前不要设置 `ASR_ENABLE_MOSS=1`。
+
+MOSS `auto` 在已验证的 30 分钟级窗口内使用 native long-form，超过 1801 秒时明确降级为 1800 秒 fixed chunks。只有响应 `execution.speaker_scope=global` 时 speaker ID 才能视作整段一致；chunk 模式不得伪装成全局 diarization。生成达到 token 上限或 segment 未覆盖音频尾部时返回受控 422。
 
 ## 验收路径
 

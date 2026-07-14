@@ -31,6 +31,7 @@ prompts/wsl-project-brief.md
 ```text
 docs/validation-2026-07-02-wsl-hf-native.md
 docs/validation-2026-07-10-wsl-moss.md
+docs/validation-2026-07-15-wsl-moss-long-form.md
 ```
 
 技术约束：
@@ -120,6 +121,8 @@ uv run python scripts/moss_backend_smoke.py \
 ```
 
 MOSS smoke 必须返回非空文本和可解析 segments。未通过前不要设置 `ASR_ENABLE_MOSS=1`。
+
+MOSS 的 `auto` 是模型专属执行策略：30 分钟级已验证窗口内走 native long-form；超过 1801 秒自动降级为 1800 秒 fixed chunks。不得把 explicit `split_strategy=none` 的 6 小时输入上限描述成已验收能力。响应必须暴露 `execution.speaker_scope` 和 `generation.segment_coverage_ratio`；token 达上限或长音频缺尾必须返回受控 422，不能返回表面 completed 的残缺正文。
 
 必须实现的 API：
 

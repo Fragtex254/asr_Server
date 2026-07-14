@@ -11,7 +11,13 @@ from multiprocessing.connection import Connection
 from time import perf_counter
 from typing import Any
 
-from asr_server.adapters.base import AudioInput, TranscriptionResult, TranscriptionSegment, TranscriptionTimings
+from asr_server.adapters.base import (
+    AudioInput,
+    GenerationMetrics,
+    TranscriptionResult,
+    TranscriptionSegment,
+    TranscriptionTimings,
+)
 from asr_server.errors import AsrError
 from asr_server.registry import MOSS_MODEL_ID
 from asr_server.workers.transport import ProcessRpcTransport
@@ -135,11 +141,13 @@ def _result_to_payload(result: TranscriptionResult) -> dict[str, object]:
             "inference_ms": result.timings.inference_ms,
             "postprocess_ms": result.timings.postprocess_ms,
         },
+        "generation": result.generation.to_api(),
     }
 
 
 def _result_from_payload(payload: Any) -> TranscriptionResult:
     timings = payload.get("timings", {})
+    generation = payload.get("generation", {})
     return TranscriptionResult(
         text=str(payload["text"]),
         duration=float(payload["duration"]),
@@ -161,6 +169,14 @@ def _result_from_payload(payload: Any) -> TranscriptionResult:
             inference_ms=float(timings.get("inference_ms", 0.0)),
             postprocess_ms=float(timings.get("postprocess_ms", 0.0)),
         ),
+        generation=GenerationMetrics(
+            prompt_tokens=_optional_int(generation.get("prompt_tokens")),
+            generated_tokens=_optional_int(generation.get("generated_tokens")),
+            max_new_tokens=_optional_int(generation.get("max_new_tokens")),
+            peak_vram_allocated_mb=_optional_float(generation.get("peak_vram_allocated_mb")),
+            segment_coverage_end_seconds=_optional_float(generation.get("segment_coverage_end_seconds")),
+            segment_coverage_ratio=_optional_float(generation.get("segment_coverage_ratio")),
+        ),
     )
 
 
@@ -171,6 +187,12 @@ def _error_to_payload(error: AsrError) -> dict[str, object]:
         "message": error.message,
         "details": error.details,
     }
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, int | float):
+        return float(value)
+    return None
 
 
 class MossTranscribeDiarizeAdapter:
@@ -360,6 +382,8 @@ class _MossWorkerBackend:
         if model is None or processor is None or helpers is None:
             raise AsrError(409, "model_loading", "MOSS model is not loaded")
         with materialized_audio_path(audio, suffix=".wav") as audio_path:
+            effective_max_new_tokens = max_new_tokens or self._max_new_tokens or 2048
+            self._reset_peak_memory_stats()
             inference_started = perf_counter()
             try:
                 result = helpers.generate_transcription(
@@ -369,30 +393,63 @@ class _MossWorkerBackend:
                         str(audio_path),
                         prompt=self._prompt_for_request(context, language, helpers.default_prompt),
                     ),
-                    max_new_tokens=max_new_tokens or self._max_new_tokens or 2048,
+                    max_new_tokens=effective_max_new_tokens,
                     do_sample=False,
                     device=self._device,
                     dtype=self._dtype,
                 )
             except Exception as exc:
+                self._release_cuda_cache()
                 raise self._map_moss_exception(exc, phase="inference", model_id=self.model_id) from exc
             inference_ms = (perf_counter() - inference_started) * 1000
+            try:
+                prompt_tokens = self._result_int(result, "prompt_len")
+                generated_tokens = self._result_int(result, "generated_tokens")
+                peak_vram_allocated_mb = self._peak_vram_allocated_mb()
+                raw_text = self._result_text(result)
+            finally:
+                del result
+                # Keep the loaded model, but return unused KV/output buffers to
+                # CUDA between long-form invocations and after controlled 422s.
+                self._release_cuda_cache()
+            if generated_tokens is not None and generated_tokens >= effective_max_new_tokens:
+                raise AsrError(
+                    422,
+                    "generation_truncated",
+                    "MOSS generation reached max_new_tokens; the transcript may be incomplete",
+                    {
+                        "generated_tokens": generated_tokens,
+                        "max_new_tokens": effective_max_new_tokens,
+                        "recommended_action": "retry with split_strategy=fixed or a larger validated model limit",
+                    },
+                )
             postprocess_started = perf_counter()
-            raw_text = self._result_text(result)
             if not raw_text.strip():
                 raise AsrError(503, "inference_failed", "MOSS returned an empty transcription result")
             segments, parse_warnings = self._parse_segments(raw_text, helpers, audio_duration_seconds(audio))
             text = "\n".join(segment.text for segment in segments) if segments else raw_text
+            duration = audio_duration_seconds(audio)
+            coverage_end = max((segment.end for segment in segments), default=None)
+            coverage_ratio = min(coverage_end / duration, 1.0) if coverage_end is not None and duration > 0 else None
+            self._validate_tail_coverage(duration=duration, coverage_end=coverage_end)
             postprocess_ms = (perf_counter() - postprocess_started) * 1000
             return TranscriptionResult(
                 text=text,
-                duration=audio_duration_seconds(audio),
+                duration=duration,
                 language=language,
                 warnings=parse_warnings,
                 segments=segments,
                 timings=TranscriptionTimings(
                     inference_ms=inference_ms,
                     postprocess_ms=postprocess_ms,
+                ),
+                generation=GenerationMetrics(
+                    prompt_tokens=prompt_tokens,
+                    generated_tokens=generated_tokens,
+                    max_new_tokens=effective_max_new_tokens,
+                    peak_vram_allocated_mb=peak_vram_allocated_mb,
+                    segment_coverage_end_seconds=coverage_end,
+                    segment_coverage_ratio=coverage_ratio,
                 ),
             )
     async def transcribe_batch(
@@ -524,6 +581,50 @@ class _MossWorkerBackend:
         text = getattr(result, "text", "")
         return text if isinstance(text, str) else str(text)
 
+    def _result_int(self, result: object, key: str) -> int | None:
+        value = result.get(key) if isinstance(result, dict) else getattr(result, key, None)
+        return value if isinstance(value, int) else None
+
+    def _validate_tail_coverage(self, *, duration: float, coverage_end: float | None) -> None:
+        if coverage_end is None or duration <= 0:
+            return
+        uncovered_tail = max(duration - coverage_end, 0.0)
+        allowed_tail = max(60.0, duration * 0.02)
+        if uncovered_tail <= allowed_tail:
+            return
+        raise AsrError(
+            422,
+            "incomplete_transcript",
+            "MOSS stopped before covering the end of the audio",
+            {
+                "audio_duration_seconds": duration,
+                "last_segment_end_seconds": coverage_end,
+                "uncovered_tail_seconds": uncovered_tail,
+                "allowed_tail_seconds": allowed_tail,
+                "recommended_action": "retry with split_strategy=fixed and a validated chunk duration",
+            },
+        )
+
+    def _reset_peak_memory_stats(self) -> None:
+        cuda = getattr(self._torch, "cuda", None)
+        reset = getattr(cuda, "reset_peak_memory_stats", None)
+        if callable(reset):
+            try:
+                reset(self._device)
+            except Exception as exc:
+                logger.warning("resetting MOSS peak CUDA memory stats failed: %s", exc)
+
+    def _peak_vram_allocated_mb(self) -> float | None:
+        cuda = getattr(self._torch, "cuda", None)
+        peak = getattr(cuda, "max_memory_allocated", None)
+        if not callable(peak):
+            return None
+        try:
+            return float(peak(self._device)) / 1024 / 1024
+        except Exception as exc:
+            logger.warning("reading MOSS peak CUDA memory stats failed: %s", exc)
+            return None
+
     def _parse_segments(
         self,
         text: str,
@@ -642,6 +743,22 @@ class _MossWorkerBackend:
             "error_type": type(exc).__name__,
             "message": message[-500:],
         }
+        if phase == "inference" and any(
+            marker in lowered
+            for marker in (
+                "max_position_embeddings",
+                "context length",
+                "sequence length",
+                "input is too long",
+                "max_length",
+            )
+        ):
+            return AsrError(
+                422,
+                "context_length_exceeded",
+                "MOSS native long-form input exceeds the model context limit",
+                details,
+            )
         if "out of memory" in lowered or "cuda oom" in lowered:
             return AsrError(503, "gpu_unavailable", "CUDA out of memory during MOSS ASR", details)
         if phase == "load" and any(

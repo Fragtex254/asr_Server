@@ -1,5 +1,7 @@
 # WSL MOSS-Transcribe-Diarize Validation Record
 
+> 后续长音频边界、model-aware 执行策略和 10/30/60/90 分钟对抗性结果见 `validation-2026-07-15-wsl-moss-long-form.md`。本文件保留 2026-07-10 的首次 gate 验收事实。
+
 日期：2026-07-10
 
 状态：独立 MOSS backend smoke 与服务端 HTTP 路径均已在 WSL RTX 5070 Ti 环境通过。

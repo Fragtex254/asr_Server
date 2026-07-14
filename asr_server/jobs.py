@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import tempfile
 from collections import deque
@@ -250,11 +251,17 @@ class JobManager:
             if job.status in TERMINAL_STATUSES:
                 return {"id": job.id, "status": job.status, "message": f"job is already {job.status}"}
             job.status = "cancel_requested"
-            job.progress.message = "cancellation will take effect after the current chunk finishes"
+            native_long_form = isinstance(job.split, dict) and job.split.get("execution_mode") == "native_long_form"
+            message = (
+                "cancellation will take effect after the current model invocation finishes"
+                if native_long_form
+                else "cancellation will take effect after the current chunk finishes"
+            )
+            job.progress.message = message
             return {
                 "id": job.id,
                 "status": job.status,
-                "message": "cancellation will take effect after the current chunk finishes",
+                "message": message,
             }
 
     def _job_or_404(self, job_id: str) -> TranscriptionJob:
@@ -366,7 +373,7 @@ class JobManager:
             raise JobCancelled()
 
     def _update_phase(self, job: TranscriptionJob, phase: str, update: dict[str, object]) -> None:
-        if phase in {"preprocessing", "splitting", "loading_model", "merging"}:
+        if phase in {"preprocessing", "splitting", "loading_model", "transcribing", "merging"}:
             job.status = phase  # type: ignore[assignment]
         split = update.get("split")
         if isinstance(split, dict):
@@ -381,11 +388,20 @@ class JobManager:
         percent = _optional_float(update.get("percent")) or job.progress.percent
         total_chunks = _optional_int(update.get("total_chunks"))
         completed_chunks = _optional_int(update.get("completed_chunks"))
+        native_long_form = (
+            phase == "transcribing"
+            and isinstance(job.split, dict)
+            and job.split.get("execution_mode") == "native_long_form"
+        )
         job.progress = JobProgress(
             phase=phase,
             percent=percent,
-            total_chunks=total_chunks if total_chunks is not None else job.progress.total_chunks,
-            completed_chunks=completed_chunks if completed_chunks is not None else job.progress.completed_chunks,
+            total_chunks=None
+            if native_long_form
+            else total_chunks if total_chunks is not None else job.progress.total_chunks,
+            completed_chunks=None
+            if native_long_form
+            else completed_chunks if completed_chunks is not None else job.progress.completed_chunks,
             message=_phase_message(phase),
         )
 
@@ -475,7 +491,7 @@ class JobManager:
                             owner_pid = int(owner_path.read_text(encoding="ascii").strip())
                         except (OSError, ValueError):
                             owner_pid = -1
-                        if owner_pid > 0 and Path(f"/proc/{owner_pid}").exists():
+                        if _pid_is_running(owner_pid):
                             continue
                     shutil.rmtree(path)
             except OSError:
@@ -496,6 +512,7 @@ def _phase_message(phase: str) -> str:
         "preprocessing": "preprocessing uploaded audio",
         "splitting": "splitting audio into chunks",
         "loading_model": "loading or confirming model",
+        "transcribing": "running native long-form model invocation",
         "merging": "merging chunk transcripts",
     }
     return messages.get(phase, phase)
@@ -515,3 +532,15 @@ def _optional_float(value: object) -> float | None:
 
 def _int_from_progress(value: int | None) -> int | None:
     return value
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True

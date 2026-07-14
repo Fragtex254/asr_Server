@@ -40,6 +40,8 @@ qwen3-asr-0.6b
 
 如果 `/v1/models` 声明了 `moss-transcribe-diarize-0.9b`，只有在产品明确需要段级说话人结果时才选择它，并优先请求 `response_format=verbose_json`。不要在服务端未声明 MOSS 时硬编码该模型。
 
+MOSS 客户端必须读取响应 `execution.speaker_scope`：只有 `global` 才能把 `S01/S02` 当作整段一致身份；`chunk` 时必须保留 `chunk-NNNN:S01` 命名空间，不能自行去掉 chunk 前缀或推断跨块身份。展示降级状态时读取 `execution.automatic_chunk_fallback` 和 `warnings`，完整性诊断读取 `generation.segment_coverage_ratio`。
+
 4. 实现一个最小同步请求函数，使用 `multipart/form-data` 调用：
 
 ```text

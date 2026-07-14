@@ -4,7 +4,14 @@ import asyncio
 import hashlib
 from time import perf_counter
 
-from asr_server.adapters.base import AudioInput, AudioPath, TranscriptionResult, TranscriptionSegment, TranscriptionTimings
+from asr_server.adapters.base import (
+    AudioInput,
+    AudioPath,
+    GenerationMetrics,
+    TranscriptionResult,
+    TranscriptionSegment,
+    TranscriptionTimings,
+)
 from asr_server.workers.audio import audio_duration_seconds
 
 
@@ -125,6 +132,7 @@ class MockAsrAdapter:
             warnings=warnings,
             segments=segments,
             timings=TranscriptionTimings(inference_ms=inference_ms),
+            generation=GenerationMetrics(max_new_tokens=max_new_tokens),
         )
 
 

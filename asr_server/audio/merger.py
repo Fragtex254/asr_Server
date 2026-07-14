@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import Literal, Protocol, Sequence
 
 from asr_server.adapters.base import TranscriptionResult, TranscriptionTimings
 from asr_server.audio.transcript import TranscriptDocument, build_transcript_document
@@ -39,6 +39,7 @@ def merge_transcription_results(
     source_duration: float,
     preserve_segments: bool,
     timings: TranscriptionTimings,
+    speaker_scope: Literal["global", "chunk"] = "chunk",
 ) -> MergedTranscription:
     raw_segments = [
         {
@@ -54,7 +55,7 @@ def merge_transcription_results(
         metadata={"source_duration": source_duration},
         timestamp_source="vad_chunk_window",
     )
-    segments = _merged_segments(chunks, results)
+    segments = _merged_segments(chunks, results, speaker_scope=speaker_scope)
     warnings = _unique_warnings(results)
     if len(chunks) > 1 and segments and "moss_speaker_labels_are_chunk_local" not in warnings:
         warnings = [*warnings, "moss_speaker_labels_are_chunk_local"]
@@ -122,6 +123,8 @@ def _chunk_payload(
 def _merged_segments(
     chunks: Sequence[ChunkLike],
     results: list[TranscriptionResult],
+    *,
+    speaker_scope: Literal["global", "chunk"],
 ) -> list[dict[str, object]]:
     segments: list[dict[str, object]] = []
     for chunk_position, (chunk, result) in enumerate(zip(chunks, results, strict=True)):
@@ -142,14 +145,18 @@ def _merged_segments(
             if midpoint < ownership_start or midpoint > ownership_end:
                 continue
             speaker = segment.speaker
-            scoped_speaker = f"chunk-{chunk.index:04d}:{speaker}" if speaker is not None else None
+            scoped_speaker = (
+                speaker
+                if speaker_scope == "global"
+                else f"chunk-{chunk.index:04d}:{speaker}" if speaker is not None else None
+            )
             segments.append(
                 {
                     "start": absolute_start,
                     "end": absolute_end,
                     "speaker": scoped_speaker,
                     "speaker_label": speaker,
-                    "speaker_scope": "chunk",
+                    "speaker_scope": speaker_scope,
                     "chunk_index": chunk.index,
                     "text": segment.text,
                 }

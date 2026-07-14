@@ -5,6 +5,7 @@ import io
 import wave
 from array import array
 from collections.abc import AsyncIterator
+from dataclasses import replace
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -14,6 +15,7 @@ from asr_server.adapters.base import TranscriptionResult
 from asr_server.adapters.mock import MockAsrAdapter
 from asr_server.audio import splitter as splitter_module
 from asr_server.config import Settings
+from asr_server.execution import MOSS_EXECUTION_POLICY
 from asr_server.main import create_app
 
 
@@ -84,6 +86,12 @@ async def test_moss_model_is_registered_only_when_enabled() -> None:
     assert moss["capabilities"]["diarization"] is True
     assert moss["capabilities"]["segment_timestamps"] is True
     assert moss["capabilities"]["languages"] == ["auto"]
+    assert moss["capabilities"]["execution_modes"] == ["native_long_form", "chunked"]
+    assert moss["capabilities"]["auto_execution_mode"] == "native_long_form"
+    assert moss["capabilities"]["max_new_tokens"] == 65_536
+    assert moss["capabilities"]["speaker_scopes"] == ["global", "chunk"]
+    assert moss["capabilities"]["validated_native_max_seconds"] == 1_801.0
+    assert moss["capabilities"]["automatic_fallback_chunk_seconds"] == 1_800.0
 
 
 async def test_disabled_moss_model_returns_model_not_found(client: AsyncClient) -> None:
@@ -264,6 +272,23 @@ async def test_transcription_rejects_max_new_tokens_over_server_limit(client: As
     assert body["error"]["details"]["max_new_tokens_limit"] == 4096
 
 
+async def test_moss_accepts_its_model_specific_max_new_tokens_limit() -> None:
+    app = create_app(settings=Settings(enable_moss=True))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", make_wav(0.1), "audio/wav")},
+            data={
+                "model": "moss-transcribe-diarize-0.9b",
+                "response_format": "verbose_json",
+                "max_new_tokens": "65536",
+            },
+        )
+
+    assert response.status_code == 200
+    assert "max_new_tokens_received:65536" in response.json()["warnings"]
+
+
 async def test_transcription_reports_zero_load_time_when_model_is_already_loaded(client: AsyncClient) -> None:
     load_response = await client.post(
         "/v1/models/qwen3-asr-1.7b/load",
@@ -315,12 +340,22 @@ async def test_moss_verbose_json_returns_segments_when_enabled() -> None:
     assert body["model"] == "moss-transcribe-diarize-0.9b"
     assert body["backend"] == "transformers"
     assert "max_new_tokens_received:2048" in body["warnings"]
+    assert body["execution"] == {
+        "mode": "native_long_form",
+        "requested_split_strategy": "auto",
+        "resolved_split_strategy": "none",
+        "speaker_scope": "global",
+        "automatic_chunk_fallback": False,
+    }
+    assert body["generation"]["max_new_tokens"] == 2_048
+    assert body["generation"]["invocation_count"] == 1
+    assert body["generation"]["truncated"] is False
     assert len(body["segments"]) == 1
     assert body["segments"][0]["start"] == 0.0
     assert body["segments"][0]["end"] > 0.0
-    assert body["segments"][0]["speaker"] == "chunk-0000:S01"
+    assert body["segments"][0]["speaker"] == "S01"
     assert body["segments"][0]["speaker_label"] == "S01"
-    assert body["segments"][0]["speaker_scope"] == "chunk"
+    assert body["segments"][0]["speaker_scope"] == "global"
     assert body["segments"][0]["text"] == body["text"]
 
 
@@ -378,10 +413,61 @@ async def test_moss_split_transcription_warns_speaker_labels_are_chunk_local() -
     assert response.status_code == 200
     body = response.json()
     assert body["split"]["chunk_count"] == 4
+    assert body["execution"]["mode"] == "chunked"
+    assert body["execution"]["speaker_scope"] == "chunk"
     assert "moss_speaker_labels_are_chunk_local" in body["warnings"]
     assert len(body["segments"]) == 4
     assert body["segments"][0]["start"] == pytest.approx(0.0)
     assert body["segments"][1]["start"] == pytest.approx(0.03)
+
+
+async def test_moss_native_long_form_rejects_silently_ignored_chunk_options() -> None:
+    app = create_app(settings=Settings(enable_moss=True))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", make_wav(0.1), "audio/wav")},
+            data={
+                "model": "moss-transcribe-diarize-0.9b",
+                "split_strategy": "auto",
+                "max_chunk_seconds": "120",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "capability_not_supported"
+    assert response.json()["error"]["details"]["recommended_split_strategy"] == "fixed"
+
+
+async def test_moss_auto_fallback_is_explicit_and_chunk_scoped() -> None:
+    app = create_app(settings=Settings(enable_moss=True))
+    runtime = app.state.manager.runtime_for("moss-transcribe-diarize-0.9b")
+    runtime.definition = replace(
+        runtime.definition,
+        execution_policy=replace(
+            MOSS_EXECUTION_POLICY,
+            validated_native_max_seconds=0.05,
+            fallback_chunk_seconds=0.04,
+            chunk_hard_seconds=0.06,
+        ),
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", make_wav(0.11), "audio/wav")},
+            data={"model": "moss-transcribe-diarize-0.9b", "response_format": "verbose_json"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["execution"]["mode"] == "chunked"
+    assert body["execution"]["automatic_chunk_fallback"] is True
+    assert body["execution"]["fallback_reason"] == "duration_exceeds_validated_native_limit"
+    assert body["execution"]["speaker_scope"] == "chunk"
+    assert body["split"]["strategy"] == "fixed"
+    assert body["split"]["chunk_count"] == 3
+    assert "moss_native_long_form_fallback:duration_exceeds_validated_native_limit" in body["warnings"]
+    assert "moss_speaker_labels_are_chunk_local" in body["warnings"]
 
 
 async def test_moss_rejects_undeclared_timestamps_and_vllm_backend() -> None:

@@ -122,6 +122,7 @@ def split_audio(
     split_strategy: str,
     max_chunk_seconds: float | None,
     overlap_seconds: float | None,
+    hard_chunk_seconds: float = DEFAULT_HARD_CHUNK_SECONDS,
 ) -> SplitResult:
     requested_strategy = split_strategy
     strategy = _parse_strategy(split_strategy)
@@ -136,20 +137,32 @@ def split_audio(
 
     chunk_seconds = max_chunk_seconds or DEFAULT_SOFT_CHUNK_SECONDS
     overlap = min(DEFAULT_OVERLAP_SECONDS, chunk_seconds / 10) if overlap_seconds is None else overlap_seconds
-    _validate_chunk_options(chunk_seconds, overlap)
+    _validate_chunk_options(chunk_seconds, overlap, hard_chunk_seconds)
 
     if strategy == "none":
-        if metadata.duration_seconds > DEFAULT_HARD_CHUNK_SECONDS:
+        if metadata.duration_seconds > hard_chunk_seconds:
             raise AsrError(
                 422,
                 "duration_limit_exceeded",
                 "split_strategy=none exceeds the model hard chunk limit",
-                {"duration_seconds": metadata.duration_seconds, "hard_chunk_seconds": DEFAULT_HARD_CHUNK_SECONDS},
+                {"duration_seconds": metadata.duration_seconds, "hard_chunk_seconds": hard_chunk_seconds},
             )
-        return _single_chunk(audio, metadata, requested_strategy=requested_strategy, overlap_seconds=overlap)
+        return _single_chunk(
+            audio,
+            metadata,
+            requested_strategy=requested_strategy,
+            overlap_seconds=overlap,
+            hard_chunk_seconds=hard_chunk_seconds,
+        )
 
     if strategy == "auto" and metadata.duration_seconds <= chunk_seconds:
-        return _single_chunk(audio, metadata, requested_strategy=requested_strategy, overlap_seconds=overlap)
+        return _single_chunk(
+            audio,
+            metadata,
+            requested_strategy=requested_strategy,
+            overlap_seconds=overlap,
+            hard_chunk_seconds=hard_chunk_seconds,
+        )
 
     warnings: list[str] = []
     if strategy in {"auto", "silero"}:
@@ -163,7 +176,7 @@ def split_audio(
                 chunks=silero_chunks,
                 metadata=metadata,
                 soft_chunk_seconds=DEFAULT_SOFT_CHUNK_SECONDS,
-                hard_chunk_seconds=DEFAULT_HARD_CHUNK_SECONDS,
+                hard_chunk_seconds=hard_chunk_seconds,
                 overlap_seconds=overlap,
                 vad_backend="silero",
                 warnings=warnings,
@@ -178,7 +191,7 @@ def split_audio(
                 chunks=energy_chunks,
                 metadata=metadata,
                 soft_chunk_seconds=DEFAULT_SOFT_CHUNK_SECONDS,
-                hard_chunk_seconds=DEFAULT_HARD_CHUNK_SECONDS,
+                hard_chunk_seconds=hard_chunk_seconds,
                 overlap_seconds=overlap,
                 vad_backend="energy",
                 warnings=warnings,
@@ -193,6 +206,7 @@ def split_audio(
                 overlap_seconds=overlap,
                 vad_backend="energy" if strategy == "energy" else None,
                 warnings=warnings,
+                hard_chunk_seconds=hard_chunk_seconds,
             )
 
     chunks = _split_wav(audio, metadata, chunk_seconds, overlap)
@@ -204,7 +218,7 @@ def split_audio(
         chunks=chunks,
         metadata=metadata,
         soft_chunk_seconds=DEFAULT_SOFT_CHUNK_SECONDS,
-        hard_chunk_seconds=DEFAULT_HARD_CHUNK_SECONDS,
+        hard_chunk_seconds=hard_chunk_seconds,
         overlap_seconds=overlap,
         warnings=warnings,
     )
@@ -230,6 +244,7 @@ def split_audio_path(
     max_chunk_seconds: float | None,
     overlap_seconds: float | None,
     cancel_event: threading.Event | None = None,
+    hard_chunk_seconds: float = DEFAULT_HARD_CHUNK_SECONDS,
 ) -> PathSplitResult:
     requested_strategy = split_strategy
     strategy = _parse_strategy(split_strategy)
@@ -243,16 +258,16 @@ def split_audio_path(
         )
     chunk_seconds = max_chunk_seconds or DEFAULT_SOFT_CHUNK_SECONDS
     overlap = min(DEFAULT_OVERLAP_SECONDS, chunk_seconds / 10) if overlap_seconds is None else overlap_seconds
-    _validate_chunk_options(chunk_seconds, overlap)
+    _validate_chunk_options(chunk_seconds, overlap, hard_chunk_seconds)
     warnings: list[str] = []
     vad_backend: str | None = None
     if strategy == "none":
-        if metadata.duration_seconds > DEFAULT_HARD_CHUNK_SECONDS:
+        if metadata.duration_seconds > hard_chunk_seconds:
             raise AsrError(
                 422,
                 "duration_limit_exceeded",
                 "split_strategy=none exceeds the model hard chunk limit",
-                {"duration_seconds": metadata.duration_seconds, "hard_chunk_seconds": DEFAULT_HARD_CHUNK_SECONDS},
+                {"duration_seconds": metadata.duration_seconds, "hard_chunk_seconds": hard_chunk_seconds},
             )
         windows = [(0.0, metadata.duration_seconds)]
         resolved_strategy = "none"
@@ -286,22 +301,22 @@ def split_audio_path(
         chunks=[ChunkDescriptor(index=i, start=start, end=end, audio_path=audio_path) for i, (start, end) in enumerate(windows)],
         metadata=metadata,
         soft_chunk_seconds=DEFAULT_SOFT_CHUNK_SECONDS,
-        hard_chunk_seconds=DEFAULT_HARD_CHUNK_SECONDS,
+        hard_chunk_seconds=hard_chunk_seconds,
         overlap_seconds=overlap,
         vad_backend=vad_backend,
         warnings=warnings,
     )
 
 
-def _validate_chunk_options(max_chunk_seconds: float, overlap_seconds: float) -> None:
+def _validate_chunk_options(max_chunk_seconds: float, overlap_seconds: float, hard_chunk_seconds: float) -> None:
     if max_chunk_seconds <= 0:
         raise AsrError(400, "bad_request", "max_chunk_seconds must be greater than 0")
-    if max_chunk_seconds > DEFAULT_HARD_CHUNK_SECONDS:
+    if max_chunk_seconds > hard_chunk_seconds:
         raise AsrError(
             422,
             "duration_limit_exceeded",
             "max_chunk_seconds exceeds the server hard chunk limit",
-            {"max_chunk_seconds": max_chunk_seconds, "hard_chunk_seconds": DEFAULT_HARD_CHUNK_SECONDS},
+            {"max_chunk_seconds": max_chunk_seconds, "hard_chunk_seconds": hard_chunk_seconds},
         )
     if overlap_seconds < 0:
         raise AsrError(400, "bad_request", "overlap_seconds must be greater than or equal to 0")
@@ -319,6 +334,7 @@ def _single_chunk(
     *,
     requested_strategy: str,
     overlap_seconds: float,
+    hard_chunk_seconds: float = DEFAULT_HARD_CHUNK_SECONDS,
     resolved_strategy: str = "none",
     vad_backend: str | None = None,
     warnings: list[str] | None = None,
@@ -329,7 +345,7 @@ def _single_chunk(
         chunks=[AudioChunk(index=0, start=0.0, end=metadata.duration_seconds, audio=audio)],
         metadata=metadata,
         soft_chunk_seconds=DEFAULT_SOFT_CHUNK_SECONDS,
-        hard_chunk_seconds=DEFAULT_HARD_CHUNK_SECONDS,
+        hard_chunk_seconds=hard_chunk_seconds,
         overlap_seconds=overlap_seconds,
         vad_backend=vad_backend,
         warnings=warnings or [],

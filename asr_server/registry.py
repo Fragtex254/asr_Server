@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
+
+from asr_server.execution import MOSS_EXECUTION_POLICY, QWEN_EXECUTION_POLICY, ModelExecutionPolicy
 
 Backend = Literal["auto", "transformers", "vllm"]
 ModelStatus = Literal["unloaded", "loading", "loaded", "unloading_scheduled", "unloading", "error"]
@@ -79,6 +81,12 @@ class ModelCapabilities:
     backends: list[str]
     diarization: bool = False
     segment_timestamps: bool = False
+    execution_modes: list[str] = field(default_factory=lambda: ["chunked"])
+    auto_execution_mode: str = "chunked"
+    max_new_tokens: int = 4_096
+    speaker_scopes: list[str] = field(default_factory=list)
+    validated_native_max_seconds: float | None = None
+    automatic_fallback_chunk_seconds: float | None = None
 
     def to_api(self) -> dict[str, object]:
         return {
@@ -91,6 +99,12 @@ class ModelCapabilities:
             "backends": self.backends,
             "diarization": self.diarization,
             "segment_timestamps": self.segment_timestamps,
+            "execution_modes": self.execution_modes,
+            "auto_execution_mode": self.auto_execution_mode,
+            "max_new_tokens": self.max_new_tokens,
+            "speaker_scopes": self.speaker_scopes,
+            "validated_native_max_seconds": self.validated_native_max_seconds,
+            "automatic_fallback_chunk_seconds": self.automatic_fallback_chunk_seconds,
         }
 
 
@@ -101,6 +115,7 @@ class ModelDefinition:
     default: bool
     capabilities: ModelCapabilities
     revision: str
+    execution_policy: ModelExecutionPolicy
 
 
 def default_models(
@@ -126,6 +141,7 @@ def default_models(
             default=default_model_id == "qwen3-asr-1.7b",
             capabilities=qwen_capabilities,
             revision="057a3b044fcd31c433e7971ab40d68d20e7eae6d",
+            execution_policy=QWEN_EXECUTION_POLICY,
         ),
         "qwen3-asr-0.6b": ModelDefinition(
             id="qwen3-asr-0.6b",
@@ -133,6 +149,7 @@ def default_models(
             default=default_model_id == "qwen3-asr-0.6b",
             capabilities=qwen_capabilities,
             revision="6aa69c382e2b426eee1f5870d4c95859a74b6445",
+            execution_policy=QWEN_EXECUTION_POLICY,
         ),
     }
     if enable_moss:
@@ -150,7 +167,14 @@ def default_models(
                 backends=["transformers"],
                 diarization=True,
                 segment_timestamps=True,
+                execution_modes=["native_long_form", "chunked"],
+                auto_execution_mode="native_long_form",
+                max_new_tokens=MOSS_EXECUTION_POLICY.max_new_tokens,
+                speaker_scopes=["global", "chunk"],
+                validated_native_max_seconds=MOSS_EXECUTION_POLICY.validated_native_max_seconds,
+                automatic_fallback_chunk_seconds=MOSS_EXECUTION_POLICY.fallback_chunk_seconds,
             ),
             revision="d7231bbae2587a4af278735eb765b318c4f64edd",
+            execution_policy=MOSS_EXECUTION_POLICY,
         )
     return models

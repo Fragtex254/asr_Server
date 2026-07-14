@@ -12,6 +12,7 @@
 - `docs/docs-endpoint-capabilities.md`：`/docs` Swagger UI 使用的当前实现能力说明。
 - `docs/validation-2026-07-02-wsl-hf-native.md`：Qwen3-ASR HF native WSL 验收记录。
 - `docs/validation-2026-07-10-wsl-moss.md`：MOSS-Transcribe-Diarize WSL 验收记录。
+- `docs/validation-2026-07-15-wsl-moss-long-form.md`：MOSS 10/30/60/90 分钟原生与自动降级对抗性验收。
 - `prompts/`：给 WSL 服务端代理和 Mac 请求端代理的交接提示词。
 - `asr_server/`：FastAPI 应用、模型注册表、生命周期管理器、异步 job 队列和 ASR 适配器。
 - `tests/`：不依赖 CUDA 的 API、生命周期、临时文件清理、MOSS gate 和 job 行为测试。
@@ -46,7 +47,7 @@ curl --noproxy '*' http://192.168.31.137:18080/health
 
 当前代码已经实现 FastAPI 网关、mock 适配器、Qwen3-ASR HF native 真实适配器、可选 MOSS-Transcribe-Diarize 适配器、模型生命周期管理、同步转录、异步转录 job、单 worker FIFO 队列、chunk 级进度、长音频切分与合并、上传大小限制和统一错误信封。
 
-默认模型仍是 `qwen3-asr-1.7b`，默认注册 `qwen3-asr-1.7b` 和 `qwen3-asr-0.6b`。`moss-transcribe-diarize-0.9b` 只有在 WSL 侧完成 MOSS smoke 验收并设置 `ASR_ENABLE_MOSS=1` 后才进入 `/v1/models`；MOSS 的段级说话人和时间段信息只在 `response_format=verbose_json` 中返回，不声明 word/char timestamps、forced alignment 或 vLLM。
+默认模型仍是 `qwen3-asr-1.7b`，默认注册 `qwen3-asr-1.7b` 和 `qwen3-asr-0.6b`。`moss-transcribe-diarize-0.9b` 只有在 WSL 侧完成 MOSS smoke 验收并设置 `ASR_ENABLE_MOSS=1` 后才进入 `/v1/models`；MOSS 的段级说话人和时间段信息只在 `response_format=verbose_json` 中返回，不声明 word/char timestamps、forced alignment 或 vLLM。MOSS `auto` 在已验证的 30 分钟级窗口内走原生 long-form，超过 1801 秒会明确降级为 1800 秒 fixed chunks；客户端必须从响应的 `execution.speaker_scope` 判断 speaker ID 是全局还是 chunk-local。
 
 转录过程中产生的上传文件、解码文件和模型临时音频文件只用于当次请求。同步请求在返回前清理临时文件；异步 job 在完成、失败或取消后清理 job 工作目录，只在内存里按 `ASR_JOB_RESULT_TTL_SECONDS` 保留 job 结果。
 

@@ -58,6 +58,11 @@ def segment_to_dict(segment: object) -> dict[str, object]:
     }
 
 
+def result_int(result: object, key: str) -> int | None:
+    value = result.get(key) if isinstance(result, dict) else getattr(result, key, None)
+    return int(value) if value is not None else None
+
+
 def run_smoke(args: argparse.Namespace) -> None:
     torch = require_cuda_torch()
     transformers = importlib.import_module("transformers")
@@ -86,6 +91,7 @@ def run_smoke(args: argparse.Namespace) -> None:
     }.get(args.language, "")
     prompt = "\n".join(part for part in (args.prompt, language_instruction) if part)
     messages = inference_utils.build_transcription_messages(str(args.audio), prompt=prompt)
+    torch.cuda.reset_peak_memory_stats(device)
     result = inference_utils.generate_transcription(
         model,
         processor,
@@ -98,6 +104,9 @@ def run_smoke(args: argparse.Namespace) -> None:
     text = result.get("text", "") if isinstance(result, dict) else getattr(result, "text", "")
     text = text if isinstance(text, str) else str(text)
     segments = moss_package.parse_transcript(text)
+    prompt_tokens = result_int(result, "prompt_len")
+    generated_tokens = result_int(result, "generated_tokens")
+    peak_vram_allocated_mb = torch.cuda.max_memory_allocated(device) / 1024 / 1024
 
     print("model:", args.model)
     print("revision:", args.revision)
@@ -105,12 +114,18 @@ def run_smoke(args: argparse.Namespace) -> None:
     print("backend: transformers")
     print("loader: hf-remote-code")
     print("max_new_tokens:", args.max_new_tokens)
+    print("prompt tokens:", prompt_tokens)
+    print("generated tokens:", generated_tokens)
+    print("peak VRAM allocated MiB:", round(peak_vram_allocated_mb, 2))
     print("text first 200:", text[:200])
     print("parsed segment count:", len(segments))
     if segments:
         print("first segment:", segment_to_dict(segments[0]))
+        print("last segment:", segment_to_dict(segments[-1]))
     if not text.strip():
         raise RuntimeError("MOSS transformers 后端转录结果为空")
+    if generated_tokens is not None and generated_tokens >= args.max_new_tokens:
+        raise RuntimeError("MOSS generation reached max_new_tokens; transcript may be truncated")
 
 
 def parse_args() -> argparse.Namespace:

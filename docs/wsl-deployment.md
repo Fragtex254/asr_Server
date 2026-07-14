@@ -162,6 +162,8 @@ uv run python scripts/moss_backend_smoke.py \
 
 smoke 必须返回非空文本和可解析 `segments`，并确认安装 MOSS 依赖后 `torch.version.cuda is not None` 且 `torch.cuda.is_available()` 仍为 `True`。
 
+部署脚本在 `uv sync` 完成后使用部署目录里的 `.venv/bin/python`、`.venv/bin/pytest` 和 `.venv/bin/mypy` 直接执行检查，避免长任务被额外的 `uv run` 环境锁阻塞。不要并行运行多个会修改同一 `.venv` 的 uv 命令。
+
 交互式启动 MOSS gate：
 
 ```bash
@@ -192,7 +194,9 @@ curl --noproxy '*' -sS \
   http://127.0.0.1:18080/v1/audio/transcriptions
 ```
 
-MOSS 当前只声明 `transformers` 后端和 `language=auto`。2026-07-10 使用固定 snapshot 的对抗性 smoke 中，`language=en` 对中文输入仍输出中文，因此不得声明 `zh/en` 已可靠生效。`verbose_json` 会返回 `segments[].speaker`、`segments[].start` 和 `segments[].end`；这不是 PRD 里的 `word`/`char` timestamps，也不是 forced alignment。长音频被切分时，speaker 使用 `chunk-NNNN:S01` 命名空间，并返回 `speaker_label`、`speaker_scope=chunk` 和 `chunk_index`；响应 `warnings` 会包含 `moss_speaker_labels_are_chunk_local`。
+MOSS 当前只声明 `transformers` 后端和 `language=auto`。2026-07-10 使用固定 snapshot 的对抗性 smoke 中，`language=en` 对中文输入仍输出中文，因此不得声明 `zh/en` 已可靠生效。`verbose_json` 会返回 `segments[].speaker`、`segments[].start` 和 `segments[].end`；这不是 PRD 里的 `word`/`char` timestamps，也不是 forced alignment。
+
+2026-07-15 的 RTX 5070 Ti 实测把 MOSS `auto` 策略收敛为：不超过 1801 秒时原生单次推理并返回 `speaker_scope=global`；更长音频自动降级为 1800 秒 fixed chunks，并返回 `moss_native_long_form_fallback:duration_exceeds_validated_native_limit`。分块 speaker 使用 `chunk-NNNN:S01` 命名空间，返回 `speaker_label`、`speaker_scope=chunk` 和 `chunk_index`，同时带有 `moss_speaker_labels_are_chunk_local`。显式 `split_strategy=none` 可以发起未验证的更长原生挑战，但 60/90 分钟实测均在约 3044 秒停止产出，服务会以 `422 incomplete_transcript` 拒绝残缺结果。
 
 ## 可选 Silero VAD
 
@@ -212,16 +216,18 @@ uv pip install silero-vad==6.2.1
 
 - `context`：专有名词、领域背景或热词提示，服务端硬限制 4000 字符。
 - `hotwords`：逗号分隔字符串或 JSON 字符串数组，服务端会合并到本次模型提示，普通日志不记录完整内容。
-- `max_new_tokens`：可选生成长度上限，Qwen 默认 512，MOSS 默认 2048，服务端硬限制 4096；响应 `warnings` 会标记非默认值。
-- `split_strategy`：`auto`、`none`、`fixed`、`silero`、`energy`、`vad`；`vad` 是兼容别名，实际优先走 Silero。
+- `max_new_tokens`：可选生成长度上限。Qwen 默认 512、上限 4096；MOSS 默认按单次模型输入时长计算 `max(2048, ceil(seconds * 12))`、上限 65536。达到上限返回 `422 generation_truncated`，不会静默返回残缺正文。
+- `split_strategy`：`auto`、`none`、`fixed`、`silero`、`energy`、`vad`。Qwen `auto` 使用通用有界切分；MOSS `auto` 使用上述原生/1800 秒自动降级策略。
 
-长音频默认按 WSL 实测后的稳定组合执行：
+Qwen 长音频默认按 WSL 实测后的稳定组合执行：
 
 ```text
 max_chunk_seconds=120
 max_new_tokens=512
 ASR_QWEN_BATCH_SIZE=1
 ```
+
+MOSS 响应的稳定诊断字段为：`execution.mode`、`execution.speaker_scope`、`execution.automatic_chunk_fallback`、`generation.prompt_tokens`、`generation.generated_tokens`、`generation.max_new_tokens`、`generation.peak_vram_allocated_mb` 和 `generation.segment_coverage_ratio`。客户端必须根据 `speaker_scope` 判断 speaker 是否全局有效。
 
 Qwen chunk batch size 通过环境变量配置，默认保守为 `1`：
 

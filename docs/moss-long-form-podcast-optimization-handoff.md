@@ -1,5 +1,7 @@
 # MOSS 长音频播客基建优化交接
 
+> 状态（2026-07-15）：本交接任务已经实现并完成 WSL 对抗性验收。最终架构、边界和实测数据以 `docs/validation-2026-07-15-wsl-moss-long-form.md`、PRD 与 `/v1/models` 为准；下文保留为改造前的问题背景。
+
 ## 给下一位 AI Agent 的任务提示词
 
 你现在接手本仓库的 MOSS 长音频转录基建优化。请直接完成调查、设计、实现、测试、部署验证和文档更新，不要只给方案。开始前先完整阅读：
@@ -8,7 +10,7 @@
 - `docs/asr-server-prd.md`
 - `docs/wsl-deployment.md`
 - `docs/validation-2026-07-10-wsl-moss.md`
-- `docs/moss-transcribe-diarize-wsl-deployment-plan.md`
+- `docs/review-2026-07-10-stability-refactor.md`
 
 ## 背景与实测证据
 
@@ -29,7 +31,7 @@
 
 原始音频、完整逐字稿与响应 JSON 不进入 Git。需要复测时重新提交上述音频，并把原始结果保存为临时验收产物。
 
-官方模型卡：<https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize>。官方将该模型定义为原生 long-form、多说话人、一次生成全局 speaker-aware transcript；长音频示例建议提高 `max_new_tokens`，可到 65536。当前服务端却使用 MOSS 默认 2048、全局硬上限 4096，并在 `asr_server/transcription.py` 中复用 Qwen 的通用切片流程。这很可能破坏了 MOSS 的长程 speaker memory。
+官方模型卡：<https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize>。官方将该模型定义为原生 long-form、多说话人、一次生成全局 speaker-aware transcript；长音频示例建议提高 `max_new_tokens`，可到 65536。改造前服务端却使用 MOSS 默认 2048、全局硬上限 4096，并在 `asr_server/transcription.py` 中复用 Qwen 的通用切片流程。这很可能破坏了 MOSS 的长程 speaker memory。
 
 ## 核心目标
 

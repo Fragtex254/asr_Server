@@ -108,7 +108,12 @@ async def test_moss_load_and_transcribe_use_official_helpers(monkeypatch: pytest
         bfloat16="bf16",
         float16="fp16",
         version=SimpleNamespace(cuda="12.8"),
-        cuda=SimpleNamespace(is_available=lambda: True),
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            synchronize=lambda: calls.append(("cuda_synchronize", True)),
+            empty_cache=lambda: calls.append(("cuda_empty_cache", True)),
+            ipc_collect=lambda: calls.append(("cuda_ipc_collect", True)),
+        ),
         device=fake_torch_device,
     )
     fake_transformers = SimpleNamespace(AutoProcessor=FakeProcessor, AutoModelForCausalLM=FakeModel)
@@ -127,13 +132,13 @@ async def test_moss_load_and_transcribe_use_official_helpers(monkeypatch: pytest
         do_sample: bool,
         device: object,
         dtype: object,
-    ) -> dict[str, str]:
+    ) -> dict[str, object]:
         del model, processor, messages
         calls.append(("generate_max_new_tokens", max_new_tokens))
         calls.append(("generate_do_sample", do_sample))
         calls.append(("generate_device", device))
         calls.append(("generate_dtype", dtype))
-        return {"text": "[0.10][S01]hello[0.60]"}
+        return {"text": "[0.10][S01]hello[0.60]", "prompt_len": 321, "generated_tokens": 111}
 
     def parse_transcript(text: str) -> list[SimpleNamespace]:
         calls.append(("parse_text", text))
@@ -171,6 +176,9 @@ async def test_moss_load_and_transcribe_use_official_helpers(monkeypatch: pytest
     assert result.language == "auto"
     assert result.segments[0].speaker == "S01"
     assert result.segments[0].start == 0.0
+    assert result.generation.prompt_tokens == 321
+    assert result.generation.generated_tokens == 111
+    assert result.generation.max_new_tokens == 1024
     assert ("model_repo", "OpenMOSS-Team/MOSS-Transcribe-Diarize") in calls
     assert ("model_trust_remote_code", True) in calls
     assert ("model_dtype", "auto") in calls
@@ -179,6 +187,76 @@ async def test_moss_load_and_transcribe_use_official_helpers(monkeypatch: pytest
     assert ("to_device", fake_device) in calls
     assert ("generate_max_new_tokens", 1024) in calls
     assert ("prompt", "default prompt\n术语：MOSS\n热词提示：RTX 5070 Ti") in calls
+    assert ("cuda_empty_cache", True) in calls
+
+
+async def test_moss_rejects_output_that_reaches_generation_limit() -> None:
+    backend = _MossWorkerBackend("moss-transcribe-diarize-0.9b")
+    cleanup_calls: list[str] = []
+    backend._model = object()
+    backend._processor = object()
+    backend._device = SimpleNamespace(type="cuda")
+    backend._dtype = "bf16"
+    backend._helpers = _MossHelpers(
+        "prompt",
+        lambda _audio_path, *, prompt: [{"prompt": prompt}],
+        lambda *_args, **_kwargs: {
+            "text": "[0.10][S01]truncated[0.60]",
+            "prompt_len": 100,
+            "generated_tokens": 2048,
+        },
+        lambda _text: [SimpleNamespace(start=0.1, end=0.6, speaker="S01", text="truncated")],
+    )
+    backend._release_cuda_cache = lambda: cleanup_calls.append("released")  # type: ignore[method-assign]
+
+    with pytest.raises(AsrError) as exc_info:
+        await backend.transcribe(
+            b"audio",
+            model_id="moss-transcribe-diarize-0.9b",
+            backend="transformers",
+            language="auto",
+            context="",
+            max_new_tokens=2048,
+        )
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.code == "generation_truncated"
+    assert exc_info.value.details["generated_tokens"] == 2048
+    assert cleanup_calls == ["released"]
+
+
+async def test_moss_releases_cuda_cache_when_generation_raises() -> None:
+    backend = _MossWorkerBackend("moss-transcribe-diarize-0.9b")
+    cleanup_calls: list[str] = []
+    backend._model = object()
+    backend._processor = object()
+    backend._device = SimpleNamespace(type="cuda")
+    backend._dtype = "bf16"
+
+    def fail_generation(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("decoder failed")
+
+    backend._helpers = _MossHelpers(
+        "prompt",
+        lambda _audio_path, *, prompt: [{"prompt": prompt}],
+        fail_generation,
+        lambda _text: [],
+    )
+    backend._release_cuda_cache = lambda: cleanup_calls.append("released")  # type: ignore[method-assign]
+
+    with pytest.raises(AsrError) as exc_info:
+        await backend.transcribe(
+            b"audio",
+            model_id="moss-transcribe-diarize-0.9b",
+            backend="transformers",
+            language="auto",
+            context="",
+            max_new_tokens=2048,
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.code == "inference_failed"
+    assert cleanup_calls == ["released"]
 
 
 async def test_moss_load_rejects_unsupported_dtype(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -266,3 +344,34 @@ def test_moss_parser_failure_preserves_raw_transcription_as_warning() -> None:
 
     assert segments == []
     assert warnings == ["moss_segment_parser_failed:ValueError"]
+
+
+def test_moss_context_limit_failure_is_reported_explicitly() -> None:
+    backend = _MossWorkerBackend("moss-transcribe-diarize-0.9b")
+
+    error = backend._map_moss_exception(
+        RuntimeError("The sequence length exceeds max_position_embeddings"),
+        phase="inference",
+        model_id="moss-transcribe-diarize-0.9b",
+    )
+
+    assert error.status_code == 422
+    assert error.code == "context_length_exceeded"
+    assert error.details["phase"] == "inference"
+
+
+def test_moss_large_tail_gap_is_rejected_as_incomplete() -> None:
+    backend = _MossWorkerBackend("moss-transcribe-diarize-0.9b")
+
+    with pytest.raises(AsrError) as exc_info:
+        backend._validate_tail_coverage(duration=3_600.0, coverage_end=3_044.37)
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.code == "incomplete_transcript"
+    assert exc_info.value.details["uncovered_tail_seconds"] == pytest.approx(555.63)
+
+
+def test_moss_small_trailing_silence_does_not_trigger_incomplete_error() -> None:
+    backend = _MossWorkerBackend("moss-transcribe-diarize-0.9b")
+
+    backend._validate_tail_coverage(duration=1_800.0, coverage_end=1_760.0)

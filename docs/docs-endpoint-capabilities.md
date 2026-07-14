@@ -70,6 +70,12 @@ Its first-release capability set is deliberately conservative:
 - `forced_alignment: false`
 - `diarization: true`
 - `segment_timestamps: true`
+- `execution_modes: ["native_long_form", "chunked"]`
+- `auto_execution_mode: "native_long_form"`
+- `max_new_tokens: 65536`
+- `speaker_scopes: ["global", "chunk"]`
+- `validated_native_max_seconds: 1801.0`
+- `automatic_fallback_chunk_seconds: 1800.0`
 - language values: `auto` only. A 2026-07-10 adversarial WSL smoke showed
   `language=en` still returning Chinese for Chinese input, so `zh`/`en` are not
   declared until the model exposes a verified language-control mechanism.
@@ -79,8 +85,13 @@ For MOSS, `response_format=verbose_json` returns parsed
 `segments[].text` when the model output is parseable. The `timestamps`
 request parameter still does not support `word` or `char` timestamps, and MOSS
 segment timestamps are not treated as forced alignment.
-Cross-chunk speaker labels are explicitly scoped as `chunk-NNNN:S01`; each
-segment also returns `speaker_label`, `speaker_scope=chunk`, and `chunk_index`.
+For `split_strategy=auto`, MOSS uses one native invocation through the validated
+30-minute class window and returns `speaker_scope=global`. Above 1801 seconds it
+explicitly falls back to 1800-second fixed chunks. Cross-chunk speaker labels
+are scoped as `chunk-NNNN:S01`; each segment also returns `speaker_label`,
+`speaker_scope=chunk`, and `chunk_index`. Explicit `split_strategy=none` is an
+advanced, unvalidated long-form challenge and may return a controlled 422 when
+tail coverage, token, or context checks fail.
 
 ## Transcription request behavior
 
@@ -96,8 +107,9 @@ Implemented form fields for `POST /v1/audio/transcriptions` and
 - `backend`: accepts `auto`, `transformers`, or `vllm` syntactically, but only
   `auto` resolving to `transformers` and explicit `transformers` are supported
   by declared capabilities today.
-- `max_new_tokens`: optional; default is `512`, hard limit is `4096`.
-  MOSS uses a model-specific default of `2048` when the field is omitted.
+- `max_new_tokens`: optional and model-specific. Qwen defaults to `512` with a
+  hard limit of `4096`. MOSS dynamically uses
+  `max(2048, ceil(invocation_audio_seconds * 12))`, capped at `65536`.
 - `context`: optional adapter prompt context, combined with hotwords and limited
   to `4000` characters.
 - `hotwords`: optional JSON string array or comma-separated string, merged into
@@ -106,6 +118,12 @@ Implemented form fields for `POST /v1/audio/transcriptions` and
 - `max_chunk_seconds`: optional per-request chunk upper bound.
 - `overlap_seconds`: optional chunk overlap.
 - `preserve_segments`: optional flag to return chunk-level details.
+
+Successful JSON responses include `execution` and `generation`. Clients should
+consume `execution.mode`, `execution.speaker_scope`,
+`execution.automatic_chunk_fallback`, `generation.generated_tokens`,
+`generation.max_new_tokens`, and `generation.segment_coverage_ratio` instead of
+inferring global speaker identity from the selected model ID.
 
 Audio uploads are bounded by `ASR_MAX_UPLOAD_MB`, default `512`.
 Each uploaded audio file is bounded to `21600` seconds, or 6 hours.

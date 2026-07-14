@@ -266,12 +266,12 @@ run_static_checks() {
 
   if [[ "${RUN_TESTS}" == "1" ]]; then
     log "running pytest"
-    uv run pytest -q
+    "${DEPLOY_DIR}/.venv/bin/pytest" -q
   fi
 
   if [[ "${RUN_MYPY}" == "1" ]]; then
     log "running mypy"
-    uv run mypy asr_server tests scripts
+    "${DEPLOY_DIR}/.venv/bin/mypy" asr_server tests scripts
   fi
 }
 
@@ -300,7 +300,7 @@ run_cuda_check() {
   fi
 
   log "validating torch CUDA runtime"
-  uv run python - <<'PY'
+  "${DEPLOY_DIR}/.venv/bin/python" - <<'PY'
 import torch
 import torchvision
 import torchaudio
@@ -333,7 +333,7 @@ run_backend_smoke() {
   [[ -f "${SMOKE_AUDIO}" ]] || die "smoke audio not found: ${SMOKE_AUDIO}"
 
   log "running Qwen3-ASR transformers backend smoke"
-  uv run python scripts/qwen_asr_backend_smoke.py \
+  "${DEPLOY_DIR}/.venv/bin/python" scripts/qwen_asr_backend_smoke.py \
     --backend transformers \
     --model "${SMOKE_MODEL_REPO}" \
     --audio "${SMOKE_AUDIO}" \
@@ -433,7 +433,7 @@ run_http_smoke() {
   curl --noproxy '*' -fsS "${base_url}/health" >/dev/null
 
   log "running live HTTP smoke tests"
-  ASR_BASE_URL="${base_url}" uv run pytest tests/test_http_smoke.py -q
+  ASR_BASE_URL="${base_url}" "${DEPLOY_DIR}/.venv/bin/pytest" tests/test_http_smoke.py -q
 }
 
 install_system_packages

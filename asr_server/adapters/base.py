@@ -40,6 +40,26 @@ class TranscriptionSegment:
 
 
 @dataclass(frozen=True)
+class GenerationMetrics:
+    prompt_tokens: int | None = None
+    generated_tokens: int | None = None
+    max_new_tokens: int | None = None
+    peak_vram_allocated_mb: float | None = None
+    segment_coverage_end_seconds: float | None = None
+    segment_coverage_ratio: float | None = None
+
+    def to_api(self) -> dict[str, int | float | None]:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "generated_tokens": self.generated_tokens,
+            "max_new_tokens": self.max_new_tokens,
+            "peak_vram_allocated_mb": self.peak_vram_allocated_mb,
+            "segment_coverage_end_seconds": self.segment_coverage_end_seconds,
+            "segment_coverage_ratio": self.segment_coverage_ratio,
+        }
+
+
+@dataclass(frozen=True)
 class TranscriptionResult:
     text: str
     duration: float
@@ -47,6 +67,7 @@ class TranscriptionResult:
     warnings: list[str]
     segments: list[TranscriptionSegment] = field(default_factory=list)
     timings: TranscriptionTimings = field(default_factory=TranscriptionTimings)
+    generation: GenerationMetrics = field(default_factory=GenerationMetrics)
 
 
 class AsrAdapter(Protocol):

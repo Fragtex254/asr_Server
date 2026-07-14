@@ -174,6 +174,44 @@ async def test_job_reports_chunk_progress() -> None:
         assert len(cast(list[dict[str, object]], completed_result["chunks"])) == 4
 
 
+async def test_moss_native_long_form_job_reports_stage_without_fake_chunk_progress() -> None:
+    app = create_app(settings=Settings(enable_moss=True), adapter_delay_seconds=0.08)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        created = await create_job(
+            client,
+            data={
+                "model": "moss-transcribe-diarize-0.9b",
+                "response_format": "verbose_json",
+            },
+        )
+        transcribing = await wait_for_status(client, str(created["id"]), {"transcribing"})
+        completed = await wait_for_status(client, str(created["id"]), {"completed"})
+
+    progress = cast(dict[str, Any], transcribing["progress"])
+    split = cast(dict[str, Any], transcribing["split"])
+    assert progress["phase"] == "transcribing"
+    assert "total_chunks" not in progress
+    assert "completed_chunks" not in progress
+    assert "current_chunk" not in progress
+    assert split["execution_mode"] == "native_long_form"
+    assert cast(dict[str, Any], completed["result"])["execution"]["speaker_scope"] == "global"
+
+
+async def test_moss_native_long_form_cancellation_waits_for_model_invocation() -> None:
+    app = create_app(settings=Settings(enable_moss=True), adapter_delay_seconds=0.08)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        created = await create_job(client, data={"model": "moss-transcribe-diarize-0.9b"})
+        await wait_for_status(client, str(created["id"]), {"transcribing"})
+
+        response = await client.delete(f"/v1/jobs/{created['id']}")
+        cancelled = await wait_for_status(client, str(created["id"]), {"cancelled"})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancel_requested"
+    assert response.json()["message"] == "cancellation will take effect after the current model invocation finishes"
+    assert cancelled["status"] == "cancelled"
+
+
 async def test_job_failure_uses_error_shape(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fail_transcribe(
         self: MockAsrAdapter,

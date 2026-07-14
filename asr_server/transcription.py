@@ -8,21 +8,20 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import uuid4
 
-from asr_server.adapters.base import TranscriptionResult
-from asr_server.audio.merger import merge_transcription_results
+from asr_server.adapters.base import AudioInput, AudioPath, TranscriptionResult
+from asr_server.audio.merger import ChunkLike, merge_transcription_results
+from asr_server.audio.metadata import inspect_audio, inspect_audio_path
 from asr_server.audio.preprocess import normalize_audio_path_to_wav_async, normalize_audio_to_wav
 from asr_server.audio.splitter import PathSplitResult, SplitCancelled, SplitResult, split_audio, split_audio_path
 from asr_server.config import Settings
 from asr_server.audio.workspace import validate_workspace_limits
 from asr_server.errors import AsrError
+from asr_server.execution import ExecutionPlan, ModelExecutionPolicy
 from asr_server.lifecycle import ModelLifecycleManager
-from asr_server.registry import MOSS_MODEL_ID, Backend
+from asr_server.registry import Backend
 
 
 MAX_CONTEXT_CHARS = 4000
-DEFAULT_MAX_NEW_TOKENS = 512
-MOSS_DEFAULT_MAX_NEW_TOKENS = 2048
-MAX_NEW_TOKENS = 4096
 SYNC_JOB_THRESHOLD_SECONDS = 600.0
 
 StageCallback = Callable[[str, dict[str, object]], Awaitable[None]]
@@ -85,6 +84,8 @@ class ValidatedTranscription:
     resolved_backend: str
     adapter_context: str
     max_new_tokens: int | None
+    execution_policy: ModelExecutionPolicy
+    supports_diarization: bool
 
 
 def parse_hotwords(hotwords: str | None) -> list[str]:
@@ -121,34 +122,6 @@ def build_adapter_context(context: str, hotwords: str | None) -> str:
     return adapter_context
 
 
-def validate_max_new_tokens(
-    max_new_tokens: int | None,
-    *,
-    default: int = DEFAULT_MAX_NEW_TOKENS,
-) -> int | None:
-    if max_new_tokens is None:
-        return default
-    if max_new_tokens > MAX_NEW_TOKENS:
-        raise AsrError(
-            400,
-            "bad_request",
-            "max_new_tokens exceeds the server limit",
-            {"max_new_tokens": max_new_tokens, "max_new_tokens_limit": MAX_NEW_TOKENS},
-        )
-    return max_new_tokens
-
-
-def default_max_new_tokens_for_model(model_id: str) -> int:
-    return MOSS_DEFAULT_MAX_NEW_TOKENS if model_id == MOSS_MODEL_ID else DEFAULT_MAX_NEW_TOKENS
-
-
-def validate_max_new_tokens_for_model(model_id: str, max_new_tokens: int | None) -> int | None:
-    return validate_max_new_tokens(
-        max_new_tokens,
-        default=default_max_new_tokens_for_model(model_id),
-    )
-
-
 def validate_transcription_request(
     manager: ModelLifecycleManager,
     request: TranscriptionRequest,
@@ -178,7 +151,9 @@ def validate_transcription_request(
         selected_model=selected_model,
         resolved_backend=resolved_backend,
         adapter_context=build_adapter_context(request.context, request.hotwords),
-        max_new_tokens=validate_max_new_tokens_for_model(selected_model, request.max_new_tokens),
+        max_new_tokens=runtime.definition.execution_policy.validate_max_new_tokens(request.max_new_tokens),
+        execution_policy=runtime.definition.execution_policy,
+        supports_diarization=runtime.definition.capabilities.diarization,
     )
 
 
@@ -197,27 +172,52 @@ async def run_transcription(
     if stage_callback is not None:
         await stage_callback("preprocessing", {"percent": 1.0})
     normalized = await asyncio.to_thread(normalize_audio_to_wav, audio)
+    metadata = await asyncio.to_thread(inspect_audio, normalized.audio)
+    plan = checked.execution_policy.plan(
+        requested_split_strategy=request.split_strategy,
+        audio_duration_seconds=metadata.duration_seconds,
+        max_chunk_seconds=request.max_chunk_seconds,
+        overlap_seconds=request.overlap_seconds,
+    )
     if stage_callback is not None:
         await stage_callback("splitting", {"percent": 3.0})
     split = await asyncio.to_thread(
         lambda: split_audio(
             normalized.audio,
-            split_strategy=request.split_strategy,
-            max_chunk_seconds=request.max_chunk_seconds,
+            split_strategy=plan.split_strategy,
+            max_chunk_seconds=plan.max_chunk_seconds,
             overlap_seconds=request.overlap_seconds,
+            hard_chunk_seconds=plan.hard_chunk_seconds,
         )
     )
+    split = replace(
+        split,
+        requested_strategy=request.split_strategy,
+        warnings=list(dict.fromkeys([*split.warnings, *plan.warnings])),
+    )
+    resolved_max_new_tokens = _resolved_max_new_tokens(checked, split)
+    speaker_scope = _speaker_scope(checked, plan, len(split.chunks))
     if stage_callback is not None:
         await stage_callback(
             "loading_model",
             {
                 "percent": 5.0,
-                "split": split.summary(),
+                "split": _split_summary(split, plan, speaker_scope),
                 "total_chunks": len(split.chunks),
                 "completed_chunks": 0,
                 "chunk_windows": [(chunk.start, chunk.end) for chunk in split.chunks],
             },
         )
+    effective_before_chunk = before_chunk
+    effective_after_chunk = after_chunk
+    if plan.execution_mode == "native_long_form":
+        effective_after_chunk = None
+
+        async def native_before_chunk(_chunk_index: int, _total_chunks: int) -> None:
+            if stage_callback is not None:
+                await stage_callback("transcribing", {"percent": 5.0})
+
+        effective_before_chunk = native_before_chunk
     resolved_backend, chunk_results, timings = await manager.transcribe_chunks(
         [chunk.audio for chunk in split.chunks],
         model_id=request.model,
@@ -225,10 +225,10 @@ async def run_transcription(
         language=request.language,
         timestamps=request.timestamps,
         context=checked.adapter_context,
-        max_new_tokens=checked.max_new_tokens,
+        max_new_tokens=resolved_max_new_tokens,
         batch_size=settings.qwen_batch_size,
-        before_chunk=before_chunk,
-        after_chunk=after_chunk,
+        before_chunk=effective_before_chunk,
+        after_chunk=effective_after_chunk,
     )
     timings = replace(
         timings,
@@ -244,8 +244,9 @@ async def run_transcription(
         source_duration=split.metadata.duration_seconds,
         preserve_segments=request.preserve_segments,
         timings=timings,
+        speaker_scope="global" if speaker_scope == "global" else "chunk",
     )
-    warnings = _warnings(result.warnings, split.warnings, checked.max_new_tokens, request.max_new_tokens)
+    warnings = _warnings(result.warnings, split.warnings, resolved_max_new_tokens, request.max_new_tokens)
     return transcription_payload(
         id_=f"tr_{uuid4().hex}",
         selected_model=checked.selected_model,
@@ -258,6 +259,8 @@ async def run_transcription(
         segments=result.segments if request.response_format == "verbose_json" else [],
         timings=result.timings.to_api(),
         warnings=warnings,
+        execution=plan.to_api(speaker_scope=speaker_scope),
+        generation=_generation_payload(split, chunk_results, resolved_max_new_tokens),
     )
 
 
@@ -282,6 +285,13 @@ async def run_transcription_path(
         timeout_seconds=settings.ffmpeg_timeout_seconds,
     )
     await asyncio.to_thread(validate_workspace_limits, workspace, settings)
+    metadata = await asyncio.to_thread(inspect_audio_path, normalized.path)
+    plan = checked.execution_policy.plan(
+        requested_split_strategy=request.split_strategy,
+        audio_duration_seconds=metadata.duration_seconds,
+        max_chunk_seconds=request.max_chunk_seconds,
+        overlap_seconds=request.overlap_seconds,
+    )
     if stage_callback is not None:
         await stage_callback("splitting", {"percent": 3.0})
     split_cancel = threading.Event()
@@ -289,10 +299,11 @@ async def run_transcription_path(
         asyncio.to_thread(
             split_audio_path,
             normalized.path,
-            split_strategy=request.split_strategy,
-            max_chunk_seconds=request.max_chunk_seconds,
+            split_strategy=plan.split_strategy,
+            max_chunk_seconds=plan.max_chunk_seconds,
             overlap_seconds=request.overlap_seconds,
             cancel_event=split_cancel,
+            hard_chunk_seconds=plan.hard_chunk_seconds,
         )
     )
     try:
@@ -304,28 +315,50 @@ async def run_transcription_path(
         except SplitCancelled:
             pass
         raise
+    split = replace(
+        split,
+        requested_strategy=request.split_strategy,
+        warnings=list(dict.fromkeys([*split.warnings, *plan.warnings])),
+    )
+    resolved_max_new_tokens = _resolved_max_new_tokens(checked, split)
+    speaker_scope = _speaker_scope(checked, plan, len(split.chunks))
     if stage_callback is not None:
         await stage_callback(
             "loading_model",
             {
                 "percent": 5.0,
-                "split": split.summary(),
+                "split": _split_summary(split, plan, speaker_scope),
                 "total_chunks": len(split.chunks),
                 "completed_chunks": 0,
                 "chunk_windows": [(chunk.start, chunk.end) for chunk in split.chunks],
             },
         )
+    effective_before_chunk = before_chunk
+    effective_after_chunk = after_chunk
+    if plan.execution_mode == "native_long_form":
+        effective_after_chunk = None
+
+        async def native_before_chunk(_chunk_index: int, _total_chunks: int) -> None:
+            if stage_callback is not None:
+                await stage_callback("transcribing", {"percent": 5.0})
+
+        effective_before_chunk = native_before_chunk
+    audio_inputs: list[AudioInput] = (
+        [AudioPath(path=normalized.path)]
+        if plan.execution_mode == "native_long_form"
+        else [chunk.as_audio_input() for chunk in split.chunks]
+    )
     resolved_backend, chunk_results, timings = await manager.transcribe_chunks(
-        [chunk.as_audio_input() for chunk in split.chunks],
+        audio_inputs,
         model_id=request.model,
         backend=request.backend,
         language=request.language,
         timestamps=request.timestamps,
         context=checked.adapter_context,
-        max_new_tokens=checked.max_new_tokens,
+        max_new_tokens=resolved_max_new_tokens,
         batch_size=1,
-        before_chunk=before_chunk,
-        after_chunk=after_chunk,
+        before_chunk=effective_before_chunk,
+        after_chunk=effective_after_chunk,
     )
     await asyncio.to_thread(validate_workspace_limits, workspace, settings)
     timings = replace(
@@ -342,8 +375,9 @@ async def run_transcription_path(
         source_duration=split.metadata.duration_seconds,
         preserve_segments=request.preserve_segments,
         timings=timings,
+        speaker_scope="global" if speaker_scope == "global" else "chunk",
     )
-    warnings = _warnings(result.warnings, split.warnings, checked.max_new_tokens, request.max_new_tokens)
+    warnings = _warnings(result.warnings, split.warnings, resolved_max_new_tokens, request.max_new_tokens)
     return transcription_payload(
         id_=f"tr_{uuid4().hex}",
         selected_model=checked.selected_model,
@@ -356,6 +390,8 @@ async def run_transcription_path(
         segments=result.segments if request.response_format == "verbose_json" else [],
         timings=result.timings.to_api(),
         warnings=warnings,
+        execution=plan.to_api(speaker_scope=speaker_scope),
+        generation=_generation_payload(split, chunk_results, resolved_max_new_tokens),
     )
 
 
@@ -372,6 +408,8 @@ def transcription_payload(
     segments: list[dict[str, object]],
     timings: dict[str, float],
     warnings: list[str],
+    execution: dict[str, object],
+    generation: dict[str, object],
 ) -> dict[str, object]:
     return {
         "id": id_,
@@ -387,6 +425,81 @@ def transcription_payload(
         "usage": {"audio_seconds": duration},
         "timings": timings,
         "warnings": warnings,
+        "execution": execution,
+        "generation": generation,
+    }
+
+
+def _resolved_max_new_tokens(
+    checked: ValidatedTranscription,
+    split: SplitResult | PathSplitResult,
+) -> int:
+    invocation_duration = max((chunk.duration for chunk in split.chunks), default=0.0)
+    return checked.execution_policy.resolve_max_new_tokens(
+        checked.max_new_tokens,
+        invocation_duration_seconds=invocation_duration,
+    )
+
+
+def _speaker_scope(
+    checked: ValidatedTranscription,
+    plan: ExecutionPlan,
+    chunk_count: int,
+) -> str:
+    if not checked.supports_diarization:
+        return "none"
+    if chunk_count == 1:
+        return "global"
+    return "chunk"
+
+
+def _split_summary(
+    split: SplitResult | PathSplitResult,
+    plan: ExecutionPlan,
+    speaker_scope: str,
+) -> dict[str, object]:
+    return {
+        **split.summary(),
+        "execution_mode": plan.execution_mode,
+        "speaker_scope": speaker_scope,
+    }
+
+
+def _generation_payload(
+    split: SplitResult | PathSplitResult,
+    results: list[TranscriptionResult],
+    max_new_tokens: int,
+) -> dict[str, object]:
+    chunks: list[ChunkLike] = list(split.chunks)
+    prompt_values = [item.generation.prompt_tokens for item in results if item.generation.prompt_tokens is not None]
+    generated_values = [
+        item.generation.generated_tokens for item in results if item.generation.generated_tokens is not None
+    ]
+    peak_values = [
+        item.generation.peak_vram_allocated_mb
+        for item in results
+        if item.generation.peak_vram_allocated_mb is not None
+    ]
+    coverage_ends = [
+        chunk.start + result.generation.segment_coverage_end_seconds
+        for chunk, result in zip(chunks, results, strict=True)
+        if result.generation.segment_coverage_end_seconds is not None
+    ]
+    coverage_end = max(coverage_ends, default=None)
+    coverage_ratio = (
+        min(coverage_end / split.metadata.duration_seconds, 1.0)
+        if coverage_end is not None and split.metadata.duration_seconds > 0
+        else None
+    )
+    return {
+        "prompt_tokens": sum(prompt_values) if prompt_values else None,
+        "generated_tokens": sum(generated_values) if generated_values else None,
+        "max_new_tokens": max_new_tokens,
+        "peak_vram_allocated_mb": max(peak_values) if peak_values else None,
+        "segment_coverage_end_seconds": coverage_end,
+        "segment_coverage_ratio": coverage_ratio,
+        "invocation_count": len(results),
+        "truncated": False,
     }
 
 

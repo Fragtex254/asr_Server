@@ -31,7 +31,7 @@ class AnchorChunk(Protocol):
 @dataclass(frozen=True)
 class AnchorReplayConfig:
     anchor_seconds: float = 8.0
-    min_anchor_seconds: float = 1.0
+    min_anchor_seconds: float = 2.0
     silence_seconds: float = 0.5
     max_prefix_seconds: float = 60.0
 
@@ -119,6 +119,12 @@ class AnchorReplaySequence:
                 self._conflicts += 1
                 continue
             body_segments.append(segment)
+        anchorable_local_speakers = {
+            segment.speaker
+            for segment in body_segments
+            if segment.speaker is not None
+            and segment.end - segment.start >= self._config.min_anchor_seconds
+        }
         if result.text.strip() and not body_segments:
             self._missing_segment_chunks += 1
         rewritten: list[TranscriptionSegment] = []
@@ -130,7 +136,12 @@ class AnchorReplaySequence:
             resolution = "anchor" if global_speaker is not None and index > 0 else None
             if global_speaker is not None and index == 0:
                 resolution = "initial"
-            if global_speaker is None and local_speaker is not None and (index == 0 or anchors_complete):
+            if (
+                global_speaker is None
+                and local_speaker is not None
+                and local_speaker in anchorable_local_speakers
+                and (index == 0 or anchors_complete)
+            ):
                 global_speaker = self._allocate_speaker()
                 local_to_global[local_speaker] = global_speaker
                 resolution = "initial" if index == 0 else "new_candidate"

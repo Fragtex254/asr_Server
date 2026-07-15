@@ -24,6 +24,11 @@ from asr_server.registry import Backend
 
 MAX_CONTEXT_CHARS = 4000
 SYNC_JOB_THRESHOLD_SECONDS = 600.0
+# Real four-speaker podcast validation showed that a dense 1,740-second body
+# can exhaust MOSS's useful output window after roughly 1,324 seconds even
+# without reaching the nominal audio-duration limit. Keep a content-density
+# margin while leaving the separate 60-second anchor replay budget intact.
+MOSS_ANCHOR_REPLAY_BODY_CHUNK_SECONDS = 1_200.0
 
 StageCallback = Callable[[str, dict[str, object]], Awaitable[None]]
 BeforeChunkCallback = Callable[[int, int], Awaitable[None]]
@@ -352,8 +357,9 @@ async def run_transcription_path(
                     *split.warnings,
                     *plan.warnings,
                     *(
-                        ["moss_anchor_replay_body_chunk_limit:1740"]
-                        if request.speaker_resolution != "off" and plan.max_chunk_seconds == 1_740.0
+                        ["moss_anchor_replay_body_chunk_limit:1200"]
+                        if request.speaker_resolution != "off"
+                        and plan.max_chunk_seconds == MOSS_ANCHOR_REPLAY_BODY_CHUNK_SECONDS
                         else []
                     ),
                 ]
@@ -542,7 +548,7 @@ def _speaker_scope(
 def _anchor_compatible_plan(plan: ExecutionPlan, speaker_resolution: str) -> ExecutionPlan:
     if speaker_resolution == "off" or plan.execution_mode != "chunked":
         return plan
-    body_limit = 1_740.0
+    body_limit = MOSS_ANCHOR_REPLAY_BODY_CHUNK_SECONDS
     if plan.max_chunk_seconds is None or plan.max_chunk_seconds <= body_limit:
         return plan
     return replace(

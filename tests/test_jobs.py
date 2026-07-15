@@ -174,6 +174,56 @@ async def test_job_reports_chunk_progress() -> None:
         assert len(cast(list[dict[str, object]], completed_result["chunks"])) == 4
 
 
+@pytest.mark.parametrize(
+    ("model", "extra_data"),
+    [
+        ("qwen3-asr-1.7b", {}),
+        ("moss-transcribe-diarize-0.9b", {"response_format": "verbose_json"}),
+    ],
+)
+async def test_chunked_job_reports_cumulative_and_latest_chunk_text(
+    model: str,
+    extra_data: dict[str, str],
+) -> None:
+    app = create_app(settings=Settings(enable_moss=True), adapter_delay_seconds=0.03)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        created = await create_job(
+            client,
+            audio=make_wav(0.11),
+            data={
+                "model": model,
+                "split_strategy": "fixed",
+                "max_chunk_seconds": "0.04",
+                "overlap_seconds": "0.01",
+                "preserve_segments": "true",
+                **extra_data,
+            },
+        )
+
+        progress: dict[str, Any] | None = None
+        for _ in range(80):
+            response = await client.get(f"/v1/jobs/{created['id']}")
+            assert response.status_code == 200
+            body = cast(dict[str, Any], response.json())
+            candidate = cast(dict[str, Any], body["progress"])
+            if candidate.get("completed_chunks", 0) >= 1 and candidate.get("chunk_text"):
+                progress = candidate
+                break
+            await asyncio.sleep(0.01)
+
+        assert progress is not None
+        assert progress["text"]
+        assert progress["chunk_text"]
+        assert str(progress["text"]).endswith(str(progress["chunk_text"]))
+        chunks = cast(list[dict[str, Any]], progress["chunks"])
+        assert chunks[-1] == {
+            "index": progress["completed_chunks"],
+            "text": progress["chunk_text"],
+        }
+
+        await wait_for_status(client, str(created["id"]), {"completed"})
+
+
 async def test_moss_native_long_form_job_reports_stage_without_fake_chunk_progress() -> None:
     app = create_app(settings=Settings(enable_moss=True), adapter_delay_seconds=0.08)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
@@ -193,6 +243,9 @@ async def test_moss_native_long_form_job_reports_stage_without_fake_chunk_progre
     assert "total_chunks" not in progress
     assert "completed_chunks" not in progress
     assert "current_chunk" not in progress
+    assert "text" not in progress
+    assert "chunk_text" not in progress
+    assert "chunks" not in progress
     assert split["execution_mode"] == "native_long_form"
     assert cast(dict[str, Any], completed["result"])["execution"]["speaker_scope"] == "global"
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from asr_server.execution import MOSS_EXECUTION_POLICY, QWEN_EXECUTION_POLICY
+from asr_server.execution import ExecutionPlan, MOSS_EXECUTION_POLICY, QWEN_EXECUTION_POLICY
+from asr_server.transcription import MOSS_ANCHOR_REPLAY_BODY_CHUNK_SECONDS, _anchor_compatible_plan
 
 
 def test_moss_auto_uses_native_long_form_with_duration_scaled_token_budget() -> None:
@@ -22,6 +23,24 @@ def test_moss_auto_falls_back_explicitly_above_validated_native_window() -> None
     assert plan.hard_chunk_seconds == 1_801.0
     assert plan.allow_automatic_chunk_fallback is True
     assert plan.fallback_reason == "duration_exceeds_validated_native_limit"
+
+
+def test_moss_anchor_replay_caps_dense_podcast_body_chunks_at_twenty_minutes() -> None:
+    plan = ExecutionPlan(
+        execution_mode="chunked",
+        requested_split_strategy="auto",
+        split_strategy="fixed",
+        max_chunk_seconds=1_800.0,
+        hard_chunk_seconds=1_801.0,
+        allow_automatic_chunk_fallback=True,
+        fallback_reason="duration_exceeds_validated_native_limit",
+    )
+
+    resolved = _anchor_compatible_plan(plan, "auto")
+
+    assert MOSS_ANCHOR_REPLAY_BODY_CHUNK_SECONDS == 1_200.0
+    assert resolved.max_chunk_seconds == 1_200.0
+    assert _anchor_compatible_plan(plan, "off") == plan
 
 
 def test_moss_native_validation_boundary_has_only_decoder_tolerance() -> None:

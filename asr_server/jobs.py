@@ -59,6 +59,10 @@ def utc_iso(value: datetime | None) -> str | None:
     return value.isoformat().replace("+00:00", "Z")
 
 
+def _partial_chunks(texts: list[str]) -> list[dict[str, object]]:
+    return [{"index": index, "text": text} for index, text in enumerate(texts, start=1)]
+
+
 @dataclass
 class JobProgress:
     phase: str
@@ -68,6 +72,9 @@ class JobProgress:
     current_chunk: int | None = None
     current_chunk_start: float | None = None
     current_chunk_end: float | None = None
+    text: str | None = None
+    chunk_text: str | None = None
+    chunks: list[dict[str, object]] | None = None
     message: str | None = None
 
     def to_api(self) -> dict[str, object]:
@@ -82,6 +89,12 @@ class JobProgress:
             payload["current_chunk_start"] = self.current_chunk_start
         if self.current_chunk_end is not None:
             payload["current_chunk_end"] = self.current_chunk_end
+        if self.text is not None:
+            payload["text"] = self.text
+        if self.chunk_text is not None:
+            payload["chunk_text"] = self.chunk_text
+        if self.chunks is not None:
+            payload["chunks"] = self.chunks
         if self.message is not None:
             payload["message"] = self.message
         return payload
@@ -110,6 +123,7 @@ class TranscriptionJob:
     temp_paths: list[Path] = field(default_factory=list)
     workspace: AudioWorkspace | None = None
     chunk_windows: list[tuple[float, float]] = field(default_factory=list)
+    partial_texts: list[str] = field(default_factory=list)
 
 
 class JobManager:
@@ -304,19 +318,26 @@ class JobManager:
                     current_chunk=current,
                     current_chunk_start=job.chunk_windows[chunk_index][0] if chunk_index < len(job.chunk_windows) else None,
                     current_chunk_end=job.chunk_windows[chunk_index][1] if chunk_index < len(job.chunk_windows) else None,
+                    text="\n".join(job.partial_texts),
+                    chunk_text=job.progress.chunk_text,
+                    chunks=_partial_chunks(job.partial_texts),
                     message=f"transcribing chunk {current} of {total_chunks}",
                 )
 
             async def after_chunk(chunk_index: int, total_chunks: int, result: TranscriptionResult) -> None:
-                del result
                 completed = chunk_index + 1
                 percent = (completed / total_chunks) * 100 if total_chunks else 100.0
+                chunk_text = result.text.strip()
+                job.partial_texts.append(chunk_text)
                 job.progress = JobProgress(
                     phase="transcribing",
                     percent=percent,
                     total_chunks=total_chunks,
                     completed_chunks=completed,
                     current_chunk=completed,
+                    text="\n".join(job.partial_texts),
+                    chunk_text=chunk_text,
+                    chunks=_partial_chunks(job.partial_texts),
                     message=f"completed chunk {completed} of {total_chunks}",
                 )
                 self._raise_if_cancel_requested(job)
@@ -402,6 +423,9 @@ class JobManager:
             completed_chunks=None
             if native_long_form
             else completed_chunks if completed_chunks is not None else job.progress.completed_chunks,
+            text="\n".join(job.partial_texts) if job.partial_texts else None,
+            chunk_text=job.progress.chunk_text,
+            chunks=_partial_chunks(job.partial_texts) if job.partial_texts else None,
             message=_phase_message(phase),
         )
 

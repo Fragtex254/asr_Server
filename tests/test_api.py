@@ -445,30 +445,30 @@ async def test_moss_anchor_replay_returns_four_global_speakers() -> None:
             if self.calls == 1:
                 return TranscriptionResult(
                     text="甲乙丙丁",
-                    duration=5.0,
+                    duration=10.0,
                     language="zh",
                     warnings=[],
                     segments=[
-                        TranscriptionSegment(0.0, 1.0, "甲", "S01"),
-                        TranscriptionSegment(1.1, 2.1, "乙", "S02"),
-                        TranscriptionSegment(2.2, 3.2, "丙", "S03"),
-                        TranscriptionSegment(3.3, 4.3, "丁", "S04"),
+                        TranscriptionSegment(0.0, 2.5, "甲", "S01"),
+                        TranscriptionSegment(2.5, 5.0, "乙", "S02"),
+                        TranscriptionSegment(5.0, 7.5, "丙", "S03"),
+                        TranscriptionSegment(7.5, 10.0, "丁", "S04"),
                     ],
                 )
             assert isinstance(audio, AudioComposition)
             prefix = audio.prefix_duration
             return TranscriptionResult(
                 text="锚点和正文",
-                duration=prefix + 5.0,
+                duration=prefix + 10.0,
                 language="zh",
                 warnings=[],
                 segments=[
-                    TranscriptionSegment(0.0, 1.0, "甲锚", "D"),
-                    TranscriptionSegment(1.5, 2.5, "乙锚", "B"),
-                    TranscriptionSegment(3.0, 4.0, "丙锚", "A"),
-                    TranscriptionSegment(4.5, 5.5, "丁锚", "C"),
-                    TranscriptionSegment(prefix + 0.5, prefix + 1.5, "丁继续", "C"),
-                    TranscriptionSegment(prefix + 2.0, prefix + 3.0, "甲继续", "D"),
+                    TranscriptionSegment(0.0, 2.5, "甲锚", "D"),
+                    TranscriptionSegment(3.0, 5.5, "乙锚", "B"),
+                    TranscriptionSegment(6.0, 8.5, "丙锚", "A"),
+                    TranscriptionSegment(9.0, 11.5, "丁锚", "C"),
+                    TranscriptionSegment(prefix + 0.5, prefix + 3.0, "丁继续", "C"),
+                    TranscriptionSegment(prefix + 3.5, prefix + 6.0, "甲继续", "D"),
                 ],
             )
 
@@ -477,12 +477,12 @@ async def test_moss_anchor_replay_returns_four_global_speakers() -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
         response = await client.post(
             "/v1/audio/transcriptions",
-            files={"file": ("sample.wav", make_wav(10.0), "audio/wav")},
+            files={"file": ("sample.wav", make_wav(20.0), "audio/wav")},
             data={
                 "model": "moss-transcribe-diarize-0.9b",
                 "response_format": "verbose_json",
                 "split_strategy": "fixed",
-                "max_chunk_seconds": "5",
+                "max_chunk_seconds": "10",
                 "overlap_seconds": "0",
                 "speaker_resolution": "auto",
             },
@@ -556,25 +556,25 @@ async def test_required_speaker_resolution_rejects_an_anchor_identity_conflict()
             if self.calls == 1:
                 return TranscriptionResult(
                     text="甲乙",
-                    duration=5.0,
+                    duration=10.0,
                     language="zh",
                     warnings=[],
                     segments=[
-                        TranscriptionSegment(0.0, 1.5, "甲", "S01"),
-                        TranscriptionSegment(2.0, 3.5, "乙", "S02"),
+                        TranscriptionSegment(0.0, 3.0, "甲", "S01"),
+                        TranscriptionSegment(4.0, 7.0, "乙", "S02"),
                     ],
                 )
             assert isinstance(audio, AudioComposition)
             prefix = audio.prefix_duration
             return TranscriptionResult(
                 text="冲突",
-                duration=prefix + 5.0,
+                duration=prefix + 10.0,
                 language="zh",
                 warnings=[],
                 segments=[
-                    TranscriptionSegment(0.0, 1.5, "甲锚", "SAME"),
-                    TranscriptionSegment(2.0, 3.5, "乙锚", "SAME"),
-                    TranscriptionSegment(prefix + 1.0, prefix + 2.0, "正文", "SAME"),
+                    TranscriptionSegment(0.0, 3.0, "甲锚", "SAME"),
+                    TranscriptionSegment(3.5, 6.5, "乙锚", "SAME"),
+                    TranscriptionSegment(prefix + 1.0, prefix + 3.0, "正文", "SAME"),
                 ],
             )
 
@@ -583,12 +583,12 @@ async def test_required_speaker_resolution_rejects_an_anchor_identity_conflict()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
         response = await client.post(
             "/v1/audio/transcriptions",
-            files={"file": ("sample.wav", make_wav(10.0), "audio/wav")},
+            files={"file": ("sample.wav", make_wav(20.0), "audio/wav")},
             data={
                 "model": "moss-transcribe-diarize-0.9b",
                 "response_format": "verbose_json",
                 "split_strategy": "fixed",
-                "max_chunk_seconds": "5",
+                "max_chunk_seconds": "10",
                 "overlap_seconds": "0",
                 "speaker_resolution": "required",
             },

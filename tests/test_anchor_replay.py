@@ -121,6 +121,35 @@ def test_anchor_replay_does_not_merge_two_global_speakers_when_anchor_labels_con
     assert sequence.summary()["unresolved_segments"] == 1
 
 
+def test_anchor_replay_does_not_promote_a_short_intro_voice_to_global_identity(tmp_path: Path) -> None:
+    audio_path = tmp_path / "source.wav"
+    _write_wav(audio_path, 40.0)
+    chunks = [
+        ChunkDescriptor(index=0, start=0.0, end=20.0, audio_path=audio_path),
+        ChunkDescriptor(index=1, start=20.0, end=40.0, audio_path=audio_path),
+    ]
+    sequence = AnchorReplaySequence(chunks)
+
+    first = sequence.accept(
+        0,
+        _result(
+            (0.0, 4.0, "HOST_A", "主谈人甲"),
+            (5.0, 9.0, "HOST_B", "主谈人乙"),
+            (10.0, 11.1, "INTRO", "片头短句一"),
+            (11.2, 12.3, "INTRO", "片头短句二"),
+            duration=20.0,
+        ),
+    )
+
+    assert [item.speaker for item in first.segments] == ["speaker-0001", "speaker-0002", None, None]
+    assert [item.speaker_resolution for item in first.segments] == ["initial", "initial", "unresolved", "unresolved"]
+    replay = sequence.audio_for(1)
+    assert isinstance(replay, AudioComposition)
+    assert len([part for part in replay.parts if isinstance(part, AudioPath)]) == 3
+    assert sequence.summary()["speaker_count"] == 2
+    assert sequence.summary()["unresolved_segments"] == 2
+
+
 def test_anchor_replay_reconnects_a_speaker_after_an_absent_chunk(tmp_path: Path) -> None:
     audio_path = tmp_path / "source.wav"
     _write_wav(audio_path, 60.0)

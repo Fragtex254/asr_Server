@@ -382,7 +382,9 @@ Content-Type: `multipart/form-data`
 
 - 服务端必须暴露真实阶段：`queued`、`preprocessing`、`splitting`、`loading_model`、`transcribing`、`merging`、`completed`、`failed`。
 - 切分完成后，必须暴露真实 chunk 级进度：`total_chunks`、`completed_chunks`、`current_chunk`、`percent`。
+- 每个 chunk 完成后，`progress.chunk_text` 返回该 chunk 的稳定文本，`progress.text` 返回所有已完成 chunk 的累计临时文本，`progress.chunks` 返回截至当前的有序 `{index,text}` 列表，保证轮询跨过多个 chunk 时客户端仍能完整恢复；进入最终合并后以 `result.text` 为准。
 - Qwen adapter 当前拿不到单个 chunk 内部推理百分比，不能伪造模型内部 token/帧级进度。
+- native long-form 只有一次真实模型调用，没有完成的中间 chunk，因此不得伪造 `text`、`chunk_text` 或 chunk 内进度。
 
 `POST /v1/audio/transcription-jobs`
 
@@ -444,6 +446,9 @@ Content-Type: `multipart/form-data`
     "current_chunk": 13,
     "current_chunk_start": 1412.4,
     "current_chunk_end": 1530.1,
+    "text": "前十二个已完成分片的累计临时文本。",
+    "chunk_text": "第十二个分片的稳定文本。",
+    "chunks": [{"index": 1, "text": "第一块文字。"}, {"index": 12, "text": "第十二块文字。"}],
     "message": "transcribing chunk 13 of 32"
   },
   "split": {
@@ -596,7 +601,7 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 2. Qwen 的 `auto` 保持通用 chunked ASR：短音频不切分，长音频使用 bounded streaming energy VAD，失败后固定窗口。
 3. MOSS 的 `auto` 是 model-aware：不超过 1801 秒时整段单次推理，speaker scope 为 `global`；更长音频自动降级为 1800 秒 fixed chunk。默认 `speaker_resolution=off` 时 speaker scope 为 `chunk`，并返回明确 fallback warning。
 4. MOSS 显式 `split_strategy=none` 可用于挑战尚未验证的更长原生推理，但缺尾、token 达上限、上下文超限都必须返回 422，不能返回表面成功的残缺正文。
-5. 分块合并时按原始时间线排序并处理 overlap。`speaker_resolution=off` 时 MOSS speaker 使用 `chunk-NNNN:S01` 命名空间。显式 `auto|required` 时，每个后续正文块前回放最多 60 秒的已知说话人干净片段，在同一次 MOSS 调用内把本地标签映射成 job-local `speaker-NNNN`；正文窗口上限收缩到 1740 秒，保证锚点加正文仍在已验证的 1801 秒输入边界内。
+5. 分块合并时按原始时间线排序并处理 overlap。`speaker_resolution=off` 时 MOSS speaker 使用 `chunk-NNNN:S01` 命名空间。显式 `auto|required` 时，每个后续正文块前回放最多 60 秒的已知说话人干净片段，在同一次 MOSS 调用内把本地标签映射成 job-local `speaker-NNNN`；正文窗口上限收缩到 1200 秒。该上限不仅给锚点前缀留出输入窗口，也给高语速、多人密集播客的输出 token 密度留出余量；1740 秒正文已在真实四人播客上出现只覆盖至约 1324 秒的受控 `incomplete_transcript`。单个说话人标签必须至少有一段连续 2 秒的稳定语音才可建立 job-local 全局身份；片头音效或极短插话只保留为待确认片段，不能污染后续锚点。
 6. Anchor Replay 不把名字或真实身份凭空赋给声音；`source_speaker` 保留原始 chunk-local 标签。锚点冲突、新说话人尚未在后续块确认、或锚点预算不足时 scope 为 `mixed`，不得伪造数值置信度。
 7. 返回 `execution`、`split`、`generation`、`diarization`、`chunks`、`warnings` 和 timings，供客户端判断真实执行模式、speaker scope、token、冲突与尾部覆盖。
 
@@ -606,7 +611,7 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 | --- | --- | --- | --- | --- |
 | `qwen3-asr-1.7b` | 120 秒 | 300 秒 | 2 秒 | WSL RTX 5070 Ti 实测后默认按 2 分钟软切分，配合默认 `max_new_tokens=512` 降低显存峰值。请求时间戳或强制对齐时，单段不得超过 300 秒。 |
 | `qwen3-asr-0.6b` | 120 秒 | 300 秒 | 2 秒 | 与 1.7B 保持一致；后续可根据吞吐测试放宽。 |
-| `moss-transcribe-diarize-0.9b` | 原生至 1801 秒；超出后 1800 秒 fixed；Anchor Replay 正文 1740 秒 | 1801 秒（自动分块） | splitter 默认值 | 原生单次调用返回全局 speaker；分块默认返回 chunk-local。显式启用 Anchor Replay 后可返回 global/mixed；当前真实验收人数为 4。显式 `none` 的 6 小时输入限制不等于已验收能力。 |
+| `moss-transcribe-diarize-0.9b` | 原生至 1801 秒；超出后 1800 秒 fixed；Anchor Replay 正文 1200 秒 | 1801 秒（自动分块） | splitter 默认值 | 原生单次调用返回全局 speaker；分块默认返回 chunk-local。显式启用 Anchor Replay 后可返回 global/mixed；当前真实验收人数为 4。显式 `none` 的 6 小时输入限制不等于已验收能力。 |
 
 同步与异步阈值：
 
@@ -775,6 +780,7 @@ limits:
 - Mac mini 能创建 `POST /v1/audio/transcription-jobs`，拿到 `202`、`job_id` 和 `status_url`。
 - `GET /v1/jobs/{job_id}` 能看到 `queued`、运行中状态和最终 `completed`。
 - chunked 长音频中，`progress.total_chunks`、`completed_chunks`、`current_chunk` 会随真实 chunk 完成而变化；native long-form 单次模型调用只报告真实阶段，不伪造 chunk 内百分比。
+- chunked 长音频每完成一个 chunk 后，`progress.chunk_text` 返回该分片文本，`progress.text` 返回累计临时文本，`progress.chunks` 返回可恢复的有序已完成分片；最终结果仍以 `result.text` 为准。
 - 多个 job 同时提交时，服务端只运行一个，其余 job 显示 `queued` 和正确 `queue_position`。
 - job 完成后 `result.text` 非空，结构与同步转写结果兼容。
 - job 失败时返回统一 error 对象，包含错误 code、message、details 和失败阶段。

@@ -11,7 +11,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from asr_server import main as main_module
-from asr_server.adapters.base import TranscriptionResult
+from asr_server.adapters.base import AudioComposition, AudioInput, TranscriptionResult, TranscriptionSegment
 from asr_server.adapters.mock import MockAsrAdapter
 from asr_server.audio import splitter as splitter_module
 from asr_server.config import Settings
@@ -89,9 +89,12 @@ async def test_moss_model_is_registered_only_when_enabled() -> None:
     assert moss["capabilities"]["execution_modes"] == ["native_long_form", "chunked"]
     assert moss["capabilities"]["auto_execution_mode"] == "native_long_form"
     assert moss["capabilities"]["max_new_tokens"] == 65_536
-    assert moss["capabilities"]["speaker_scopes"] == ["global", "chunk"]
+    assert moss["capabilities"]["speaker_scopes"] == ["global", "chunk", "mixed"]
     assert moss["capabilities"]["validated_native_max_seconds"] == 1_801.0
     assert moss["capabilities"]["automatic_fallback_chunk_seconds"] == 1_800.0
+    assert moss["capabilities"]["speaker_resolution_modes"] == ["off", "auto", "required"]
+    assert moss["capabilities"]["speaker_resolution_method"] == "moss_anchor_replay"
+    assert moss["capabilities"]["validated_anchor_replay_speakers"] == 4
 
 
 async def test_disabled_moss_model_returns_model_not_found(client: AsyncClient) -> None:
@@ -419,6 +422,214 @@ async def test_moss_split_transcription_warns_speaker_labels_are_chunk_local() -
     assert len(body["segments"]) == 4
     assert body["segments"][0]["start"] == pytest.approx(0.0)
     assert body["segments"][1]["start"] == pytest.approx(0.03)
+
+
+async def test_moss_anchor_replay_returns_four_global_speakers() -> None:
+    class FourSpeakerAdapter(MockAsrAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def transcribe(
+            self,
+            audio: AudioInput,
+            *,
+            model_id: str,
+            backend: str,
+            language: str,
+            context: str,
+            max_new_tokens: int | None,
+        ) -> TranscriptionResult:
+            del model_id, backend, language, context, max_new_tokens
+            self.calls += 1
+            if self.calls == 1:
+                return TranscriptionResult(
+                    text="甲乙丙丁",
+                    duration=5.0,
+                    language="zh",
+                    warnings=[],
+                    segments=[
+                        TranscriptionSegment(0.0, 1.0, "甲", "S01"),
+                        TranscriptionSegment(1.1, 2.1, "乙", "S02"),
+                        TranscriptionSegment(2.2, 3.2, "丙", "S03"),
+                        TranscriptionSegment(3.3, 4.3, "丁", "S04"),
+                    ],
+                )
+            assert isinstance(audio, AudioComposition)
+            prefix = audio.prefix_duration
+            return TranscriptionResult(
+                text="锚点和正文",
+                duration=prefix + 5.0,
+                language="zh",
+                warnings=[],
+                segments=[
+                    TranscriptionSegment(0.0, 1.0, "甲锚", "D"),
+                    TranscriptionSegment(1.5, 2.5, "乙锚", "B"),
+                    TranscriptionSegment(3.0, 4.0, "丙锚", "A"),
+                    TranscriptionSegment(4.5, 5.5, "丁锚", "C"),
+                    TranscriptionSegment(prefix + 0.5, prefix + 1.5, "丁继续", "C"),
+                    TranscriptionSegment(prefix + 2.0, prefix + 3.0, "甲继续", "D"),
+                ],
+            )
+
+    app = create_app(settings=Settings(enable_moss=True))
+    app.state.manager.runtime_for("moss-transcribe-diarize-0.9b").adapter = FourSpeakerAdapter()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", make_wav(10.0), "audio/wav")},
+            data={
+                "model": "moss-transcribe-diarize-0.9b",
+                "response_format": "verbose_json",
+                "split_strategy": "fixed",
+                "max_chunk_seconds": "5",
+                "overlap_seconds": "0",
+                "speaker_resolution": "auto",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["diarization"] == {
+        "method": "moss_anchor_replay",
+        "status": "complete",
+        "speaker_scope": "global",
+        "speaker_count": 4,
+        "unresolved_segments": 0,
+        "conflicts": 0,
+        "anchor_budget_limited": False,
+        "candidate_speakers": 0,
+        "missing_segment_chunks": 0,
+    }
+    assert body["execution"]["speaker_scope"] == "global"
+    assert body["segments"][-2]["speaker"] == "speaker-0004"
+    assert body["segments"][-2]["source_speaker"] == "chunk-0001:C"
+    assert body["segments"][-1]["speaker"] == "speaker-0001"
+    assert "moss_speaker_labels_are_chunk_local" not in body["warnings"]
+
+
+async def test_speaker_resolution_rejects_invalid_mode_and_non_diarization_model() -> None:
+    app = create_app(settings=Settings(enable_moss=True))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        invalid = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", make_wav(0.1), "audio/wav")},
+            data={"model": "moss-transcribe-diarize-0.9b", "speaker_resolution": "guess"},
+        )
+        unsupported = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", make_wav(0.1), "audio/wav")},
+            data={"model": "qwen3-asr-1.7b", "speaker_resolution": "auto"},
+        )
+        hidden_segments = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", make_wav(0.1), "audio/wav")},
+            data={"model": "moss-transcribe-diarize-0.9b", "speaker_resolution": "auto"},
+        )
+
+    assert invalid.status_code == 400
+    assert invalid.json()["error"]["code"] == "bad_request"
+    assert unsupported.status_code == 422
+    assert unsupported.json()["error"]["code"] == "capability_not_supported"
+    assert hidden_segments.status_code == 422
+    assert hidden_segments.json()["error"]["details"]["recommended_response_format"] == "verbose_json"
+
+
+async def test_required_speaker_resolution_rejects_an_anchor_identity_conflict() -> None:
+    class ConflictingAnchorAdapter(MockAsrAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def transcribe(
+            self,
+            audio: AudioInput,
+            *,
+            model_id: str,
+            backend: str,
+            language: str,
+            context: str,
+            max_new_tokens: int | None,
+        ) -> TranscriptionResult:
+            del model_id, backend, language, context, max_new_tokens
+            self.calls += 1
+            if self.calls == 1:
+                return TranscriptionResult(
+                    text="甲乙",
+                    duration=5.0,
+                    language="zh",
+                    warnings=[],
+                    segments=[
+                        TranscriptionSegment(0.0, 1.5, "甲", "S01"),
+                        TranscriptionSegment(2.0, 3.5, "乙", "S02"),
+                    ],
+                )
+            assert isinstance(audio, AudioComposition)
+            prefix = audio.prefix_duration
+            return TranscriptionResult(
+                text="冲突",
+                duration=prefix + 5.0,
+                language="zh",
+                warnings=[],
+                segments=[
+                    TranscriptionSegment(0.0, 1.5, "甲锚", "SAME"),
+                    TranscriptionSegment(2.0, 3.5, "乙锚", "SAME"),
+                    TranscriptionSegment(prefix + 1.0, prefix + 2.0, "正文", "SAME"),
+                ],
+            )
+
+    app = create_app(settings=Settings(enable_moss=True))
+    app.state.manager.runtime_for("moss-transcribe-diarize-0.9b").adapter = ConflictingAnchorAdapter()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", make_wav(10.0), "audio/wav")},
+            data={
+                "model": "moss-transcribe-diarize-0.9b",
+                "response_format": "verbose_json",
+                "split_strategy": "fixed",
+                "max_chunk_seconds": "5",
+                "overlap_seconds": "0",
+                "speaker_resolution": "required",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "speaker_resolution_incomplete"
+    assert response.json()["error"]["details"]["conflicts"] == 1
+
+
+async def test_required_native_resolution_rejects_text_without_speaker_segments() -> None:
+    class MissingSegmentsAdapter(MockAsrAdapter):
+        async def transcribe(
+            self,
+            audio: AudioInput,
+            *,
+            model_id: str,
+            backend: str,
+            language: str,
+            context: str,
+            max_new_tokens: int | None,
+        ) -> TranscriptionResult:
+            del audio, model_id, backend, language, context, max_new_tokens
+            return TranscriptionResult(text="有正文但解析不到说话人段", duration=1.0, language="zh", warnings=[])
+
+    app = create_app(settings=Settings(enable_moss=True))
+    app.state.manager.runtime_for("moss-transcribe-diarize-0.9b").adapter = MissingSegmentsAdapter()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("sample.wav", make_wav(1.0), "audio/wav")},
+            data={
+                "model": "moss-transcribe-diarize-0.9b",
+                "response_format": "verbose_json",
+                "speaker_resolution": "required",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "speaker_resolution_incomplete"
+    assert response.json()["error"]["details"]["missing_segment_chunks"] == 1
 
 
 async def test_moss_native_long_form_rejects_silently_ignored_chunk_options() -> None:

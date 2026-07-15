@@ -87,6 +87,9 @@ class ModelCapabilities:
     speaker_scopes: list[str] = field(default_factory=list)
     validated_native_max_seconds: float | None = None
     automatic_fallback_chunk_seconds: float | None = None
+    speaker_resolution_modes: list[str] = field(default_factory=lambda: ["off"])
+    speaker_resolution_method: str | None = None
+    validated_anchor_replay_speakers: int | None = None
 
     def to_api(self) -> dict[str, object]:
         return {
@@ -105,6 +108,9 @@ class ModelCapabilities:
             "speaker_scopes": self.speaker_scopes,
             "validated_native_max_seconds": self.validated_native_max_seconds,
             "automatic_fallback_chunk_seconds": self.automatic_fallback_chunk_seconds,
+            "speaker_resolution_modes": self.speaker_resolution_modes,
+            "speaker_resolution_method": self.speaker_resolution_method,
+            "validated_anchor_replay_speakers": self.validated_anchor_replay_speakers,
         }
 
 
@@ -170,9 +176,12 @@ def default_models(
                 execution_modes=["native_long_form", "chunked"],
                 auto_execution_mode="native_long_form",
                 max_new_tokens=MOSS_EXECUTION_POLICY.max_new_tokens,
-                speaker_scopes=["global", "chunk"],
+                speaker_scopes=["global", "chunk", "mixed"],
                 validated_native_max_seconds=MOSS_EXECUTION_POLICY.validated_native_max_seconds,
                 automatic_fallback_chunk_seconds=MOSS_EXECUTION_POLICY.fallback_chunk_seconds,
+                speaker_resolution_modes=["off", "auto", "required"],
+                speaker_resolution_method="moss_anchor_replay",
+                validated_anchor_replay_speakers=4,
             ),
             revision="d7231bbae2587a4af278735eb765b318c4f64edd",
             execution_policy=MOSS_EXECUTION_POLICY,

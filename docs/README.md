@@ -14,6 +14,7 @@
 - `validation-2026-07-02-wsl-hf-native.md`：Qwen3-ASR 0.6B/1.7B 的 HF native `transformers` 后端验收。
 - `validation-2026-07-10-wsl-moss.md`：MOSS-Transcribe-Diarize 独立 smoke、HTTP 路径和卸载验收。
 - `validation-2026-07-15-wsl-moss-long-form.md`：MOSS 10/30/60/90 分钟原生推理边界、缺尾保护与自动降级验收。
+- `validation-2026-07-15-wsl-moss-anchor-replay.md`：MOSS Anchor Replay 四说话人跨块解析与对抗性验收。
 - `review-2026-07-10-stability-refactor.md`：单 GPU、Worker 可靠性、Path 音频管线、MOSS 正确性与 Job 生命周期的对抗性审查和重构记录。
 
 ## 维护规则

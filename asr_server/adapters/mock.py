@@ -6,6 +6,7 @@ from time import perf_counter
 
 from asr_server.adapters.base import (
     AudioInput,
+    AudioComposition,
     AudioPath,
     GenerationMetrics,
     TranscriptionResult,
@@ -104,7 +105,13 @@ class MockAsrAdapter:
         label: str,
     ) -> TranscriptionResult:
         del backend
-        audio_size = audio.path.stat().st_size if isinstance(audio, AudioPath) else len(audio)
+        audio_size = (
+            audio.path.stat().st_size
+            if isinstance(audio, AudioPath)
+            else int(audio.duration * 32_000)
+            if isinstance(audio, AudioComposition)
+            else len(audio)
+        )
         text = f"{label}:{audio_size}"
         warnings = ["mock_adapter"]
         if batch:
@@ -139,4 +146,6 @@ class MockAsrAdapter:
 def _audio_label(audio: AudioInput) -> str:
     if isinstance(audio, AudioPath):
         return hashlib.sha256(f"{audio.path}:{audio.start}:{audio.end}".encode()).hexdigest()[:12]
+    if isinstance(audio, AudioComposition):
+        return hashlib.sha256(repr(audio).encode()).hexdigest()[:12]
     return hashlib.sha256(audio).hexdigest()[:12]

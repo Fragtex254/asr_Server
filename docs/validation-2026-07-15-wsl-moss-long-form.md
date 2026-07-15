@@ -1,5 +1,7 @@
 # MOSS 长音频 model-aware 执行策略 WSL 验收记录
 
+> 后续 opt-in 跨块 speaker 解析已使用 Anchor Replay 完成四说话人验收，见 `validation-2026-07-15-wsl-moss-anchor-replay.md`。本文的 chunk-local 结论仍适用于默认 `speaker_resolution=off`。
+
 ## 结论
 
 `moss-transcribe-diarize-0.9b` 在当前 RTX 5070 Ti 16GB 与固定 snapshot 上，10 分钟和 30 分钟单次 native long-form 可以完整覆盖尾部并保留全局 `S01/S02`。60 分钟和 90 分钟单次推理不会立即 OOM，但模型都在约 3044 秒停止输出；90 分钟还接近耗尽 16GB 显存。因此不能把“请求完成生成”当作“转写完整”。

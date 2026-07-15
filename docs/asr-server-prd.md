@@ -1,6 +1,6 @@
 # WSL ASR Server PRD
 
-更新时间：2026-07-10
+更新时间：2026-07-15
 
 ## 1. 背景
 
@@ -93,7 +93,7 @@ flowchart LR
 | --- | --- | --- | --- | --- |
 | Qwen3-ASR 0.6B | `qwen3-asr-0.6b` | 轻量转写、较低显存占用 | 离线转写、语言提示、`transformers` 后端转写 | 质量和复杂音频能力弱于 1.7B；高级能力后续按实测结果逐项打开 |
 | Qwen3-ASR 1.7B | `qwen3-asr-1.7b` | 默认主力模型 | 离线转写、语言提示、`transformers` 后端转写 | 流式、时间戳、强制对齐、vLLM 等高级能力不阻塞初版发布 |
-| MOSS-Transcribe-Diarize | `moss-transcribe-diarize-0.9b` | 可选说话人分离、段级时间段 | 离线转写、`language=auto`、`transformers` 后端、`verbose_json` segments；30 分钟级原生 long-form 已验收 | 2026-07-15 对抗性验收确认 60/90 分钟单次推理会在约 3044 秒处缺尾，因此 `auto` 只在 1801 秒内走原生全局 speaker，超出后明确降级为 1800 秒 fixed chunk；chunk speaker 不代表全局身份；不声明 word/char timestamps、forced alignment、streaming 或 vLLM |
+| MOSS-Transcribe-Diarize | `moss-transcribe-diarize-0.9b` | 可选说话人分离、段级时间段 | 离线转写、`language=auto`、`transformers` 后端、`verbose_json` segments；30 分钟级原生 long-form；opt-in Anchor Replay 已实测 4 人跨 2 块 | 60/90 分钟单次推理会在约 3044 秒处缺尾，因此 `auto` 只在 1801 秒内走原生全局 speaker，超出后降级分块；默认 `speaker_resolution=off` 仍返回 chunk-local，只有显式 `auto|required` 才尝试跨块解析；不声明 word/char timestamps、forced alignment、streaming 或 vLLM |
 
 ## 6. API 设计
 
@@ -296,6 +296,7 @@ Content-Type: `multipart/form-data`
 - `max_new_tokens`：可选；使用模型专属限制。Qwen 默认 512、上限 4096；MOSS 未指定时按单次模型输入时长动态计算 `max(2048, ceil(seconds * 12))`，上限 65536。
 - `context`：可选；本次转录的领域提示、术语、人名、产品名、项目名等，服务端应限制长度并传给 Qwen adapter。
 - `hotwords`：可选；热词列表，可用逗号分隔字符串或 JSON 数组表达，服务端可合并到 `context`。
+- `speaker_resolution`：`off`、`auto`、`required`，默认 `off`。只对声明支持的 MOSS 模型生效；`auto` 允许部分结果，`required` 在存在冲突、未解析段或候选说话人时返回 `422 speaker_resolution_incomplete`。
 
 返回：
 
@@ -587,15 +588,17 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 - `max_chunk_seconds`：可选；用户给上限时不得超过服务端模型上限。
 - `overlap_seconds`：可选；默认由服务端决定。
 - `preserve_segments`：是否返回 chunk 级别结果，默认 `false`。
+- `speaker_resolution`：同转录接口；启用时必须使用 `response_format=verbose_json`。
 
 服务端默认执行策略：
 
 1. 使用 FFmpeg 解码并规范化音频元数据，生成服务端临时 WAV/PCM，再统计总时长、采样率、声道数和文件大小。
 2. Qwen 的 `auto` 保持通用 chunked ASR：短音频不切分，长音频使用 bounded streaming energy VAD，失败后固定窗口。
-3. MOSS 的 `auto` 是 model-aware：不超过 1801 秒时整段单次推理，speaker scope 为 `global`；更长音频自动降级为 1800 秒 fixed chunk，speaker scope 为 `chunk`，并返回明确 fallback warning。
+3. MOSS 的 `auto` 是 model-aware：不超过 1801 秒时整段单次推理，speaker scope 为 `global`；更长音频自动降级为 1800 秒 fixed chunk。默认 `speaker_resolution=off` 时 speaker scope 为 `chunk`，并返回明确 fallback warning。
 4. MOSS 显式 `split_strategy=none` 可用于挑战尚未验证的更长原生推理，但缺尾、token 达上限、上下文超限都必须返回 422，不能返回表面成功的残缺正文。
-5. 分块合并时按原始时间线排序并处理 overlap；MOSS speaker 使用 `chunk-NNNN:S01` 命名空间，当前不做未经验证的跨 chunk 身份拼接。
-6. 返回 `execution`、`split`、`generation`、`chunks`、`warnings` 和 timings，供客户端判断真实执行模式、speaker scope、token 与尾部覆盖。
+5. 分块合并时按原始时间线排序并处理 overlap。`speaker_resolution=off` 时 MOSS speaker 使用 `chunk-NNNN:S01` 命名空间。显式 `auto|required` 时，每个后续正文块前回放最多 60 秒的已知说话人干净片段，在同一次 MOSS 调用内把本地标签映射成 job-local `speaker-NNNN`；正文窗口上限收缩到 1740 秒，保证锚点加正文仍在已验证的 1801 秒输入边界内。
+6. Anchor Replay 不把名字或真实身份凭空赋给声音；`source_speaker` 保留原始 chunk-local 标签。锚点冲突、新说话人尚未在后续块确认、或锚点预算不足时 scope 为 `mixed`，不得伪造数值置信度。
+7. 返回 `execution`、`split`、`generation`、`diarization`、`chunks`、`warnings` 和 timings，供客户端判断真实执行模式、speaker scope、token、冲突与尾部覆盖。
 
 默认模型窗口：
 
@@ -603,7 +606,7 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 | --- | --- | --- | --- | --- |
 | `qwen3-asr-1.7b` | 120 秒 | 300 秒 | 2 秒 | WSL RTX 5070 Ti 实测后默认按 2 分钟软切分，配合默认 `max_new_tokens=512` 降低显存峰值。请求时间戳或强制对齐时，单段不得超过 300 秒。 |
 | `qwen3-asr-0.6b` | 120 秒 | 300 秒 | 2 秒 | 与 1.7B 保持一致；后续可根据吞吐测试放宽。 |
-| `moss-transcribe-diarize-0.9b` | 原生至 1801 秒；超出后 1800 秒 fixed | 1801 秒（自动分块） | splitter 默认值 | 原生单次调用返回全局 speaker；自动降级后只返回 chunk-local speaker。显式 `none` 的 6 小时输入限制不等于已验收能力。 |
+| `moss-transcribe-diarize-0.9b` | 原生至 1801 秒；超出后 1800 秒 fixed；Anchor Replay 正文 1740 秒 | 1801 秒（自动分块） | splitter 默认值 | 原生单次调用返回全局 speaker；分块默认返回 chunk-local。显式启用 Anchor Replay 后可返回 global/mixed；当前真实验收人数为 4。显式 `none` 的 6 小时输入限制不等于已验收能力。 |
 
 同步与异步阈值：
 
@@ -763,6 +766,7 @@ limits:
 - Mac mini 通过局域网向 `POST /v1/audio/transcriptions` 上传一段 10 秒中文音频，`qwen3-asr-1.7b` + `transformers` 返回非空 `text`。
 - 如果启用 MOSS，Mac mini 通过局域网上传短音频，`moss-transcribe-diarize-0.9b` + `transformers` + `response_format=verbose_json` 返回非空 `text` 和段级 `segments`。
 - MOSS 30 分钟级 `auto` 返回 `execution.mode=native_long_form`、`speaker_scope=global` 且时间轴覆盖结尾；超过 1801 秒时返回明确的 automatic fallback、chunk-local speaker scope 和完整尾部覆盖。
+- MOSS 显式 `speaker_resolution=auto` 的四说话人、两块重复声音验收返回 4 个稳定 job-local speaker、`status=complete`、0 conflict、0 unresolved；默认 `off` 行为不变。
 - 默认模型 `qwen3-asr-1.7b` 在不显式传 `backend` 时可以用 `backend=auto` 完成转录。
 - 前端 Mac 客户端只依赖 `GET /v1/models` 的模型与后端发现结果，不硬编码服务端未声明的能力。
 
@@ -789,7 +793,7 @@ limits:
 
 ## 12. 后续路线
 
-当前 WSL 服务端已经实现异步转录 job、FIFO 串行队列、可轮询状态、model-aware MOSS long-form/自动降级和 chunk 级真实进度。后续阶段不做 vLLM、WebSocket streaming、MiMo、ForcedAligner、数据库队列、多 worker 并发推理或 MOSS 跨 chunk speaker identity stitching，除非 PRD 明确扩展范围并以声纹/重叠区实测证明可靠性。
+当前 WSL 服务端已经实现异步转录 job、FIFO 串行队列、可轮询状态、model-aware MOSS long-form/自动降级、opt-in MOSS Anchor Replay 和 chunk 级真实进度。后续阶段不做 vLLM、WebSocket streaming、MiMo、ForcedAligner、数据库队列、多 worker 并发推理或独立声纹 embedding/聚类，除非 PRD 明确扩展范围并以真实数据证明收益。
 
 优先级 P0：
 

@@ -175,6 +175,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         max_chunk_seconds: Annotated[float | None, Form()] = None,
         overlap_seconds: Annotated[float | None, Form()] = None,
         preserve_segments: Annotated[bool, Form()] = False,
+        speaker_resolution: Annotated[str, Form()] = "off",
     ) -> dict[str, object] | PlainTextResponse | JSONResponse:
         del temperature
         manager: ModelLifecycleManager = app.state.manager
@@ -191,6 +192,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             max_chunk_seconds=max_chunk_seconds,
             overlap_seconds=overlap_seconds,
             preserve_segments=preserve_segments,
+            speaker_resolution=speaker_resolution,
         )
         validated = validate_transcription_request(manager, request)
         workspace = await app.state.workspace_manager.store_upload(file)
@@ -245,6 +247,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         max_chunk_seconds: Annotated[float | None, Form()] = None,
         overlap_seconds: Annotated[float | None, Form()] = None,
         preserve_segments: Annotated[bool, Form()] = False,
+        speaker_resolution: Annotated[str, Form()] = "off",
     ) -> dict[str, object]:
         del temperature
         request = _transcription_request(
@@ -260,6 +263,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             max_chunk_seconds=max_chunk_seconds,
             overlap_seconds=overlap_seconds,
             preserve_segments=preserve_segments,
+            speaker_resolution=speaker_resolution,
         )
         manager: ModelLifecycleManager = app.state.manager
         validate_transcription_request(manager, request)
@@ -311,6 +315,7 @@ def _transcription_request(
     max_chunk_seconds: float | None,
     overlap_seconds: float | None,
     preserve_segments: bool,
+    speaker_resolution: str,
 ) -> TranscriptionRequest:
     return TranscriptionRequest(
         model=model,
@@ -325,6 +330,7 @@ def _transcription_request(
         max_chunk_seconds=max_chunk_seconds,
         overlap_seconds=overlap_seconds,
         preserve_segments=preserve_segments,
+        speaker_resolution=speaker_resolution,
     )
 
 

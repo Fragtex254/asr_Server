@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from time import perf_counter
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar
 
 from asr_server.adapters.base import AudioInput, AsrAdapter, TranscriptionResult, TranscriptionTimings
 from asr_server.errors import AsrError
@@ -17,6 +17,14 @@ ChunkProgressCallback = Callable[[int, int], Awaitable[None]]
 ChunkResultCallback = Callable[[int, int, TranscriptionResult], Awaitable[None]]
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
+
+
+class AdaptiveTranscriptionSequence(Protocol):
+    def __len__(self) -> int: ...
+
+    def audio_for(self, index: int) -> AudioInput: ...
+
+    def accept(self, index: int, result: TranscriptionResult) -> TranscriptionResult: ...
 
 
 def utc_now_iso() -> str:
@@ -285,6 +293,66 @@ class ModelLifecycleManager:
     ) -> tuple[str, list[TranscriptionResult], TranscriptionTimings]:
         if not audio_chunks:
             raise AsrError(400, "bad_request", "audio request did not contain any chunks")
+        return await self._transcribe_managed(
+            model_id=model_id,
+            backend=backend,
+            timestamps=timestamps,
+            operation=lambda runtime, selected_model_id, resolved_backend: self._transcribe_chunk_results(
+                runtime,
+                audio_chunks,
+                model_id=selected_model_id,
+                backend=resolved_backend,
+                language=language,
+                context=context,
+                max_new_tokens=max_new_tokens,
+                batch_size=batch_size,
+                before_chunk=before_chunk,
+                after_chunk=after_chunk,
+            ),
+        )
+
+    async def transcribe_sequence(
+        self,
+        sequence: AdaptiveTranscriptionSequence,
+        *,
+        model_id: str | None,
+        backend: Backend,
+        language: str,
+        timestamps: str,
+        context: str,
+        max_new_tokens: int | None,
+        before_chunk: ChunkProgressCallback | None = None,
+        after_chunk: ChunkResultCallback | None = None,
+    ) -> tuple[str, list[TranscriptionResult], TranscriptionTimings]:
+        """Run an adaptive sequence as one model request and one GPU lease."""
+
+        if len(sequence) == 0:
+            raise AsrError(400, "bad_request", "audio request did not contain any chunks")
+        return await self._transcribe_managed(
+            model_id=model_id,
+            backend=backend,
+            timestamps=timestamps,
+            operation=lambda runtime, selected_model_id, resolved_backend: self._transcribe_sequence_results(
+                runtime,
+                sequence,
+                model_id=selected_model_id,
+                backend=resolved_backend,
+                language=language,
+                context=context,
+                max_new_tokens=max_new_tokens,
+                before_chunk=before_chunk,
+                after_chunk=after_chunk,
+            ),
+        )
+
+    async def _transcribe_managed(
+        self,
+        *,
+        model_id: str | None,
+        backend: Backend,
+        timestamps: str,
+        operation: Callable[[ModelRuntime, str, str], Awaitable[list[TranscriptionResult]]],
+    ) -> tuple[str, list[TranscriptionResult], TranscriptionTimings]:
         request_started = perf_counter()
         selected_model_id = model_id or self.default_model_id
         runtime = self.runtime_for(selected_model_id)
@@ -307,18 +375,7 @@ class ModelLifecycleManager:
             async with runtime.request_lock:
                 resolved_backend, load_ms = await self._begin_request(runtime, backend=backend)
                 try:
-                    results = await self._transcribe_chunk_results(
-                        runtime,
-                        audio_chunks,
-                        model_id=selected_model_id,
-                        backend=resolved_backend,
-                        language=language,
-                        context=context,
-                        max_new_tokens=max_new_tokens,
-                        batch_size=batch_size,
-                        before_chunk=before_chunk,
-                        after_chunk=after_chunk,
-                    )
+                    results = await operation(runtime, selected_model_id, resolved_backend)
                     runtime.last_used_at = utc_now_iso()
                     timings = TranscriptionTimings(
                         total_ms=(perf_counter() - request_started) * 1000,
@@ -340,6 +397,56 @@ class ModelLifecycleManager:
                     raise
                 finally:
                     await self._finish_request(runtime)
+
+    async def _transcribe_sequence_results(
+        self,
+        runtime: ModelRuntime,
+        sequence: AdaptiveTranscriptionSequence,
+        *,
+        model_id: str,
+        backend: str,
+        language: str,
+        context: str,
+        max_new_tokens: int | None,
+        before_chunk: ChunkProgressCallback | None,
+        after_chunk: ChunkResultCallback | None,
+    ) -> list[TranscriptionResult]:
+        results: list[TranscriptionResult] = []
+        total_count = len(sequence)
+        for index in range(total_count):
+            if before_chunk is not None:
+                await before_chunk(index, total_count)
+            chunk_started = perf_counter()
+            try:
+                raw_result = await _call_adapter(
+                    lambda: runtime.adapter.transcribe(
+                        sequence.audio_for(index),
+                        model_id=model_id,
+                        backend=backend,
+                        language=language,
+                        context=context,
+                        max_new_tokens=max_new_tokens,
+                    )
+                )
+            except AsrError:
+                raise
+            except Exception as exc:
+                raise AsrError(
+                    503,
+                    "inference_failed",
+                    "sequence transcription failed",
+                    {"chunk_index": index, "error_type": type(exc).__name__},
+                ) from exc
+            result = sequence.accept(index, raw_result)
+            if result.timings.total_ms == 0:
+                result = replace(
+                    result,
+                    timings=replace(result.timings, total_ms=(perf_counter() - chunk_started) * 1000),
+                )
+            results.append(result)
+            if after_chunk is not None:
+                await after_chunk(index, total_count, result)
+        return results
 
     async def _transcribe_chunk_results(
         self,

@@ -39,7 +39,7 @@ def merge_transcription_results(
     source_duration: float,
     preserve_segments: bool,
     timings: TranscriptionTimings,
-    speaker_scope: Literal["global", "chunk"] = "chunk",
+    speaker_scope: Literal["global", "chunk", "mixed"] = "chunk",
 ) -> MergedTranscription:
     raw_segments = [
         {
@@ -57,7 +57,12 @@ def merge_transcription_results(
     )
     segments = _merged_segments(chunks, results, speaker_scope=speaker_scope)
     warnings = _unique_warnings(results)
-    if len(chunks) > 1 and segments and "moss_speaker_labels_are_chunk_local" not in warnings:
+    if (
+        len(chunks) > 1
+        and segments
+        and speaker_scope == "chunk"
+        and "moss_speaker_labels_are_chunk_local" not in warnings
+    ):
         warnings = [*warnings, "moss_speaker_labels_are_chunk_local"]
     language = next((result.language for result in results if result.language), "auto")
     merged_text = document.text
@@ -124,7 +129,7 @@ def _merged_segments(
     chunks: Sequence[ChunkLike],
     results: list[TranscriptionResult],
     *,
-    speaker_scope: Literal["global", "chunk"],
+    speaker_scope: Literal["global", "chunk", "mixed"],
 ) -> list[dict[str, object]]:
     segments: list[dict[str, object]] = []
     for chunk_position, (chunk, result) in enumerate(zip(chunks, results, strict=True)):
@@ -147,18 +152,24 @@ def _merged_segments(
             speaker = segment.speaker
             scoped_speaker = (
                 speaker
-                if speaker_scope == "global"
+                if speaker_scope != "chunk"
                 else f"chunk-{chunk.index:04d}:{speaker}" if speaker is not None else None
             )
-            segments.append(
-                {
-                    "start": absolute_start,
-                    "end": absolute_end,
-                    "speaker": scoped_speaker,
-                    "speaker_label": speaker,
-                    "speaker_scope": speaker_scope,
-                    "chunk_index": chunk.index,
-                    "text": segment.text,
-                }
+            segment_scope = (
+                "global" if speaker_scope == "mixed" and speaker is not None else speaker_scope
             )
+            payload: dict[str, object] = {
+                "start": absolute_start,
+                "end": absolute_end,
+                "speaker": scoped_speaker,
+                "speaker_label": speaker,
+                "speaker_scope": segment_scope,
+                "chunk_index": chunk.index,
+                "text": segment.text,
+            }
+            if segment.source_speaker is not None:
+                payload["source_speaker"] = segment.source_speaker
+            if segment.speaker_resolution is not None:
+                payload["speaker_resolution"] = segment.speaker_resolution
+            segments.append(payload)
     return segments

@@ -76,6 +76,9 @@ Its first-release capability set is deliberately conservative:
 - `speaker_scopes: ["global", "chunk"]`
 - `validated_native_max_seconds: 1801.0`
 - `automatic_fallback_chunk_seconds: 1800.0`
+- `speaker_resolution_modes: ["off", "auto", "required"]`
+- `speaker_resolution_method: "moss_anchor_replay"`
+- `validated_anchor_replay_speakers: 4`
 - language values: `auto` only. A 2026-07-10 adversarial WSL smoke showed
   `language=en` still returning Chinese for Chinese input, so `zh`/`en` are not
   declared until the model exposes a verified language-control mechanism.
@@ -118,6 +121,12 @@ Implemented form fields for `POST /v1/audio/transcriptions` and
 - `max_chunk_seconds`: optional per-request chunk upper bound.
 - `overlap_seconds`: optional chunk overlap.
 - `preserve_segments`: optional flag to return chunk-level details.
+- `speaker_resolution`: `off` (default), `auto`, or `required`. MOSS only.
+  `auto` returns a `diarization` summary and permits `mixed/partial`; `required`
+  returns `422 speaker_resolution_incomplete` unless every valid segment is
+  resolved. The method returns anonymous job-local `speaker-NNNN` identities,
+  not enrolled names or biometric identity claims. A non-`off` mode requires
+  `response_format=verbose_json`, because other formats do not expose segments.
 
 Successful JSON responses include `execution` and `generation`. Clients should
 consume `execution.mode`, `execution.speaker_scope`,

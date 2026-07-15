@@ -16,6 +16,7 @@ from asr_server.audio.splitter import PathSplitResult, SplitCancelled, SplitResu
 from asr_server.config import Settings
 from asr_server.audio.workspace import validate_workspace_limits
 from asr_server.errors import AsrError
+from asr_server.diarization.anchor_replay import AnchorReplaySequence
 from asr_server.execution import ExecutionPlan, ModelExecutionPolicy
 from asr_server.lifecycle import ModelLifecycleManager
 from asr_server.registry import Backend
@@ -45,6 +46,7 @@ class RequestConfig:
     max_chunk_seconds: float | None
     overlap_seconds: float | None
     preserve_segments: bool
+    speaker_resolution: str
 
 
 @dataclass(frozen=True)
@@ -61,6 +63,7 @@ class TranscriptionRequest:
     max_chunk_seconds: float | None
     overlap_seconds: float | None
     preserve_segments: bool
+    speaker_resolution: str = "off"
 
     @property
     def generation_config(self) -> GenerationConfig:
@@ -75,6 +78,7 @@ class TranscriptionRequest:
             self.max_chunk_seconds,
             self.overlap_seconds,
             self.preserve_segments,
+            self.speaker_resolution,
         )
 
 
@@ -130,6 +134,8 @@ def validate_transcription_request(
         raise AsrError(400, "bad_request", f"unsupported response_format: {request.response_format}")
     if request.timestamps not in {"none", "word", "char"}:
         raise AsrError(400, "bad_request", f"unsupported timestamps value: {request.timestamps}")
+    if request.speaker_resolution not in {"off", "auto", "required"}:
+        raise AsrError(400, "bad_request", f"unsupported speaker_resolution: {request.speaker_resolution}")
     selected_model = request.model or manager.default_model_id
     runtime = manager.runtime_for(selected_model)
     resolved_backend = manager.resolve_backend(runtime, request.backend)
@@ -146,6 +152,20 @@ def validate_transcription_request(
             "capability_not_supported",
             f"{selected_model} does not support timestamps in this server",
             {"timestamps": request.timestamps},
+        )
+    if request.speaker_resolution != "off" and not runtime.definition.capabilities.diarization:
+        raise AsrError(
+            422,
+            "capability_not_supported",
+            f"{selected_model} does not support speaker resolution",
+            {"speaker_resolution": request.speaker_resolution},
+        )
+    if request.speaker_resolution != "off" and request.response_format != "verbose_json":
+        raise AsrError(
+            422,
+            "capability_not_supported",
+            "speaker resolution requires response_format=verbose_json",
+            {"response_format": request.response_format, "recommended_response_format": "verbose_json"},
         )
     return ValidatedTranscription(
         selected_model=selected_model,
@@ -169,6 +189,12 @@ async def run_transcription(
     after_chunk: AfterChunkCallback | None = None,
 ) -> dict[str, object]:
     checked = validated or validate_transcription_request(manager, request)
+    if request.speaker_resolution != "off":
+        raise AsrError(
+            422,
+            "capability_not_supported",
+            "speaker resolution requires the path-based transcription pipeline",
+        )
     if stage_callback is not None:
         await stage_callback("preprocessing", {"percent": 1.0})
     normalized = await asyncio.to_thread(normalize_audio_to_wav, audio)
@@ -261,6 +287,7 @@ async def run_transcription(
         warnings=warnings,
         execution=plan.to_api(speaker_scope=speaker_scope),
         generation=_generation_payload(split, chunk_results, resolved_max_new_tokens),
+        diarization=None,
     )
 
 
@@ -292,6 +319,7 @@ async def run_transcription_path(
         max_chunk_seconds=request.max_chunk_seconds,
         overlap_seconds=request.overlap_seconds,
     )
+    plan = _anchor_compatible_plan(plan, request.speaker_resolution)
     if stage_callback is not None:
         await stage_callback("splitting", {"percent": 3.0})
     split_cancel = threading.Event()
@@ -318,10 +346,28 @@ async def run_transcription_path(
     split = replace(
         split,
         requested_strategy=request.split_strategy,
-        warnings=list(dict.fromkeys([*split.warnings, *plan.warnings])),
+        warnings=list(
+            dict.fromkeys(
+                [
+                    *split.warnings,
+                    *plan.warnings,
+                    *(
+                        ["moss_anchor_replay_body_chunk_limit:1740"]
+                        if request.speaker_resolution != "off" and plan.max_chunk_seconds == 1_740.0
+                        else []
+                    ),
+                ]
+            )
+        ),
     )
-    resolved_max_new_tokens = _resolved_max_new_tokens(checked, split)
-    speaker_scope = _speaker_scope(checked, plan, len(split.chunks))
+    resolved_max_new_tokens = _resolved_max_new_tokens(
+        checked,
+        split,
+        invocation_overhead_seconds=(
+            60.0 if request.speaker_resolution != "off" and len(split.chunks) > 1 else 0.0
+        ),
+    )
+    speaker_scope = _speaker_scope(checked, plan, len(split.chunks), request.speaker_resolution)
     if stage_callback is not None:
         await stage_callback(
             "loading_model",
@@ -348,18 +394,33 @@ async def run_transcription_path(
         if plan.execution_mode == "native_long_form"
         else [chunk.as_audio_input() for chunk in split.chunks]
     )
-    resolved_backend, chunk_results, timings = await manager.transcribe_chunks(
-        audio_inputs,
-        model_id=request.model,
-        backend=request.backend,
-        language=request.language,
-        timestamps=request.timestamps,
-        context=checked.adapter_context,
-        max_new_tokens=resolved_max_new_tokens,
-        batch_size=1,
-        before_chunk=effective_before_chunk,
-        after_chunk=effective_after_chunk,
-    )
+    anchor_sequence: AnchorReplaySequence | None = None
+    if request.speaker_resolution != "off" and len(split.chunks) > 1:
+        anchor_sequence = AnchorReplaySequence(split.chunks)
+        resolved_backend, chunk_results, timings = await manager.transcribe_sequence(
+            anchor_sequence,
+            model_id=request.model,
+            backend=request.backend,
+            language=request.language,
+            timestamps=request.timestamps,
+            context=checked.adapter_context,
+            max_new_tokens=resolved_max_new_tokens,
+            before_chunk=effective_before_chunk,
+            after_chunk=effective_after_chunk,
+        )
+    else:
+        resolved_backend, chunk_results, timings = await manager.transcribe_chunks(
+            audio_inputs,
+            model_id=request.model,
+            backend=request.backend,
+            language=request.language,
+            timestamps=request.timestamps,
+            context=checked.adapter_context,
+            max_new_tokens=resolved_max_new_tokens,
+            batch_size=1,
+            before_chunk=effective_before_chunk,
+            after_chunk=effective_after_chunk,
+        )
     await asyncio.to_thread(validate_workspace_limits, workspace, settings)
     timings = replace(
         timings,
@@ -368,6 +429,20 @@ async def run_transcription_path(
     )
     if stage_callback is not None:
         await stage_callback("merging", {"percent": 99.0})
+    diarization = _diarization_summary(
+        request.speaker_resolution,
+        anchor_sequence,
+        checked.supports_diarization,
+        chunk_results,
+    )
+    if request.speaker_resolution == "required" and diarization is not None and diarization["status"] != "complete":
+        raise AsrError(
+            422,
+            "speaker_resolution_incomplete",
+            "not every speaker segment could be resolved across chunks",
+            diarization,
+        )
+    speaker_scope = str(diarization["speaker_scope"]) if diarization is not None else speaker_scope
     result = await asyncio.to_thread(
         merge_transcription_results,
         split.chunks,
@@ -375,7 +450,9 @@ async def run_transcription_path(
         source_duration=split.metadata.duration_seconds,
         preserve_segments=request.preserve_segments,
         timings=timings,
-        speaker_scope="global" if speaker_scope == "global" else "chunk",
+        speaker_scope=(
+            "mixed" if speaker_scope == "mixed" else "global" if speaker_scope == "global" else "chunk"
+        ),
     )
     warnings = _warnings(result.warnings, split.warnings, resolved_max_new_tokens, request.max_new_tokens)
     return transcription_payload(
@@ -392,6 +469,7 @@ async def run_transcription_path(
         warnings=warnings,
         execution=plan.to_api(speaker_scope=speaker_scope),
         generation=_generation_payload(split, chunk_results, resolved_max_new_tokens),
+        diarization=diarization,
     )
 
 
@@ -410,8 +488,9 @@ def transcription_payload(
     warnings: list[str],
     execution: dict[str, object],
     generation: dict[str, object],
+    diarization: dict[str, object] | None,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "id": id_,
         "model": selected_model,
         "backend": resolved_backend,
@@ -428,13 +507,17 @@ def transcription_payload(
         "execution": execution,
         "generation": generation,
     }
+    if diarization is not None:
+        payload["diarization"] = diarization
+    return payload
 
 
 def _resolved_max_new_tokens(
     checked: ValidatedTranscription,
     split: SplitResult | PathSplitResult,
+    invocation_overhead_seconds: float = 0.0,
 ) -> int:
-    invocation_duration = max((chunk.duration for chunk in split.chunks), default=0.0)
+    invocation_duration = max((chunk.duration for chunk in split.chunks), default=0.0) + invocation_overhead_seconds
     return checked.execution_policy.resolve_max_new_tokens(
         checked.max_new_tokens,
         invocation_duration_seconds=invocation_duration,
@@ -445,12 +528,55 @@ def _speaker_scope(
     checked: ValidatedTranscription,
     plan: ExecutionPlan,
     chunk_count: int,
+    speaker_resolution: str = "off",
 ) -> str:
     if not checked.supports_diarization:
         return "none"
     if chunk_count == 1:
         return "global"
+    if speaker_resolution != "off":
+        return "global"
     return "chunk"
+
+
+def _anchor_compatible_plan(plan: ExecutionPlan, speaker_resolution: str) -> ExecutionPlan:
+    if speaker_resolution == "off" or plan.execution_mode != "chunked":
+        return plan
+    body_limit = 1_740.0
+    if plan.max_chunk_seconds is None or plan.max_chunk_seconds <= body_limit:
+        return plan
+    return replace(
+        plan,
+        max_chunk_seconds=body_limit,
+    )
+
+
+def _diarization_summary(
+    speaker_resolution: str,
+    sequence: AnchorReplaySequence | None,
+    supports_diarization: bool,
+    results: list[TranscriptionResult],
+) -> dict[str, object] | None:
+    if speaker_resolution == "off" or not supports_diarization:
+        return None
+    if sequence is not None:
+        return sequence.summary()
+    segments = [segment for result in results for segment in result.segments]
+    speakers = {segment.speaker for segment in segments if segment.speaker is not None}
+    unresolved = sum(segment.speaker is None for segment in segments)
+    missing_segment_chunks = sum(bool(result.text.strip()) and not result.segments for result in results)
+    complete = bool(segments) and unresolved == 0 and missing_segment_chunks == 0
+    return {
+        "method": "model_native",
+        "status": "complete" if complete else "partial",
+        "speaker_scope": "global" if complete else "mixed",
+        "speaker_count": len(speakers),
+        "unresolved_segments": unresolved,
+        "conflicts": 0,
+        "anchor_budget_limited": False,
+        "candidate_speakers": 0,
+        "missing_segment_chunks": missing_segment_chunks,
+    }
 
 
 def _split_summary(

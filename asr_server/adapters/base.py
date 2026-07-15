@@ -29,6 +29,8 @@ class TranscriptionSegment:
     end: float
     text: str
     speaker: str | None = None
+    source_speaker: str | None = None
+    speaker_resolution: str | None = None
 
     def to_api(self) -> dict[str, object]:
         return {
@@ -36,6 +38,8 @@ class TranscriptionSegment:
             "end": self.end,
             "speaker": self.speaker,
             "text": self.text,
+            **({"source_speaker": self.source_speaker} if self.source_speaker is not None else {}),
+            **({"speaker_resolution": self.speaker_resolution} if self.speaker_resolution is not None else {}),
         }
 
 
@@ -119,4 +123,31 @@ class AudioPath:
         return max(self.end - self.start, 0.0)
 
 
-AudioInput = bytes | AudioPath
+@dataclass(frozen=True)
+class AudioSilence:
+    duration: float
+
+
+AudioCompositionPart = AudioPath | AudioSilence
+
+
+@dataclass(frozen=True)
+class AudioComposition:
+    """A worker-side composition of source slices and synthetic silence.
+
+    ``prefix_duration`` identifies the replay prefix so callers can remove it
+    from model timestamps without inspecting the materialized temporary file.
+    """
+
+    parts: tuple[AudioCompositionPart, ...]
+    prefix_duration: float
+
+    @property
+    def duration(self) -> float:
+        return sum(
+            part.duration if isinstance(part, AudioSilence) else (part.duration or 0.0)
+            for part in self.parts
+        )
+
+
+AudioInput = bytes | AudioPath | AudioComposition

@@ -424,11 +424,19 @@ async def test_moss_split_transcription_warns_speaker_labels_are_chunk_local() -
     assert body["segments"][1]["start"] == pytest.approx(0.03)
 
 
-async def test_moss_anchor_replay_returns_four_global_speakers() -> None:
+@pytest.mark.parametrize(
+    ("requested_max_new_tokens", "expected_max_new_tokens"),
+    [(None, 24_000), (8_000, 8_000)],
+)
+async def test_moss_anchor_replay_returns_four_global_speakers(
+    requested_max_new_tokens: int | None,
+    expected_max_new_tokens: int,
+) -> None:
     class FourSpeakerAdapter(MockAsrAdapter):
         def __init__(self) -> None:
             super().__init__()
             self.calls = 0
+            self.max_new_tokens_values: list[int | None] = []
 
         async def transcribe(
             self,
@@ -440,8 +448,9 @@ async def test_moss_anchor_replay_returns_four_global_speakers() -> None:
             context: str,
             max_new_tokens: int | None,
         ) -> TranscriptionResult:
-            del model_id, backend, language, context, max_new_tokens
+            del model_id, backend, language, context
             self.calls += 1
+            self.max_new_tokens_values.append(max_new_tokens)
             if self.calls == 1:
                 return TranscriptionResult(
                     text="甲乙丙丁",
@@ -473,19 +482,23 @@ async def test_moss_anchor_replay_returns_four_global_speakers() -> None:
             )
 
     app = create_app(settings=Settings(enable_moss=True))
-    app.state.manager.runtime_for("moss-transcribe-diarize-0.9b").adapter = FourSpeakerAdapter()
+    adapter = FourSpeakerAdapter()
+    app.state.manager.runtime_for("moss-transcribe-diarize-0.9b").adapter = adapter
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        data = {
+            "model": "moss-transcribe-diarize-0.9b",
+            "response_format": "verbose_json",
+            "split_strategy": "fixed",
+            "max_chunk_seconds": "10",
+            "overlap_seconds": "0",
+            "speaker_resolution": "auto",
+        }
+        if requested_max_new_tokens is not None:
+            data["max_new_tokens"] = str(requested_max_new_tokens)
         response = await client.post(
             "/v1/audio/transcriptions",
             files={"file": ("sample.wav", make_wav(20.0), "audio/wav")},
-            data={
-                "model": "moss-transcribe-diarize-0.9b",
-                "response_format": "verbose_json",
-                "split_strategy": "fixed",
-                "max_chunk_seconds": "10",
-                "overlap_seconds": "0",
-                "speaker_resolution": "auto",
-            },
+            data=data,
         )
 
     assert response.status_code == 200
@@ -505,6 +518,8 @@ async def test_moss_anchor_replay_returns_four_global_speakers() -> None:
     assert body["segments"][-2]["speaker"] == "speaker-0004"
     assert body["segments"][-2]["source_speaker"] == "chunk-0001:C"
     assert body["segments"][-1]["speaker"] == "speaker-0001"
+    assert body["generation"]["max_new_tokens"] == expected_max_new_tokens
+    assert adapter.max_new_tokens_values == [expected_max_new_tokens, expected_max_new_tokens]
     assert "moss_speaker_labels_are_chunk_local" not in body["warnings"]
 
 

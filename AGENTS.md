@@ -138,6 +138,8 @@ uv run python scripts/moss_backend_smoke.py \
 
 MOSS 只声明 `transformers` 后端。它的段级 speaker/timestamp 结果只在 `response_format=verbose_json` 的 `segments` 中返回，不等于 word/char timestamps，也不等于 forced alignment。长音频切分后 speaker label 只保证 chunk 内相对一致，不能当作全局说话人身份。
 
+MOSS Anchor Replay 在调用方未显式传 `max_new_tokens` 时使用至少 `24000` 的自动生成预算，避免高语速多人播客按 `12 tokens/秒` 计算出的预算过早截断；显式请求值仍应保持原样，上限仍为 `65536`。
+
 ## API 与生命周期规则
 
 - 模型能力发现必须来自 `GET /v1/models`；客户端不要硬编码模型能力。

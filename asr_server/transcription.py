@@ -29,6 +29,7 @@ SYNC_JOB_THRESHOLD_SECONDS = 600.0
 # without reaching the nominal audio-duration limit. Keep a content-density
 # margin while leaving the separate 60-second anchor replay budget intact.
 MOSS_ANCHOR_REPLAY_BODY_CHUNK_SECONDS = 1_200.0
+MOSS_ANCHOR_REPLAY_MIN_MAX_NEW_TOKENS = 24_000
 
 StageCallback = Callable[[str, dict[str, object]], Awaitable[None]]
 BeforeChunkCallback = Callable[[int, int], Awaitable[None]]
@@ -372,6 +373,11 @@ async def run_transcription_path(
         invocation_overhead_seconds=(
             60.0 if request.speaker_resolution != "off" and len(split.chunks) > 1 else 0.0
         ),
+        minimum_auto_max_new_tokens=(
+            MOSS_ANCHOR_REPLAY_MIN_MAX_NEW_TOKENS
+            if request.speaker_resolution != "off" and len(split.chunks) > 1
+            else None
+        ),
     )
     speaker_scope = _speaker_scope(checked, plan, len(split.chunks), request.speaker_resolution)
     if stage_callback is not None:
@@ -522,12 +528,16 @@ def _resolved_max_new_tokens(
     checked: ValidatedTranscription,
     split: SplitResult | PathSplitResult,
     invocation_overhead_seconds: float = 0.0,
+    minimum_auto_max_new_tokens: int | None = None,
 ) -> int:
     invocation_duration = max((chunk.duration for chunk in split.chunks), default=0.0) + invocation_overhead_seconds
-    return checked.execution_policy.resolve_max_new_tokens(
+    resolved = checked.execution_policy.resolve_max_new_tokens(
         checked.max_new_tokens,
         invocation_duration_seconds=invocation_duration,
     )
+    if checked.max_new_tokens is not None or minimum_auto_max_new_tokens is None:
+        return resolved
+    return min(max(resolved, minimum_auto_max_new_tokens), checked.execution_policy.max_new_tokens)
 
 
 def _speaker_scope(

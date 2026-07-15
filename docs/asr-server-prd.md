@@ -293,7 +293,7 @@ Content-Type: `multipart/form-data`
 - `timestamps`：`none`、`word`、`char`，默认 `none`。
 - `backend`：`auto`、`transformers`、`vllm`，默认 `auto`。
 - `temperature`：可选。
-- `max_new_tokens`：可选；使用模型专属限制。Qwen 默认 512、上限 4096；MOSS 未指定时按单次模型输入时长动态计算 `max(2048, ceil(seconds * 12))`，上限 65536。
+- `max_new_tokens`：可选；使用模型专属限制。Qwen 默认 512、上限 4096；MOSS 未指定时按单次模型输入时长动态计算 `max(2048, ceil(seconds * 12))`，上限 65536。多 chunk Anchor Replay 在调用方未显式指定时额外使用 `24000` 的自动预算下限；显式请求值不受该下限覆盖。
 - `context`：可选；本次转录的领域提示、术语、人名、产品名、项目名等，服务端应限制长度并传给 Qwen adapter。
 - `hotwords`：可选；热词列表，可用逗号分隔字符串或 JSON 数组表达，服务端可合并到 `context`。
 - `speaker_resolution`：`off`、`auto`、`required`，默认 `off`。只对声明支持的 MOSS 模型生效；`auto` 允许部分结果，`required` 在存在冲突、未解析段或候选说话人时返回 `422 speaker_resolution_incomplete`。
@@ -601,7 +601,7 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 2. Qwen 的 `auto` 保持通用 chunked ASR：短音频不切分，长音频使用 bounded streaming energy VAD，失败后固定窗口。
 3. MOSS 的 `auto` 是 model-aware：不超过 1801 秒时整段单次推理，speaker scope 为 `global`；更长音频自动降级为 1800 秒 fixed chunk。默认 `speaker_resolution=off` 时 speaker scope 为 `chunk`，并返回明确 fallback warning。
 4. MOSS 显式 `split_strategy=none` 可用于挑战尚未验证的更长原生推理，但缺尾、token 达上限、上下文超限都必须返回 422，不能返回表面成功的残缺正文。
-5. 分块合并时按原始时间线排序并处理 overlap。`speaker_resolution=off` 时 MOSS speaker 使用 `chunk-NNNN:S01` 命名空间。显式 `auto|required` 时，每个后续正文块前回放最多 60 秒的已知说话人干净片段，在同一次 MOSS 调用内把本地标签映射成 job-local `speaker-NNNN`；正文窗口上限收缩到 1200 秒。该上限不仅给锚点前缀留出输入窗口，也给高语速、多人密集播客的输出 token 密度留出余量；1740 秒正文已在真实四人播客上出现只覆盖至约 1324 秒的受控 `incomplete_transcript`。单个说话人标签必须至少有一段连续 2 秒的稳定语音才可建立 job-local 全局身份；片头音效或极短插话只保留为待确认片段，不能污染后续锚点。
+5. 分块合并时按原始时间线排序并处理 overlap。`speaker_resolution=off` 时 MOSS speaker 使用 `chunk-NNNN:S01` 命名空间。显式 `auto|required` 时，每个后续正文块前回放最多 60 秒的已知说话人干净片段，在同一次 MOSS 调用内把本地标签映射成 job-local `speaker-NNNN`；正文窗口上限收缩到 1200 秒。该上限不仅给锚点前缀留出输入窗口，也给高语速、多人密集播客的输出 token 密度留出余量；1740 秒正文已在真实四人播客上出现只覆盖至约 1324 秒的受控 `incomplete_transcript`。未显式传 `max_new_tokens` 时，Anchor Replay 单次调用的自动生成预算不得低于 24000；此前 1200 秒正文加 60 秒锚点按 12 tokens/秒只得到 15120，并在真实四人播客第 3 块触发 `generation_truncated`。单个说话人标签必须至少有一段连续 2 秒的稳定语音才可建立 job-local 全局身份；片头音效或极短插话只保留为待确认片段，不能污染后续锚点。
 6. Anchor Replay 不把名字或真实身份凭空赋给声音；`source_speaker` 保留原始 chunk-local 标签。锚点冲突、新说话人尚未在后续块确认、或锚点预算不足时 scope 为 `mixed`，不得伪造数值置信度。
 7. 返回 `execution`、`split`、`generation`、`diarization`、`chunks`、`warnings` 和 timings，供客户端判断真实执行模式、speaker scope、token、冲突与尾部覆盖。
 
